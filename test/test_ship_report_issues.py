@@ -78,7 +78,16 @@ ISSUES = [
 
 GH_STUB = r"""#!/usr/bin/env bash
 set -euo pipefail
+if [ "$1 ${2:-}" = "api repos/$GITHUB_REPOSITORY" ]; then
+  cat "$FIXTURES/has_issues"
+  exit 0
+fi
 if [ "$1 ${2:-}" = "issue list" ]; then
+  # Real gh behaviour on a repo with the Issues feature switched off.
+  if [ "$(cat "$FIXTURES/has_issues")" != "true" ]; then
+    echo "the '$GITHUB_REPOSITORY' repository has disabled issues" >&2
+    exit 1
+  fi
   cat "$FIXTURES/issues.json"
   exit 0
 fi
@@ -111,6 +120,7 @@ class Runner:
         stub = bindir / "gh"
         stub.write_text(GH_STUB)
         stub.chmod(0o755)
+        (self.fixtures / "has_issues").write_text("true")
         self.outputs_file = self.work / "gh_output"
         self.outputs_file.touch()
         self.env = {
@@ -204,6 +214,23 @@ def test_only_issues_inside_the_window_are_reported(runner: Runner) -> None:
 def test_boundary_issue_belongs_to_the_previous_report(runner: Runner) -> None:
     runner.fetch()
     assert 3999 not in runner.selected and 4100 not in runner.selected
+
+
+def test_disabled_issues_reports_zero_instead_of_failing(runner: Runner) -> None:
+    """Forks have the Issues feature off, and `gh issue list` exits 1 there.
+
+    Left unhandled, that failure fails every scheduled run and wedges the
+    window forever -- a failed run does not advance it, so there is no next
+    run that recovers. Disabled issues are a legitimate zero-inbound state:
+    the step must succeed, report zero, and leave the shipping half alone.
+    """
+    (runner.fixtures / "has_issues").write_text("false")
+    (runner.fixtures / "issues.json").write_text(json.dumps(ISSUES))
+    runner.outputs_file.write_text("")
+    step = runner._run("issues")
+    assert step.returncode == 0, step.stderr
+    assert runner._outputs()["count"] == "0"
+    assert json.loads((runner.work / "issues.json").read_text()) == []
 
 
 def test_an_inbound_spike_does_not_fail_the_run(runner: Runner) -> None:

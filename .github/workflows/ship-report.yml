@@ -34,10 +34,19 @@
 #   OIDC/Bedrock failure                       -> deterministic template body
 #   SLACK_WEBHOOK_URL secret unset             -> run FAILS (window not advanced,
 #                                                 re-covered once the secret exists)
+#   Issues feature disabled on the repo        -> inbound half reports zero; the
+#                                                 shipping half still posts
 # Both narratives degrade INDEPENDENTLY: the shipping half and the issue half are
 # separate Bedrock calls, so one model failure cannot silence the other. The
 # issue half's fallback keeps the two-section split, the security call-out and
 # every count -- only the prose is lost.
+#
+# SCHEDULED RUNS ARE UPSTREAM-ONLY. The channel-locked webhook, the Bedrock
+# role, and the Slack audience all live with kirodotdev/KiroCrew. On a fork a
+# scheduled fire can only fail (no webhook -> run FAILS by design, twice a day)
+# or advance a watermark nobody reads, so the report job no-ops scheduled
+# events everywhere else. workflow_dispatch still runs on a fork (default
+# dry-run) so this file stays testable there.
 #
 # Config:
 #   secrets.SLACK_WEBHOOK_URL                -- channel-locked incoming webhook
@@ -80,6 +89,8 @@ concurrency:
 
 jobs:
   report:
+    # Scheduled fires are upstream-only (see header); manual dispatch runs anywhere.
+    if: github.event_name != 'schedule' || github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -160,6 +171,18 @@ jobs:
           END: ${{ steps.window.outputs.end }}
         run: |
           set -euo pipefail
+          # A repo with the Issues feature switched off (the default on forks)
+          # makes `gh issue list` exit 1, which would fail every run and wedge
+          # the window forever, since a failed run does not advance it. That is
+          # a legitimate zero-inbound state, not an error: probe the flag and
+          # report zero. A FAILED probe still fails the run (set -e); only a
+          # successful "false" takes this path.
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]; then
+            echo "[]" > issues.json
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "Issues are disabled on this repository; inbound half reports zero."
+            exit 0
+          fi
           # --state all: an issue filed and closed inside the window still
           # belongs in the inbound count.
           gh issue list --repo "$GITHUB_REPOSITORY" --state all \
