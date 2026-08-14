@@ -41,6 +41,13 @@
 # issue half's fallback keeps the two-section split, the security call-out and
 # every count -- only the prose is lost.
 #
+# SCHEDULED RUNS ARE UPSTREAM-ONLY. The channel-locked webhook, the Bedrock
+# role, and the Slack audience all live with kirodotdev/KiroCrew. On a fork a
+# scheduled fire can only fail (no webhook -> run FAILS by design, twice a day)
+# or advance a watermark nobody reads, so the report job no-ops scheduled
+# events everywhere else. workflow_dispatch still runs on a fork (default
+# dry-run) so this file stays testable there.
+#
 # Config:
 #   secrets.SLACK_WEBHOOK_URL                -- channel-locked incoming webhook
 #   secrets.SHIP_REPORT_BEDROCK_ROLE_ARN     -- OIDC role, bedrock:InvokeModel only
@@ -82,6 +89,8 @@ concurrency:
 
 jobs:
   report:
+    # Scheduled fires are upstream-only (see header); manual dispatch runs anywhere.
+    if: github.event_name != 'schedule' || github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
