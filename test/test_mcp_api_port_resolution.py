@@ -10,20 +10,34 @@ Two halves of one defect:
   had nothing better than that guess to inherit.
 
 These tests lock in the fix: ``mcp_core`` resolves lazily through
-``cli_server.resolve_client_port`` (env → explicit config port → live
-run-marker → default), and the dashboard server exports ``KIROCREW_BOUND_PORT``
-once its TCP site is listening.
+``port_resolution.resolve_client_port_ex`` (env → explicit config port → live
+run-marker → default; re-exported by ``cli_server``, whose namespace the
+chain-internal calls still resolve through so the patches below intercept),
+and the dashboard server exports ``KIROCREW_BOUND_PORT`` once its TCP site is
+listening.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import kiro_crew
 import kiro_crew.mcp_core as mcp_core
 from kiro_crew.dashboard.server import _export_bound_port
+
+#: Source root of the tree under test, pinned onto the probe subprocess's
+#: PYTHONPATH. Without it the child interpreter resolves whatever kiro_crew
+#: happens to be installed for it (pytest's ``pythonpath = src`` does not
+#: propagate to subprocesses) — a stale editable install would make the
+#: leaf-purity assertion pass vacuously against old code, and a non-editable
+#: install would fail it spuriously. Same pattern as test_perf_boot_path._probe.
+_SRC = str(Path(kiro_crew.__file__).resolve().parents[1])
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +132,30 @@ class TestApiBaseResolution:
         # resolves the real port without a restart.
         with _cfg(""), _markers([6776]), _owned([6776]):
             assert mcp_core._api_base() == "http://127.0.0.1:6776"
-        assert mcp_core._API_PORT == 6776  # positive evidence IS pinned
+        # A marker-discovered port is served but never pinned either: its
+        # ownership proof holds only for the instant it was made, and a freed
+        # port can be rebound by any local process. Requests carrying the
+        # internal secret must re-verify per call (see _api_port).
+        assert mcp_core._API_PORT is None
+
+    def test_marker_port_is_reverified_on_every_call(self):
+        """A marker-discovered port must be re-resolved (re-proving ownership)
+        on every call, not trusted from a cache.
+
+        The gateway can exit or move ports after a resolution; the freed port
+        may be rebound by a different local user's process. A pinned marker
+        resolution would keep aiming secret-bearing requests at it — so the
+        chain (whose marker step runs ``_gateway_owns_port``) must run again
+        for each request.
+        """
+        with _cfg(""), _markers([6776]) as markers, _owned([6776]):
+            assert mcp_core._api_base() == "http://127.0.0.1:6776"
+            assert mcp_core._api_base() == "http://127.0.0.1:6776"
+            assert markers.call_count == 2  # re-resolved, not cached
+        # The gateway moved: ownership of 6776 no longer verifies and the new
+        # marker names 7788 — the very next call follows it.
+        with _cfg(""), _markers([7788]), _owned([7788]):
+            assert mcp_core._api_base() == "http://127.0.0.1:7788"
 
     def test_unix_socket_not_pinned_on_default_fallthrough(self):
         """The socket path follows the same no-evidence rule as the URL."""
@@ -128,12 +165,20 @@ class TestApiBaseResolution:
         with _cfg(""), _markers([6776]), _owned([6776]):
             assert mcp_core._api_unix_socket().endswith("dashboard-6776.sock")
 
-    def test_resolution_is_lazy_and_cached(self):
-        """First call resolves, later calls reuse the cache (no re-discovery)."""
-        with _cfg(""), _markers([6776]) as markers, _owned([6776]):
-            assert mcp_core._api_base() == "http://127.0.0.1:6776"
-            assert mcp_core._api_base() == "http://127.0.0.1:6776"
-            assert markers.call_count == 1
+    def test_resolution_is_lazy_and_cached(self, monkeypatch: pytest.MonkeyPatch):
+        """First call resolves, later calls reuse the cache (no re-discovery).
+
+        Caching applies to STABLE sources only — here the env var, a user
+        decision that holds for the process lifetime. (A marker-discovered
+        port deliberately re-resolves per call; see
+        ``test_marker_port_is_reverified_on_every_call``.)
+        """
+        monkeypatch.setenv("KIROCREW_PORT", "6777")
+        with _cfg(""), _markers([]) as markers:
+            assert mcp_core._api_base() == "http://127.0.0.1:6777"
+            assert mcp_core._api_base() == "http://127.0.0.1:6777"
+            markers.assert_not_called()
+        assert mcp_core._API_PORT == 6777  # stable evidence IS pinned
 
     def test_preseeded_cache_is_respected(self, monkeypatch: pytest.MonkeyPatch):
         """A pre-seeded ``_API`` (the test seam) short-circuits resolution."""
@@ -205,3 +250,35 @@ class TestExportBoundPort:
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "1111")
         _export_bound_port(_StubRunner([]), 6776)
         assert os.environ["KIROCREW_BOUND_PORT"] == "6776"
+
+
+class TestPortResolutionStaysLeaf:
+    """``port_resolution`` exists so the MCP stdio server never pays for
+    ``cli_server``'s import graph (frontend build, service controllers,
+    preflight, embeddings). Lock that in: importing either the leaf or
+    ``mcp_core`` in a fresh interpreter must not pull ``cli_server`` in.
+    A fresh interpreter is required — this suite itself imports
+    ``cli_server``, so an in-process ``sys.modules`` check would always
+    see it loaded.
+    """
+
+    @pytest.mark.parametrize(
+        "module", ["kiro_crew.port_resolution", "kiro_crew.mcp_core"]
+    )
+    def test_import_does_not_pull_cli_server(self, module: str) -> None:
+        code = (
+            "import importlib, sys; "
+            f"importlib.import_module({module!r}); "
+            "assert 'kiro_crew.cli_server' not in sys.modules, "
+            f"'importing {module} pulled in the heavy cli_server graph'"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = _SRC + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr

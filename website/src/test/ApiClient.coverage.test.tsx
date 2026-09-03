@@ -125,8 +125,9 @@ describe('client transport', () => {
   })
 
   it('POST/PUT/PATCH send a JSON content type alongside the placeholder key', async () => {
-    await api.trustApp('demo')
+    await api.trustApp('demo', 'https://example.test/owner/demo')
     expect(call().headers).toMatchObject({ 'Content-Type': 'application/json', 'X-Session-Key': 'dashboard:ui' })
+    expect(call().body).toEqual({ repository: 'https://example.test/owner/demo' })
     await api.setTrustAllApps(true)
     expect(call(1).method).toBe('PUT')
     expect(call(1).headers['Content-Type']).toBe('application/json')
@@ -171,6 +172,73 @@ describe('client transport', () => {
   it('createArtifact falls back to the placeholder when the body names no session', async () => {
     await api.createArtifact({ name: 'Doc', content: '<p/>' })
     expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+  })
+
+  // The steering verbs are the case the placeholder actively broke: the server
+  // resolves a `workspace/` key against the project of the slot named by this
+  // header, so `dashboard:ui` — which names no slot — made project steering
+  // unreachable as soon as two chats sat on different projects. All five verbs
+  // take the key, because a file created under one project must stay readable,
+  // editable and deletable from the same page load.
+  it('the steering reads send the caller\'s session key, on the GET as well as the POST family', async () => {
+    await api.steeringFiles('dashboard:chat-4')
+    expect(call().url).toBe('/api/steering')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.steeringFile('workspace/api.md', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('the steering writes send the caller\'s session key', async () => {
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4')
+    expect(call().method).toBe('POST')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.updateSteering('workspace/api.md', '# API v2', 'dashboard:chat-4')
+    expect(call(1).method).toBe('PUT')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4')
+    expect(call(2).method).toBe('DELETE')
+    expect(call(2).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('a workspace write states which project the caller was listed', async () => {
+    // The session key names a chat slot and that slot's project can be
+    // re-pointed, so the slot alone cannot say which project the user believed
+    // they were editing. The listing's `project_key` rides along and the server
+    // refuses (409) when it no longer resolves to the same one.
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4', 'pk-abc')
+    expect(call().headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.updateSteering('workspace/api.md', '# v2', 'dashboard:chat-4', 'pk-abc')
+    expect(call(1).headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4', 'pk-abc')
+    expect(call(2).headers['X-Steering-Project']).toBe('pk-abc')
+  })
+
+  it('omits the project header when the caller has no project key', async () => {
+    // Absent is not "any project": the server fails a workspace write closed on
+    // a missing header, so sending nothing is the honest wire form.
+    await api.createSteering('api.md', '# API', 'user', 'dashboard:chat-4')
+    expect(call().headers['X-Steering-Project']).toBeUndefined()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('every steering verb falls back to the placeholder when no session key is passed', async () => {
+    // The tab passes `undefined` when no chat is open rather than inventing a
+    // slot name, so the fallback is what a settings page with no chat sends.
+    await api.steeringFiles()
+    await api.steeringFile('workspace/api.md')
+    await api.createSteering('api.md', '# API', 'workspace')
+    await api.updateSteering('workspace/api.md', '# API v2')
+    await api.deleteSteering('workspace/api.md')
+    for (let i = 0; i < 5; i++) {
+      expect(call(i).headers['X-Session-Key']).toBe('dashboard:ui')
+    }
   })
 })
 
@@ -558,14 +626,16 @@ describe('query-string builders', () => {
     expect(call().url).toBe('/api/sessions?limit=30&offset=0')
     await api.sessions(10, 20, true)
     expect(call(1).url).toBe('/api/sessions?limit=10&offset=20&preview=1')
+    await api.sessions(30, 0, false, true)
+    expect(call(2).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1')
     await api.sessionsSearch('a b', 5)
-    expect(call(2).url).toBe('/api/sessions/search?q=a%20b&limit=5')
+    expect(call(3).url).toBe('/api/sessions/search?q=a%20b&limit=5')
     await api.vectorEpisodic(10, 5, 'promo,l6')
-    expect(call(3).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
+    expect(call(4).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
     await api.vectorEpisodic()
-    expect(call(4).url).toBe('/api/memory/episodic?limit=50&offset=0')
+    expect(call(5).url).toBe('/api/memory/episodic?limit=50&offset=0')
     await api.vectorEpisodicSearch('q', 'tag')
-    expect(call(5).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
+    expect(call(6).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
   })
 
   it('discovery endpoints append provider and limit only when set', async () => {
@@ -760,6 +830,8 @@ describe('request bodies with conditionally-omitted keys', () => {
     // index 0 is a legitimate fork point and must not be dropped as falsy.
     await api.forkChatSlot('chat-1', 0, 'why', 'plan', 'down')
     expect(call(1).body).toEqual({ at_message_index: 0, prompt: 'why', mode: 'plan', direction: 'down' })
+    await api.forkChatSlot('chat-1', 7, undefined, undefined, 'head', 'row-42')
+    expect(call(2).body).toEqual({ at_message_index: 7, at_message_id: 'row-42', direction: 'head' })
   })
 
   it('slackLink sends no body at all when it is only asking for the existing link', async () => {
@@ -859,11 +931,11 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(3).body).toEqual({ steps: [{ title: 'a' }], task_id: '', original_input: '' })
   })
 
-  it('createWebhookToken requires a signature by default', async () => {
-    await api.createWebhookToken('ci')
-    expect(call().body).toEqual({ label: 'ci', require_signature: true })
+  it('createWebhookToken requires a signature by default and carries the destination', async () => {
+    await api.createWebhookToken('ci', undefined, 'code-reviewer')
+    expect(call().body).toEqual({ agent: 'code-reviewer', label: 'ci', require_signature: true })
     await api.createWebhookToken('legacy', false)
-    expect(call(1).body).toEqual({ label: 'legacy', require_signature: false })
+    expect(call(1).body).toEqual({ agent: '', label: 'legacy', require_signature: false })
   })
 
   it('addUserDeniedCommand defaults the operator note to empty', async () => {
@@ -880,11 +952,11 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(2).body).toEqual({ color_index: 0 })
   })
 
-  it('mcpGatewaySetPoolable has a single and a batch form', async () => {
-    await api.mcpGatewaySetPoolable('fs', true)
-    expect(call().body).toEqual({ name: 'fs', poolable: true })
-    await api.mcpGatewaySetPoolableMany(['fs', 'git'], false)
-    expect(call(1).body).toEqual({ names: ['fs', 'git'], poolable: false })
+  it('mcpGatewaySetStub has a single and a batch form', async () => {
+    await api.mcpGatewaySetStub('fs', true)
+    expect(call().body).toEqual({ name: 'fs', stub: true })
+    await api.mcpGatewaySetStubMany(['fs', 'git'], false)
+    expect(call(1).body).toEqual({ names: ['fs', 'git'], stub: false })
   })
 
   it('createTagColumn/updateTagColumn pass the filter mode straight through', async () => {
@@ -990,7 +1062,7 @@ describe('sendChat theme consent', () => {
 
   it('steerChat always injects into the running turn', async () => {
     await api.steerChat('now', 'chat-1')
-    expect(call().url).toBe('/api/chat')
+    expect(call().url).toBe('/api/chat?ws=1')
     expect(call().body).toEqual({ message: 'now', slot: 'chat-1', steer: true })
   })
 })
@@ -998,11 +1070,16 @@ describe('sendChat theme consent', () => {
 /* ─────────────── 3. the non-trivial method implementations ─────────────── */
 
 describe('revealPath', () => {
-  it('copies the path when the host is headless and cannot reveal it', async () => {
+  // The transport is side-effect-free: it posts the action and returns the wire
+  // shape. When the host is headless it hands back a `copy` path for the caller
+  // (`revealOrOpen`) to write — `api.revealPath` itself never touches the
+  // clipboard, so the degrade lives in exactly one place.
+  it('returns the copy path when the host is headless and cannot reveal it', async () => {
     fetchMock.mockResolvedValue(okJson({ copy: '/home/u/report.zip' }))
-    await api.revealPath('/home/u/report.zip')
+    const r = await api.revealPath('/home/u/report.zip')
     expect(call().body).toEqual({ path: '/home/u/report.zip', action: 'reveal' })
-    expect(vi.mocked(copyToClipboard)).toHaveBeenCalledWith('/home/u/report.zip')
+    expect(r).toMatchObject({ copy: '/home/u/report.zip' })
+    expect(vi.mocked(copyToClipboard)).not.toHaveBeenCalled()
   })
 
   it('does not touch the clipboard when the OS handled it', async () => {
@@ -1290,7 +1367,9 @@ describe('publishToProvider', () => {
 describe('every api method issues one well-formed /api request', () => {
   // Exercised individually above with the fixtures they need (a Blob, a
   // ReadableStream, a File list, an object-URL download).
-  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'installFromRegistryStream', 'exportPlanYaml'])
+  // `skills` and `slashCommands` join them because each wraps its fetch in a
+  // deadline, so it USES the signal argument rather than forwarding it.
+  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands'])
 
   type AnyFn = (...args: unknown[]) => unknown
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)

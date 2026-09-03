@@ -52,6 +52,7 @@ interface Row {
   title: string
   start: string
   end: string
+  allDay: boolean
   status: MeetingSummary['status'] | 'scheduled'
   touched: boolean
 }
@@ -72,6 +73,7 @@ function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
       title: event.title,
       start: event.start,
       end: event.end,
+      allDay: event.all_day,
       status: 'scheduled',
       touched: false,
     })
@@ -84,6 +86,10 @@ function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
       title: meeting.title || existing?.title || i18nT('apps.meetings.session.untitled'),
       start: existing?.start ?? meeting.started_at,
       end: existing?.end ?? meeting.ended_at,
+      // The flag travels with the start it describes: when the calendar event's
+      // date anchor wins above, its all-day reading must win with it. A
+      // meeting-only row's `started_at` is a real instant, never all-day.
+      allDay: existing?.allDay ?? false,
       status: meeting.status,
       touched: true,
     })
@@ -103,6 +109,18 @@ function formatWhen(row: Row): string {
   // `fmtDateFields`, not the raw `toLocale*`: a meeting row sits inside a
   // translated UI, so the weekday and the 12h/24h choice have to follow the app's
   // language rather than whatever locale the browser happens to be set to.
+  if (row.allDay) {
+    // A whole-day event's `start` is a DATE ANCHOR — the date's midnight UTC,
+    // not an instant. The fields are read back in UTC and no time is shown:
+    // converting the anchor to the browser's zone renders the previous day for
+    // everyone west of UTC, which is the wrong-day defect this branch exists for.
+    return fmtDateFields(start, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      timeZone: 'UTC',
+    })
+  }
   const date = fmtDateFields(start, { weekday: 'short', month: 'short', day: 'numeric' })
   const time = fmtDateFields(start, { hour: '2-digit', minute: '2-digit' })
   return `${date} · ${time}`
@@ -136,6 +154,9 @@ function useNotifier(): (message: string, opts?: { type?: 'info' | 'success' | '
   )
 }
 
+/** How often the list re-reads the calendar cache and the meetings on disk. */
+const LIST_REFRESH_MS = 60_000
+
 export default function MeetingsPage() {
   const notify = useNotifier()
   const queryClient = useQueryClient()
@@ -143,8 +164,19 @@ export default function MeetingsPage() {
   const [filter, setFilter] = useState('')
 
   const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config })
-  const calendarQuery = useQuery({ queryKey: ['meetings', 'calendar'], queryFn: meetingsApi.calendar })
-  const meetingsQuery = useQuery({ queryKey: ['meetings', 'list'], queryFn: meetingsApi.meetings })
+  // The backend's calendar poller refreshes the cache and pre-creates the meeting
+  // that is about to start while this page sits open, so both lists re-read on a
+  // cadence: without it a pre-created meeting appears only after a remount.
+  const calendarQuery = useQuery({
+    queryKey: ['meetings', 'calendar'],
+    queryFn: meetingsApi.calendar,
+    refetchInterval: LIST_REFRESH_MS,
+  })
+  const meetingsQuery = useQuery({
+    queryKey: ['meetings', 'list'],
+    queryFn: meetingsApi.meetings,
+    refetchInterval: LIST_REFRESH_MS,
+  })
 
   const sync = useMutation({
     mutationFn: meetingsApi.syncCalendar,
@@ -242,7 +274,7 @@ export default function MeetingsPage() {
           </>
         }
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] my-6">
           <StatCard
             label={i18nT('apps.meetings.list.statScheduled')}

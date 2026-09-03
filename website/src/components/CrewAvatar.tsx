@@ -3,10 +3,9 @@
  *
  * The seed is the crew name, so a crew keeps the same face forever and two
  * people looking at the same config see the same roster. Generation is fully
- * LOCAL — `@dicebear/core` renders the SVG in-process from the pinned
- * `@dicebear/pixel-art` style definition. Nothing is fetched, so this works
- * offline and no crew name ever leaves the machine (DiceBear's HTTP API is
- * deliberately not used).
+ * LOCAL — `@dicebear/core` renders the SVG in-process from the `kiroGhost` style
+ * definition. Nothing is fetched, so this works offline and no crew name ever
+ * leaves the machine (DiceBear's HTTP API is deliberately not used).
  *
  * Rendered as an `<img>` carrying a data URI rather than inlined SVG markup.
  * Two reasons, both load-bearing:
@@ -22,24 +21,17 @@
  */
 import { useMemo } from 'react'
 import { createAvatar } from '@dicebear/core'
-import * as pixelArt from '@dicebear/pixel-art'
+import { kiroGhost, type WorkingIntensity } from '../lib/kiroGhostAvatar'
 
-/** pixel-art by DiceBear, CC0 1.0 — public domain, no attribution required. */
-const STYLE = pixelArt
-
-/**
- * Tile backgrounds, picked from the seed by DiceBear itself so the choice is
- * stable per crew. These are art parameters baked into the generated image,
- * not UI chrome, so they are literal values rather than theme tokens — the
- * avatar must look identical in light and dark mode, the way a user-uploaded
- * profile picture would.
- */
-const BACKGROUNDS = ['b6e3f4', 'c0aede', 'd1d4f9', 'ffd5dc', 'ffdfbf', 'a7f3d0']
+/** Kiro's own ghost, built on the shipped mark. See `lib/kiroGhostAvatar.ts`. */
+const STYLE = kiroGhost
 
 /**
- * Generated data URIs, keyed by seed. Module-level rather than per-component
- * so a crew's avatar is generated once per session even though it is rendered
- * in both the roster card and the editor panel.
+ * Generated data URIs, keyed by seed + working intensity. Module-level rather
+ * than per-component so a crew's avatar is generated once per session even
+ * though it is rendered in both the roster card and the editor panel. A crew
+ * has at most three entries (still, subtle, full) and flipping between them is
+ * a cache hit, so a member starting/stopping work never re-generates.
  */
 const CACHE = new Map<string, string>()
 
@@ -48,21 +40,26 @@ export interface CrewAvatarProps {
   seed: string
   /** Rendered edge length in px. */
   size?: number
+  /** Animate the ghost as "at work". `subtle` for dense lists, `full` for a
+   *  single-avatar surface. Identity is untouched — the working variant only
+   *  moves what the seed drew — so omitting it is a lossless still frame. */
+  working?: WorkingIntensity
   className?: string
 }
 
-export default function CrewAvatar({ seed, size = 40, className = '' }: CrewAvatarProps) {
+export default function CrewAvatar({ seed, size = 40, working, className = '' }: CrewAvatarProps) {
   const src = useMemo(() => {
-    const hit = CACHE.get(seed)
+    // NUL-joined (never renders): the two parts cannot collide with a seed
+    // that happens to contain the tier word.
+    const key = [seed, working ?? ''].join('\u0000')
+    const hit = CACHE.get(key)
     if (hit) return hit
-    const uri = createAvatar(STYLE, {
-      seed,
-      radius: 12,
-      backgroundColor: BACKGROUNDS,
-    }).toDataUri()
-    CACHE.set(seed, uri)
+    // The tile color is part of the style rather than a `backgroundColor` list,
+    // so that it is drawn from the same seeded stream as every other trait.
+    const uri = createAvatar(STYLE, { seed, radius: 12, working }).toDataUri()
+    CACHE.set(key, uri)
     return uri
-  }, [seed])
+  }, [seed, working])
 
   return (
     <img

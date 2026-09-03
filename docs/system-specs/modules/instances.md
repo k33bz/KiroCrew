@@ -3,8 +3,22 @@
 Lets a single Kiro Crew gateway (the **hub**) manage and switch between several
 **remote** Kiro Crew instances (dev hosts, EC2, home servers) over SSH **or AWS
 SSM Session Manager** tunnels, embedding each remote dashboard as an iframe pane
-below a tab strip. Opt-in: off by default (`instances.enabled`). The transport is
+below a switcher strip. Opt-in: off by default (`instances.enabled`). The transport is
 per-instance (`connection_method`) — see §13.
+
+> **Naming — "Remote Instances".** The user-facing surfaces label this feature
+> **Remote Instances**: the Settings section (*Settings → Remote Instances*), the
+> top-header switcher group ("Remote Instances" / "Switch instance"), and the
+> keyboard shortcuts. This is deliberately distinct from the product name
+> **Kiro Crew** and from an agent **crew** (an assistant with its own
+> workspace/memory — `kiroCrewAgentsPage`, "Crew Mode"). Earlier UI copy called
+> this feature "Remote Crew"; that wording was retired in favour of "instance" to
+> match the code and config it already sits on (`/api/instances`,
+> `instances.json`, `InstancesPanel`, EC2 `instance_id` / `ssm_target`). Only the
+> **displayed strings** changed — i18n key names and internal identifiers
+> (including the `remoteCrewPanel` component/key namespace) are unchanged, so
+> "crew" as a shorthand for an instance still appears in code and in this spec's
+> prose below.
 
 > **Section numbers in this document are an API.** `src/kiro_crew/cloud/connect.py`
 > cites "instances.md §9" from two docstrings (the module docstring and
@@ -34,6 +48,7 @@ mint, diagnostics, injection validation, run-marker) plus
 - [12. The gateway run-marker (`run_marker.py`)](#12-the-gateway-run-marker-run_markerpy)
 - [13. The SSM connection method (`connection_method`)](#13-the-ssm-connection-method-connection_method)
 - [14. Session transfer (send a session to another instance)](#14-session-transfer-send-a-session-to-another-instance)
+- [15. Federated session search (search every connected instance at once)](#15-federated-session-search-search-every-connected-instance-at-once)
 
 ---
 
@@ -43,9 +58,15 @@ A Kiro Crew gateway normally binds the dashboard to loopback only. The Instances
 feature lets the hub reach *other* gateways running on remote hosts by opening an
 SSH `-L` forward to each remote's loopback dashboard port, minting a short-lived
 dashboard token on the remote, and embedding the remote dashboard in an
-`<iframe>`. You switch panes with a tab strip (`InstanceTabBar`, plus
+`<iframe>`. You switch panes from a dropdown (`InstanceTabBar`, plus
 Cmd/Ctrl+digit in the Electron shell); the hub keeps the most-recently-used set
-"warm" (tunnel + iframe live) and lazily reconnects the rest.
+"warm" (tunnel + iframe live) and lazily reconnects the rest. The switcher is a
+menu rather than a row of chips by DEFAULT because the number of configured crews
+is unbounded: the closed trigger costs constant width, and unread counts stay
+visible on it as an aggregate badge over every crew that is not on screen. A user
+who switches between the same two or three crews can PIN those out of the menu
+into always-visible chips beside it, spending header width only on the
+destinations they actually use — see [Pinned crew chips](#pinned-crew-chips).
 
 **Key properties**
 
@@ -96,9 +117,9 @@ after startup and a restart is still pending.
  +----------------------- Hub gateway (this host) ------------------------+
  |                                                                       |
  |  Dashboard SPA                                                        |
- |   |- InstanceTabBar     (Local | remote-1 | remote-2 ...)             |
+ |   |- InstanceTabBar    switcher dropdown: Local + crews with intent   |
  |   |- InstancesViewport  warm <iframe>s: http://<host>:<port>/?token=  |
- |   +- Settings > Instances   add / connect / diagnose / remove         |
+ |   +- Settings > Instances   add / edit / connect / diagnose / remove  |
  |            | owner-only JSON API (SEL-audited)                        |
  |  dashboard/handlers_instances.py                                      |
  |            |                                                          |
@@ -115,7 +136,7 @@ after startup and a restart is still pending.
         v
  +--------------- Remote gateway (dev host / EC2 / home server) ---------+
  |  kirocrew gateway bound to 127.0.0.1:<remote_port> (registry default  |
- |  7777; the local gateway's own default port is 5476)                  |
+ |  5476, the port a stock gateway binds)                                |
  +-----------------------------------------------------------------------+
 ```
 
@@ -124,39 +145,46 @@ Module responsibilities:
 | Module | Responsibility |
 |--------|----------------|
 | `registry.py` | Persistent list of configured instances (`~/.kiro/crew/instances.json`) + `last_active_id`. Light charset check on `ssh_host`/`remote_bin` (SSH) or `ssm_target`/`aws_profile`/`aws_region`/`ssm_run_as` (SSM) at add/update, per `connection_method`; every mutation re-reads the file and writes atomically, so a live gateway and a CLI edit cannot clobber each other. |
-| `port_allocator.py` | Probes for a free loopback port at or above `tunnel_base_port` (7778). The probe sets `SO_REUSEADDR` so a `TIME_WAIT` remnant from a just-closed forward is not a false "in use". |
+| `port_allocator.py` | Probes for a free loopback port at or above `tunnel_base_port` (7778). A port counts as free only when it is free on **every** loopback address (`127.0.0.1` and `::1`), since the forward binds one family and a foreign listener on the other leaves `localhost:<port>` ambiguous; an address the host cannot assign at all (`EADDRNOTAVAIL`/`EAFNOSUPPORT`/`EPROTONOSUPPORT`, e.g. IPv6 disabled) reads as free rather than occupied, while a probe that could not be *run* (`EMFILE` and friends) propagates rather than being coerced to either answer. A single-address primitive (`_is_addr_free(port, host)`) answers the narrower "did *this* forward's own address come free" question that orphan reclaim asks. The probe sets `SO_REUSEADDR` so a `TIME_WAIT` remnant from a just-closed forward is not a false "in use". |
 | `token_mint.py` | Runs `kirocrew token --ttl --port --embed-parent-port` on the remote over SSH (run-marker first, then a bin-candidate ladder) and parses the JWT out of the printed URL. Token is returned in memory only, **never logged**. |
 | `ssm_token_mint.py` | The SSM sibling of `token_mint.py`: runs the same subcommand via `aws ssm send-command` through the launcher's `cloud.ssm` chokepoint, reusing the shared remote-command builders. Token in memory only, **never logged**. See §13. |
 | `validation.py` | The authoritative injection-safe guard on `ssh_host` / `remote_bin`, and on `ssm_target` / `aws_profile` / `aws_region` / `ssm_run_as`, applied immediately before any command line is built. See §11. |
 | `run_marker.py` | Records the running gateway's own `kirocrew` launcher (and pid) keyed by port, so a remote mint execs the same venv the live gateway runs from. Also backs zero-config client port discovery. See §12. |
-| `ssh_tunnel_manager.py` | Supervises one tunnel child per instance — `ssh -N -L` or `aws ssm start-session` — with readiness wait, health probe, 2-tier self-heal, proactive token refresh, stored-token liveness probe, remote restart, orphan-forwarder reaping. One state machine, two transports. |
+| `ssh_tunnel_manager.py` | Supervises one tunnel child per instance — `ssh -N -L` or `aws ssm start-session` — with readiness wait, health probe, 2-tier self-heal, proactive token refresh, stored-token liveness probe, remote restart. One state machine, two transports. |
 | `diagnostics.py` | Dependency-ordered failure probes; reports the first broken link. `diagnose_instance` (SSH ladder) and `diagnose_instance_ssm` (SSM ladder). |
 | `handlers_instances.py` | Owner-only, enabled-gated, SEL-audited HTTP control plane. |
 
-**The local forward port mirrors the remote port.** `connect()` sets
-`local_port = inst.remote_port` rather than allocating a fresh one: the embedded
-iframe loads from `http://<host>:<local_port>`, and the remote gateway only
-trusts CSRF/WebSocket `Origin`s on its own configured port, so mirroring keeps
-the Origin valid with no per-instance allowlisting. The consequence is a hard
-constraint: **every simultaneously-connected instance must use a distinct remote
-port**, and a busy port is a clear connect error rather than a silent fallback
-(a different local port would leave the pane unable to stream or act). The
-`PortAllocator` is therefore constructed but not on the connect path today; the
-`tunnel_base_port` setting configures it.
+**The local forward port is allocated, not mirrored.** `connect()` takes a free
+loopback port from `PortAllocator` (from `tunnel_base_port`, skipping ports the
+registry has already handed out) and does not require it to equal
+`inst.remote_port`. The embedded iframe loads from `http://<host>:<local_port>`
+and the remote gateway accepts that on any port because `check_origin` trusts a
+loopback `Origin` that equals the request's own `Host` — exactly the shape the
+iframe produces — `build_allowed_hosts` compares hostname only, and the session
+cookie is keyed off the browser-facing port (`_cookie_port_from_host`), so
+distinct local ports get distinct cookies in the shared `127.0.0.1` jar. This
+does not weaken CSE SEC-016: a malicious local page on an arbitrary port sends
+its own `Origin` while `Host` stays the gateway's, so the two differ and the
+request is rejected; browsers forbid scripts from forging either header.
+
+Earlier revisions mirrored the port (`local_port = inst.remote_port`) for the
+Origin reason above, which imposed a hard constraint that every
+simultaneously-connected instance use a distinct remote port. The shipped
+defaults contradicted it — a stock gateway binds the same default port on both
+ends, so a stock hub already held the port a stock remote reported and two stock
+installs could never connect (#1972). Reconnects reuse the instance's own
+previous port so the iframe origin and its cookie stay stable.
 
 **Platform note.** The hub side of this feature assumes a POSIX host with an
-OpenSSH `ssh` client on `PATH`. Two paths make that explicit: the
-orphan-forwarder reaper shells `ps -axww -o pid=,command=` and signals with a
-direct `os.kill(pid, signal.SIGTERM)` rather than going through
-`platform_compat`, and run-marker port discovery refuses outright on non-POSIX
-(§12). Treat a Windows hub as unverified.
+OpenSSH `ssh` client on `PATH`, and run-marker port discovery refuses outright on
+non-POSIX (§12). Treat a Windows hub as unverified.
 
 ---
 
 ## 4. The connect → warm → self-heal lifecycle
 
 1. **Connect.** `POST /api/instances/{id}/connect` validates the ssh inputs,
-   reaps any orphaned forwarder still holding the mirrored port, starts
+   allocates a free local forward port, starts
    `ssh -N -L`, waits until the local forward accepts a TCP connection, mints a
    dashboard token on the remote over SSH, and returns the live status plus the
    token. Connect is **idempotent**: an already-connected instance returns its
@@ -165,13 +193,21 @@ direct `os.kill(pid, signal.SIGTERM)` rather than going through
    `http://<dashboard-hostname>:<local>/?token=...` in an iframe, deliberately
    reusing the parent's own hostname so the pane is same-site with the parent and
    `SameSite=Lax` auth cookies are not withheld.
-2. **Warm set.** Up to `warm_set_cap` (default 5) most-recently-used instances
+2. **Warm set.** Up to `warm_set_cap` most-recently-used instances
    stay warm: iframe mounted (hide-not-unmount, so switching never reloads or
-   re-runs the token handshake) with a live tunnel and WebSocket. Exceeding the
+   re-runs the token handshake) with a live tunnel and WebSocket. The default
+   (`0`) is **automatic**: `GET /api/instances` resolves the cap from the live
+   connected count (`resolve_warm_set_cap`, bounded by
+   `WARM_SET_CAP_AUTO_CEILING`), so a crew the operator connected is never
+   evicted; an explicit integer is served verbatim, including one below the
+   connected count. Exceeding the
    cap **evicts the least-recently-used non-active iframe**. Eviction unmounts
    the iframe only: it does NOT disconnect the tunnel or clear `was_connected`,
-   so the tab persists and re-warms on the next click. Tabs disappear only on an
-   explicit disconnect.
+   so the switcher entry persists and re-warms on the next click. Entries
+   disappear only on an explicit disconnect. Note that re-warming re-mints the
+   token and cold-boots the remote SPA, so from the user's seat an eviction is
+   hard to tell apart from a dropped connection — which is why the default
+   tracks the connected count rather than a fixed number.
 3. **Health probe.** While CONNECTED, a per-tunnel loop polls the loopback
    forward every `DEFAULT_PROBE_INTERVAL_SECS` (30s, not user-configurable;
    `<= 0` disables the probe); after `probe_failure_threshold` (3) *consecutive*
@@ -211,7 +247,7 @@ mirrored ports) and each wrapped, so one unreachable host neither aborts the res
 nor crashes startup. It runs as a background task rather than awaited, because
 `on_startup` fires *before* the HTTP port is bound and serial SSH connects would
 delay the bind past the desktop app's gateway-wait window. A failed revive leaves
-`was_connected` true and records the failure reason, so the tab persists showing
+`was_connected` true and records the failure reason, so the entry persists showing
 why it is down.
 
 ---
@@ -220,15 +256,18 @@ why it is down.
 
 ### 5.1 `instances.*` config keys
 
-Defaults live in `kiro_crew.instances.constants` and are referenced from the
-`InstancesConfig` dataclass, so the constant and the config default cannot drift.
+Transport defaults and bounds live in `kiro_crew.instances.constants` and are
+referenced from `InstancesConfig`, so the documented values and runtime policy
+cannot drift.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `instances.enabled` | `false` | Primary opt-in, read at gateway startup. Also gates the CSP `frame-src` `*.localhost` extension. |
-| `instances.warm_set_cap` | `5` | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). Clamped up to 1. |
+| `instances.warm_set_cap` | `0` (automatic) | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). `0` tracks the live connected count so no connected crew is evicted, bounded by an internal ceiling; an explicit value is honoured exactly, including one below the connected count. Negative values fall back to automatic. |
 | `instances.tunnel_base_port` | `7778` | First local loopback port the allocator hands out. Out-of-range values fall back to the default. |
 | `instances.ssh_compression` | `true` | Add `-C` to the tunnel argv. See §5.2. |
+| `instances.connect_timeout_secs` | unset (SSH `15.0`, SSM `25.0`) | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). An explicit value applies to both transports, including a value equal to either transport's default. Values below 1 fall back to the transport defaults; values above 120 are clamped to 120. |
+| `instances.mint_timeout_secs` | unset (SSH `30.0`, SSM `90.0`) | How long (secs) to wait for the remote `kirocrew token` mint before failing a connect. The mint rides the same ssh transport as the tunnel, so a host behind a ProxyCommand or jump host pays the proxy handshake here too (the connect flow spawns two proxy-bound ssh children: `connect_timeout_secs` budgets the first, this budgets the second). An explicit value applies to both transports, including a value equal to either transport's default — size it for the slowest transport in use. Values below 10 fall back to the transport defaults; values above 120 are clamped with a warning. |
 | `instances.max_recovery_attempts` | `8` | Consecutive self-heal attempts before the tunnel is left disconnected. Below 1 falls back to the default; above `MAX_RECOVERY_ATTEMPTS_CEILING` (100) is clamped with a warning, so a pathological setting cannot turn bounded self-heal into a near-infinite retry loop. |
 | `instances.recover_backoff_max_secs` | `30.0` | Cap on the per-attempt backoff. Non-positive falls back to the default; above `RECOVER_BACKOFF_MAX_CEILING_SECS` (300) is clamped, bounding the worst-case wall-clock recovery window. |
 | `instances.probe_failure_threshold` | `3` | Consecutive health-probe failures before a non-forwarding tunnel is torn down. Below 1 falls back to the default. |
@@ -236,11 +275,12 @@ Defaults live in `kiro_crew.instances.constants` and are referenced from the
 ```bash
 kirocrew config set instances.warm_set_cap 3
 kirocrew config set instances.ssh_compression false
+kirocrew config set instances.connect_timeout_secs 45
+kirocrew config set instances.mint_timeout_secs 60
 ```
 
 Constants that are **not** user-configurable: the probe interval (30s), the token
-refresh fraction (0.8), the stored-token probe timeout (2s), the connect
-readiness timeout (15s), and the mint timeout (30s).
+refresh fraction (0.8), and the stored-token probe timeout (2s).
 
 ### 5.2 `instances.ssh_compression`
 
@@ -266,22 +306,25 @@ to gain).
 `~/.kiro/crew/instances.json`, one record per instance:
 
 ```
-id, name, ssh_host, remote_port (default 7777), local_port (0 = unallocated),
-ttl (default "20h"), remote_bin, was_connected
+id, name, ssh_host, remote_port (default 5476), local_port (0 = unallocated),
+ttl (default "20h"), remote_bin, was_connected, forwarder_pid (0 = none),
+forwarder_start ("" = unknown), forwarder_sig ("" = unsigned)
 ```
 
 plus a top-level `last_active_id`. `id` is a slug (`^[a-z0-9][a-z0-9-]{0,62}$`)
 derived from `name` when not given, with a numeric suffix on collision. The file
 holds **connection coordinates only**: no credentials or tokens are ever written
-there.
+there. Every anchored validator in this package ends with `\Z`, never `$`: Python's `$` also matches just before a trailing newline, so a `"20h\n"` would pass a `$`-anchored check and then reach an ssh/ssm argument list carrying an embedded newline. `ttl` is validated against the SAME bound the token minters enforce
+(`^[1-9][0-9]{0,3}[hm]$`): a value this layer accepted but they rejected would
+persist and then fail at the next connect, blaming the tunnel for a bad edit.
 
 Two persisted hints drive lazy reconnect:
 
 - `was_connected` is sticky "connection intent". It is set when a tunnel opens
   and cleared **only** on an explicit user disconnect, deliberately surviving
-  gateway shutdown and a failed auto-revive, so the frontend keeps the tab in an
+  gateway shutdown and a failed auto-revive, so the frontend keeps the entry in an
   error / click-to-reconnect state instead of dropping it. It is also what the
-  frontend keys tab visibility on (`was_connected || connected || warm`).
+  frontend keys entry visibility on (`was_connected || connected || warm`).
 - `last_active_id` records the instance most recently connected to. `connect()`
   writes it and `remove()` clears it, and any value that no longer resolves to a
   live record is dropped on the next write. Nothing in the gateway reads it:
@@ -289,8 +332,49 @@ Two persisted hints drive lazy reconnect:
   not just one, and the active pane is frontend state. `get_last_active()` is the
   only reader and has no production caller.
 
+A third hint pair, `forwarder_pid` + `forwarder_start`, exists for crash
+recovery rather than reconnect intent: `connect()` records the spawned
+forwarder child's pid and its opaque `platform_compat.process_start_time`
+identity next to `local_port` (one write), and a successful self-heal rebuild
+moves both to the replacement child. A gateway hard-kill (SIGKILL/crash) never
+runs teardown, so the forwarder survives, reparented to init, still holding its
+port and its session to the remote. The next `connect()` reclaims exactly that
+child, best-effort (a failed reclaim never fails the connect). The registry is
+agent-writable state, so a recorded claim is honored only when it
+authenticates: the record must carry `forwarder_sig`, the gateway's own HMAC
+over (instance id, pid, start time, port) under a key derived from the SEL
+trust root (`sel_hmac_key_path()`, domain-separated exactly like the
+`session_pid_sig` sidecar protocol) — a root an agent can neither read nor
+replace, so a record written, edited, or re-pointed by anything but the
+gateway fails verification outright and nothing is ever signalled for it.
+Behind the MAC, defense in depth from kernel-owned facts: the candidate must
+be a genuine ORPHAN — not a pid this manager currently supervises, and
+reparented to init (`get_ppid == 1`), which no live gateway's forwarder is
+(subreaper hosts read as non-orphaned and merely miss the reclaim). Then, iff
+the recorded
+`local_port` probes occupied AND both identity halves are recorded AND the
+pid's live start time equals the recorded one AND its **full argv exactly
+equals** the forward command line the manager would construct for the recorded
+port (`platform_compat.process_argv_matches_exact`), it is signalled — SIGTERM
+escalating to SIGKILL on a bounded grace, with the start-time identity
+**re-verified before the SIGKILL** (the grace window is exactly where a pid can
+exit and be recycled); pid-scoped for ssh, whose child shares the dead
+gateway's process group; group-scoped for SSM, whose child owns its group, with
+completion judged by the whole group being gone and the port actually
+releasing. Anything short of full identity — either hint missing, start time
+differing or unreadable, argv unreadable (always the case on Windows, so the
+guard fails closed there), or any argv element differing — means the identity
+cannot be confirmed: the process is left alone (logged, and SEL-audited when
+anything was signalled) and allocation simply skips its port; the freed port
+returns to the pool at the next allocation rather than being re-taken by the
+same connect. Reclamation is keyed on the manager's OWN recorded identity,
+never a process-table scan — matching the table by argv pattern is what once
+SIGTERMed forwards operators had opened themselves (#1972).
+
 `disconnect()` resets `local_port` to the unallocated sentinel together with
-`was_connected` in one write, so a freed port is never left reserved.
+`was_connected` and the forwarder identity pair in one write, so a freed port
+is never left reserved and a stale identity never reaches a later reclaim's
+checks.
 
 ---
 
@@ -305,14 +389,15 @@ request with no `request["user"]` with `401`, and rejects a disabled feature wit
 | Method and path | Purpose |
 |---|---|
 | `GET /api/instances` | List instances + live status + `warm_set_cap` + `active`. |
-| `POST /api/instances` | Add an instance. |
-| `PATCH /api/instances/{id}` | Edit `name`/`ssh_host`/`remote_port`/`ttl`/`remote_bin` (internal hints are not editable). |
+| `POST /api/instances` | Add an instance. A rejection carries a machine-readable `code` beside its human message, so a client can branch without parsing prose: `invalid_json` / `invalid_body` (unreadable request), `invalid_field` (a named field failed validation), `instance_duplicate` (the name is taken), `instance_invalid` (the record as a whole is not addressable) and `instances_manager_unavailable`. The dashboard forwards the code into its error → agent hand-off, which is why it has to be on the wire rather than derived from the message. |
+| `PATCH /api/instances/{id}` | Edit `name`/`ssh_host`/`remote_port`/`ttl`/`remote_bin`/`connection_method`/`ssm_target`/`ssm_run_as`/`aws_profile`/`aws_region` (`id` and internal hints are not editable). Editing a field the tunnel is BUILT from (everything except `name` and `ttl`) disconnects a live tunnel first, because it would otherwise keep forwarding the old port to the old host under the new label; the teardown passes `keep_intent=True` so it does not touch `was_connected` — that flag records a USER disconnect, so a reconfiguration leaves it alone and a real disconnect arriving mid-edit still wins. The crew therefore keeps its switcher entry and reconnects in one click. The teardown and the coordinate rewrite happen as ONE operation, `SshTunnelManager.reconfigure()`, which holds the manager lock across both. Done as two steps a `connect` can read the OLD record in between, and whether its tunnel is already CONNECTED or still CONNECTING when the write lands decides whether any after-the-fact sweep would notice it — so the window is removed rather than narrowed: a racing `connect` either completes before (and is torn down inside the section) or starts after (and reads the new coordinates). It also cancels and AWAITS that instance's in-flight self-heal first: recovery reads the record before it takes the lock, so a recovery already running carries the pre-edit coordinates and would reinstall a tunnel to the old machine. Because that cancellation itself awaits, a reconfiguration additionally raises a per-instance BARRIER before its first await; while the barrier is up the scheduling seams refuse to start work — `_on_tunnel_exit` will not begin a self-heal, a backed-off one returns without acting, and `_schedule_token_refresh` will not restart a mint loop — so nothing can slip into the window. Self-heal is cancelled AND awaited before the coordinates move, because it rebuilds from the record it read. The token-refresh loop is unwound by the teardown instead — after the stop succeeds — so a REJECTED edit leaves the live tunnel holding both its credential and its refresh; in both cases the cancellation is awaited, since a mint already in flight would otherwise store a token for a tunnel that is being replaced. A teardown that raises ABORTS the edit with `503` / `code: tunnel_teardown_failed` and persists nothing: a stop that failed leaves the old forward live, so advancing the record would describe one machine while the still-open tunnel serves another — and that tunnel is the one the user reaches. Nothing is discarded unless the stop succeeded — the tunnel keeps its place in `_tunnels` along with its token and refresh task — so a failed stop can neither leave an untracked process holding the port nor a live forward without a credential. The registry write is also shielded from cancellation: a client hanging up mid-write must not unwind the `async with` and free the lock while the write is still in flight. An edit sends only the fields that DIFFER from an IMMUTABLE snapshot of the record taken when its form opened (not the live polled record, which a concurrent CLI edit would move under the user), so the later of two concurrent saves cannot revert the earlier one's corrections; optional fields travel as explicit empty values, so emptying one clears it instead of being read as "leave as-is". The dashboard does NOT reconnect afterwards: any automatic reconnect races an explicit Disconnect arriving mid-save, so the row offers **Connect** instead. A crew CORRELATED to a cloud stack has its `connection_method`/`ssm_target`/`aws_profile`/`aws_region` frozen in the edit form and omitted from the request — Stop/Start/Delete resolve the machine through those, so editing them would strand a billing instance. That freeze is now enforced **server-side too**: this endpoint rejects the four addressing fields for a correlated cloud instance with `400` / `code: cloud_instance_addressing_locked`, so a non-dashboard caller (CLI, script, the agent driving this owner-only API) can no longer rewrite the coordinates and strand a billing instance. Correlation is resolved against the cloud launch store via `_is_correlated_cloud_instance()`, checked against the record already fetched for the edit. An SSM crew that cannot be correlated is offered no lifecycle action, so its fields stay editable — that identity is how the dashboard finds the machine to stop or delete, and editing it away would strand a billing instance. |
 | `DELETE /api/instances/{id}` | Disconnect then remove. |
-| `POST /api/instances/{id}/connect` | Open tunnel + mint token. Returns the token. |
+| `POST /api/instances/{id}/connect` | Open tunnel + mint token. Returns the token. A failure carries a machine-readable `code`, and that code is the failure-diagnosis ladder's OWN verdict (`ssh_unreachable`, `remote_down`, `tunnel_down`, …) promoted to the top level, so a client reads which link broke without walking into `diagnosis`. Only a verdict that is present AND **negative** is promoted: the stored diagnosis is the last ladder RUN, so a stale `ok` from before the failure would otherwise be published as this call's reason. With no usable verdict the stage that failed names itself — `instance_connect_failed`, or `instance_token_unconfirmed` when the tunnel came up but its credential did not confirm. The frontend applies the same present-AND-negative rule before quoting a verdict or its probe chain into the agent hand-off, for the same staleness reason. |
 | `POST /api/instances/{id}/refresh-token` | Force a fresh mint and return the new token. See below. |
 | `POST /api/instances/{id}/disconnect` | Tear down one tunnel. |
 | `GET /api/instances/{id}/status[?diagnose=1]` | Live status; `?diagnose=1` runs the failure ladder and merges the result. |
 | `POST /api/instances/{id}/restart` | Restart the remote gateway over SSH. |
+| `ANY /api/instances/{id}/proxy/{path}` | Generic chat proxy — the carrier for the remote-crew chat view. Forwards a **bounded slice** of a CONNECTED peer's `/api/` surface over the already-open tunnel via `SshTunnelManager.proxy_request`, streaming the reply chunk-by-chunk (a proxied chat turn streams SSE for minutes, so the client timeout is connect + read-idle, never total). Credential rules match the federated search: the manager-held token travels as the port-scoped cookie and never reaches the browser; a `401/403` gets exactly one transparent re-mint retry; `allow_redirects=False` (a compromised peer answering 30x must not steer the hub — SSRF). Path policy is a **canonicalization**, not a pattern check, and runs before any URL is built: the caller's path is percent-decoded to a fixed point (bounded by `PROXY_PATH_MAX_DECODE_PASSES`, a deeper chain is refused), then every segment must be a plainly-named token — no empty segment, no all-dots segment, and only unreserved/sub-delim characters — and the forwarded path is **rebuilt from exactly those vetted segments**. Vetting the decoded form and forwarding the rebuilt one is what closes encoded traversal at any depth: a half-decoded `%252e%252e` matches no denylist rule yet still normalizes back into the control plane. On that canonical form the vet policy is a **positive prefix allowlist** (`_PROXY_ALLOWED_PREFIXES`, `api/chat` + `api/stream` today): only the peer's `api/chat` subtree and its `api/stream` event feed are forwarded — each a prefix grant, so every route under one is reachable, which is the chat feature's own wire surface — and everything outside the named prefixes is refused by default: the peer's own `api/instances` plane (one hub cannot chain through a peer into a third machine's SSH control plane), the peer's token-minting routes (whose JSON replies would carry a minted peer credential back through the hub in-band), and any endpoint the peer grows outside the allowlisted prefixes. `api/stream` is the peer's own SSE broadcast endpoint and the out-of-turn half of the chat view: the per-turn reply streams back from `api/chat`, while session-list and slot-state changes arrive on `api/stream`. It is deliberately that endpoint and **not** its WebSocket sibling `api/ws` — a WS row would need a `101 Switching Protocols` to cross this proxy, and the reply content-type gate below exists precisely to stop a peer serving anything but JSON/SSE onto the authenticated hub origin, so an upgrade would tunnel straight through it. Note what the row admits: that feed is per-client but not per-slot, so a hub holding it receives the peer's whole notification/slot broadcast rather than only the session on screen — peer content crossing to a hub user who is already the peer's owner (this route is owner-only), so it widens volume, not privilege, and is the reason it is a named row rather than a blanket `api/` grant. A new prefix is added to the constant explicitly, never by widening back to deny-only; the constant's exact value is pinned by a test so widening is always a reviewed act. Methods limited to GET/POST/PUT/PATCH/DELETE; inbound bodies capped at `PROXY_REQUEST_BODY_MAX_BYTES` before buffering. No browser Origin or cookies are forwarded to the peer (the hub presents as a same-origin loopback client), and the hub's own `?token=` credential is **stripped from the forwarded query** — the browser may authenticate the proxy request with it, and forwarding it would hand the peer a replayable hub credential. Replies are gated to an **allowlist**: only `application/json` and `text/event-stream` content types are forwarded (a compromised peer must not serve active content that executes on the hub origin), and only allowlisted headers (`Content-Type`, `Cache-Control`, `X-Accel-Buffering`) cross back — `Set-Cookie` and everything else is dropped, with `X-Content-Type-Options: nosniff` added. Typed failures (`proxy_peer_not_connected`, `proxy_no_credential`, `proxy_unauthorized`, `proxy_peer_unreachable`) map to 5xx with a machine-readable `code`. |
 
 **Two routes cross the token boundary, not one.** `connect` and `refresh-token`
 both return a minted dashboard token in their response body, and they are the
@@ -329,11 +414,56 @@ the pair is `connect` + `refresh-token`, and nothing else.
 
 Status codes worth knowing: `503` when the manager is not running (feature
 enabled after startup), `404` for an unknown id, `502` when a connect, refresh,
-or remote restart fails, and `400` on invalid add/update input.
+or remote restart fails, and `400` on invalid add/update input (including a
+locked addressing-field edit on a correlated cloud instance — see §7).
 
 `restart` is wired end to end (route, handler, `restart_remote`, and an
 `api.restartInstance` client method) but no dashboard surface calls it today, so
 it is reachable only by an authenticated owner driving the API directly.
+
+A token is stored against a tunnel GENERATION, not just against "some tunnel for
+this instance". Every install bumps a per-instance counter; a mint captures the
+counter before it starts (mints run without the manager lock, so a slow one must
+not block connect/disconnect) and, under the lock, refuses to store its token if
+the counter moved. Without that stamp the only check available is
+`instance_id in self._tunnels`, which is true again for the REPLACEMENT tunnel —
+so a mint in flight across an edit-plus-reconnect, or across a self-heal
+reinstall, would overwrite the valid new token with one the current remote never
+issued, and the embedded dashboard would be handed a dead credential. The stamp
+covers every mint path rather than an enumerated list: the request-driven
+`refresh_token()` the embedded dashboard calls is not a task in `_refresh_tasks`
+and cannot be cancelled by name, so cancellation alone could never have reached
+it. A refresh also refuses to START while the reconfiguration barrier is up,
+since the coordinates it would read are about to move; the caller reports "no
+token" and the client retries after the edit.
+
+### 6.1 Why a transport edit tears the tunnel down instead of answering `409`
+
+The obvious cheaper contract is to REFUSE a transport edit while a tunnel is live
+(`409`, "disconnect first") and check-and-write under the existing lock. That
+deletes `reconfigure()` and everything it carries — the per-instance barrier, the
+recovery index, cancel-and-await on two task families, the shielded write — from a
+manager that is already large. It was rejected for one reason: **a transport edit
+is most often made because the tunnel is broken, and a broken tunnel is exactly
+what does not report itself as down.** A crew whose host moved, whose port was
+taken, or whose AMI runs a different remote user sits in `connected` or
+`connecting` while being unusable; `409` would answer "disconnect first" to a user
+who is editing precisely because connecting is what stopped working, and it hands
+them a two-step where the failure mode of forgetting step one is a silent
+mismatch between the record and the live forward.
+
+The machinery is also not paid for by this feature alone. Every piece exists
+because a tunnel's coordinates can change under a task that already read them —
+which is equally true of the pre-existing self-heal and token-refresh loops, and
+is where two of the bugs found during this PR's review actually lived. Making the
+edit path safe hardened those seams rather than adding a new hazard: the barrier
+is what stops a backed-off self-heal from reinstalling a tunnel to a machine the
+user has moved on from, with or without an edit in flight.
+
+What the design deliberately does NOT do is reconnect afterwards. Saving ends
+disconnected and the row offers **Connect**, because any automatic reconnect races
+an explicit Disconnect arriving mid-save. So the cost is bounded: the save closes
+what its own edit invalidated, and never reopens anything on the user's behalf.
 
 ---
 
@@ -378,6 +508,21 @@ it is reachable only by an authenticated owner driving the API directly.
   `is_sensitive_path` floor, so agent file tools can neither read nor write it.
   See §12 and [security.md](security.md).
 - **SEL audit trail.** Every control-plane action is audited, reads included.
+- **Addressing fields locked for a correlated cloud instance.** `PATCH
+  /api/instances/{id}` rejects an edit to `connection_method`/`ssm_target`/
+  `aws_profile`/`aws_region` (`400`, `code: "cloud_instance_addressing_locked"`)
+  when the instance's current `ssm_target` matches an EC2 instance id in the
+  cloud launch job store (`kiro_crew.cloud.connect.is_launched_instance()`) —
+  i.e. Kiro Crew provisioned it, as opposed to a hand-added SSM record. These
+  four fields are how `coordsOf()` (`RemoteCrewPanel.tsx`) builds
+  `{profile, region, instanceId}` for Stop/Start/Delete; rewriting them on a
+  correlated instance leaves those actions unable to resolve the real EC2
+  stack, which then keeps running and billing with no dashboard path to reach
+  it. The dashboard already freezes these fields client-side for a correlated
+  instance and never sends them; this is the server-side backstop for any
+  other owner-authenticated caller (CLI, script, the agent itself). A
+  hand-added SSM instance is unaffected — its `ssm_target` won't match any
+  launch job, so the lock never engages.
 
 ---
 
@@ -390,21 +535,134 @@ it is reachable only by an authenticated owner driving the API directly.
 3. **Add** an instance:
    - *Name*: any label.
    - *SSH host / alias*: what you would type after `ssh` (see §9).
-   - *Remote port*: the port the remote gateway listens on. It must be unique
-     across instances, because the local forward mirrors it.
+   - *Remote port*: the port the remote gateway listens on. Instances may share
+     it — the local forward port is allocated independently.
    - *Token TTL*: default `20h`.
    - *Remote kirocrew path*: only needed when `kirocrew` lives somewhere
      non-standard on the remote.
 4. Click **Connect**. The hub opens the tunnel and mints a token.
-5. **Switch** panes from the tab strip in the top header (**Local** returns to
-   your own dashboard). In the Electron shell, Cmd/Ctrl+digit jumps between panes
-   in tab order.
-6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** /
-   **Remove** from its row.
+5. **Switch** panes from the switcher dropdown in the top header (**Local**
+   returns to your own dashboard). In the Electron shell, Cmd/Ctrl+digit jumps
+   between panes in switcher order. Each row names its tunnel state in words on
+   screen next to the status dot — colour is reinforcement, not the carrier, so
+   the row that errored is findable without hovering every entry. Crews you switch
+   between often can be PINNED beside the trigger as chips, so the switch costs no
+   dropdown click — see [Pinned crew chips](#pinned-crew-chips).
+6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** from its
+   row. **Edit settings** / **Remove** live in the row's overflow menu — a row
+   shows two primary actions plus that menu, so everything past them is one
+   menu deep.
+
+An unsaved edit is held by the PANEL, keyed by crew, not by the form component.
+The crew list unmounts for any number of reasons the form cannot see — switching
+to the **Set up a new one** tab is enough — and an edit whose only home was the
+form's own state came back silently reverted to the stored record. Because a
+guard can only refuse the exits it enumerates, the values are lifted instead of
+defended: the form is re-seeded from that draft when it remounts. The draft carries
+its **baseline** — the record it was typed against — and not just the values:
+re-deriving the baseline from the current `inst` on remount would rebase a stale
+draft onto a newer poll, so a port someone changed from the CLI meanwhile would
+read as a difference and be written back to its old value by a save the user
+thought only touched the host. One snapshot anchors everything: `dirty` and the
+request body both measure against that baseline, so a restored draft is unsaved
+work rather than a clean form, and a field the user never touched is never a
+difference. Only three things clear it: **Cancel** (the user choosing
+to discard), a successful save, and the crew ceasing to exist. That last one is
+anchored to the crew's EXISTENCE rather than to the Remove button, so a removal
+from the CLI or a cloud Delete clears it too — ids are derived from the name, so a
+crew added afterwards can land on the same id, and a surviving draft would remount
+on a different machine and let Save overwrite settings the user never typed. It is
+gated on a SUCCESSFUL poll, so an errored fetch is not read as "all crews gone"
+and does not throw unsaved work away.
+
+A live id is not proof of a live RECORD, though: a crew removed and recreated under
+the same derived id between two polls never leaves the list. So the draft is also
+checked against the record's **machine-addressing** fields (`connection_method`,
+`ssh_host`, `remote_port`, `ssm_target`, `aws_profile`, `aws_region`). When one of
+those moved externally, the form says so, names the fields, and **withholds Save**
+until the user adopts the current record. This is deliberately not a silent choice
+either way, because the two situations that produce the signal are
+indistinguishable from the client and want opposite outcomes: a concurrent CLI edit
+should keep the user's typing, while a replacement must never receive it — only the
+person looking at the row can tell which happened. A label or lifetime changed
+elsewhere does NOT trigger it: that cannot make this a different crew, and the
+baseline diff already stops the save from reverting it.
+
+Adopting the record is a **three-way merge**, with the draft's original baseline as
+the merge base: fields the user typed are kept, every field they did not touch is
+taken from the record that exists now, and the baseline advances to it. Keeping the
+old values wholesale would convert untouched-but-stale fields into deliberate
+writes — the very clobber the baseline exists to prevent.
+
+A save that tore the tunnel down also drops the crew's WARM pane. That pane is an
+iframe holding the old local port and token, so once the tunnel behind it is gone
+it cannot be revived by reconnecting — it would reuse a credential the new tunnel
+never issued and sit on 403. The decision reads the saved record's own status
+rather than guessing from which fields changed, so a name-or-ttl-only edit (which
+tears nothing down) keeps its working pane. Opening a DIFFERENT crew's editor while one
+holds unsaved changes is still refused outright — that is about two editors being
+open at once, not about the unmount — and the refusal renders at the row that was
+clicked, since the menu has already closed by then.
 
 > Prerequisite: you can already `ssh <ssh_host>` non-interactively from the hub
 > (a valid key or cert in your `ssh-agent`, no password prompt), and the remote
 > has `kirocrew` installed with a gateway running on its loopback port.
+
+### Pinned crew chips
+
+Switching between two crews through the dropdown costs a click every time. Any
+entry — including **Local** — can be PINNED from the pin icon on its own dropdown
+row (lit for pinned, unlit outline for not), which lifts it out of the menu into
+an always-visible chip beside the trigger. Nothing is pinned by default, so a
+single-crew user pays no header width for the feature and sees no chip row at all.
+
+The pin sits on the row rather than in a second list of the same crews below it,
+and it is a SIBLING menu item of the row's switch target rather than a button
+inside it: a `menuitemradio` may not contain another interactive element, so a
+nested pin would be invalid ARIA and unreachable by the menu's own arrow keys.
+Clicking a pin toggles it and leaves the menu open, so several crews can be
+pinned in one visit without navigating anywhere.
+
+Pinning is per crew rather than one expand-everything switch because the header's
+budget is a PIXEL budget, not a crew count: three crews named after real hosts
+outgrow it while six short names fit. Choosing WHICH crews are worth header space
+is what keeps that budget spendable on the ones actually being switched between.
+
+| Concern | Behaviour |
+|---|---|
+| Storage | `localStorage` key `mc-crew-switcher-pinned`, a JSON array of instance ids (`__local__` for the local dashboard). A module-level store broadcasts changes, because several bars in one realm are mounted at once and hidden with `display:none` rather than unmounted — a per-component hook would leave a hidden bar on a stale value until it remounted. A remote pane's embedded bar is a separate cross-origin realm and so carries its own pin set. |
+| Migration | The predecessor was one expand-everything flag, `mc-crew-switcher-expanded`. On first read a `'1'` there migrates to a pinned **Local** rather than to an empty set: that user wanted chips, and migrating them to nothing would read as the feature having been removed. The legacy key is dropped in the same pass. |
+| Order | The crew on screen leads as its own chip, then the pinned chips, then the dropdown. The dropdown TRAILS the chips so it stays adjacent to the last one and reads as "and the rest"; it carries the aggregate unread for every crew not on screen, clipped ones included. The active crew is never also a pinned chip — two copies of one name would spend the budget twice. |
+| Width bound | None of its own. The switcher sits in the topbar's left grid track (`minmax(0,1fr)`) inside `.tb-left`, which carries `min-width:0` and `overflow:hidden`, so the track structurally prevents it from reaching the centered search column — see [the three-track topbar](#pinned-crew-chips). Earlier revisions of this feature carried a `vw`-derived `max-width` because the search overlay was absolutely positioned and a left-side cluster could squeeze it; the grid layout removed that failure mode along with the need for the cap. |
+| Overflow | The row is a single `nowrap` line with `overflow: hidden`, and the chip at the boundary is CUT rather than dropped. Wrapping into a hidden second row would keep every chip whole, but a wrapped row still holds its full ALLOCATED width with the wrapped chips' space empty — which pushes the trailing dropdown away from the last visible chip by a gap that changes with the viewport. Filling the row keeps the two adjacent (measured at the 4px flex gap, asserted by the capture harness). A trailing fade marks the cut edge, so a cut chip reads as "there is more, in the dropdown next to me" rather than as a rendering fault. Cut chips stay reachable in the dropdown, whose row marks them *no room* so a pin with no visible chip does not read as a pin that failed. |
+
+**Why the switcher needs no width cap.** The topbar is a three-track CSS grid:
+`minmax(0,1fr) | clamp(240px,22vw,480px) | minmax(0,1fr)`. The search column is a
+flow-internal track, not an absolutely positioned overlay, so a wide left cluster
+cannot reach it: `.tb-left` is `min-width:0` with `overflow:hidden`, and the track
+simply gives the chips less room. That is the whole bound, and it holds at every
+viewport width and under the macOS Electron 84px header inset (which narrows the
+tracks rather than shifting content over them).
+
+This is worth stating because the obvious alternative is wrong in a way that
+already shipped once: a hardcoded fraction. `max-w-[42vw]` on the chip row reached
+~538px at 1280px, which under the previous absolutely-positioned search overlay
+pushed its available space under the minimum width and unmounted it outright. A
+fraction cannot track a viewport-relative sibling; a grid track does it by
+construction.
+
+
+Counting which chips were cut off is read-only and one-directional: the result is
+consumed only by the dropdown's rows, which are portalled and contribute nothing
+to the header's width, so nothing sized by the measurement lives inside the thing
+being measured. The dropdown's own unread badge is absolutely positioned for the
+same reason — appearing must not change the button's width, since the chip row is
+sized from the space that button leaves. The rule itself (a chip whose trailing
+edge passes the row's visible width is cut) is a pure function, `clippedChipIds`,
+because jsdom performs no layout and a rendered test could never distinguish a
+fitted row from a clipped one. `offsetLeft` is only sound there because the row
+carries `position: relative`, making it the chips' offsetParent and putting both
+in the same coordinate space as its `clientWidth`.
 
 ---
 
@@ -495,10 +753,23 @@ used by the managed path.
 
 ### Provisioning from the dashboard (`/api/cloud/*`)
 
-The Remote Crew settings page can create an EC2 crew in the user's own AWS
+The Remote Instances settings page can create an EC2 instance in the user's own AWS
 account without dropping to the CLI. `dashboard/handlers_cloud.py` exposes the
 launcher behind the same owner-only guard as `/api/instances/*`: an
 authenticated owner (`request["user"]`), non-Slack, POSIX only, `403` otherwise.
+
+**The two read-only launch routes are the POSIX exception.** `GET
+/api/cloud/launch` and `GET /api/cloud/launch/{id}` parse a local job store and
+shell to nothing, so they answer on every platform (`_guard(..., posix_only=False)`);
+everything that can provision, stop or terminate stays POSIX-gated with
+`400 posix_host_required`. The list is what makes the crew rows classifiable
+(cloud-launched vs hand-added), and the panel waits for it before rendering
+anything — so gating it on Windows replaced the whole Remote Crew list, SSH rows
+included, with a cloud-provisioning error and no way to connect or remove
+anything. On a Windows host the route answers with whatever launch history is
+persisted in the config dir — normally nothing, since nothing there could have
+created a job, though a config dir carried over from a POSIX host still reports
+its real jobs.
 
 | Method and path | Purpose |
 |---|---|
@@ -568,9 +839,9 @@ whose current variable parts are all charset-bound literals.
 | Iframe is blank or black | The pane's embedded SPA never announced readiness within 15s, so the error panel with **Retry** appears (Retry force-reloads even an identical src). An iframe reports no load error to its parent, so this watchdog is the only signal. |
 | Connect fails with an SSH auth error | Refresh your SSH credentials (re-add the key to `ssh-agent`); `BatchMode` never prompts, so a missing credential is an immediate failure. Tunnels self-heal once auth is restored. |
 | Connect fails for another reason | Use **Diagnose**. The ladder reports the first broken link: `ssh_unreachable` (check SSH access or the host alias), `remote_down` (remote gateway not listening), `not_connected` (SSH and remote are fine, this instance has no tunnel yet: click Connect), or `tunnel_down` (reconnect). |
-| "local port N is already in use" | The forward mirrors the remote port, so two instances cannot share one. Change this instance's remote port (and the remote gateway's own port to match), or stop whatever holds the port. |
+| "local port N was taken while connecting" | The allocator picked a port that something grabbed in the moment before `ssh` bound it. Retry. If it persists, stop whatever keeps taking ports in that range or move `instances.tunnel_base_port` to a quieter one. |
 | Instance keeps dropping | The health probe plus 2-tier self-heal retry over roughly a two-minute window (8 attempts, capped-exponential backoff). Tune `instances.max_recovery_attempts` / `recover_backoff_max_secs` / `probe_failure_threshold`; both recovery values are clamped so they cannot loop indefinitely. If self-heal gives up, diagnosis runs automatically. Check the remote gateway and SSH stability. |
-| A pane vanished from the warm set but its tab is still there | It was LRU-evicted (warm set full). The tunnel is untouched: clicking the tab re-warms it. Raise `instances.warm_set_cap` if you want more panes resident. |
+| A pane vanished from the warm set but its switcher entry is still there | It was LRU-evicted (warm set full). The tunnel is untouched: selecting the crew re-warms it, though the re-mint plus SPA cold boot makes that look like a reconnect. Only an explicit `instances.warm_set_cap` can now be below the connected count — set it to `0` to let the cap track how many crews are connected. |
 | Every token mint fails on one remote, though its gateway is healthy | The remote's `~/.local/bin/kirocrew` probably points at an uninstalled checkout. See §12: the run-marker is what makes mint follow the *running* gateway's install. |
 
 ---
@@ -610,7 +881,7 @@ Where it is called, and what each caller does with a rejection:
 
 | Caller | Behavior on rejection |
 |--------|----------------------|
-| `SshTunnelManager.connect()` | Returns an ERROR status carrying "invalid ssh settings", retained in `_last_error` so the tab can explain itself. |
+| `SshTunnelManager.connect()` | Returns an ERROR status carrying "invalid ssh settings", retained in `_last_error` so the switcher entry can explain itself. |
 | `SshTunnelManager._recover()` | Aborts self-heal for that instance with a warning (no point retrying an unusable record). |
 | `SshTunnelManager._refresh_token_once()` | Aborts the refresh with a warning. |
 | `SshTunnelManager.restart_remote()` | Returns `{ok: false, message: "invalid ssh settings: ..."}`. |
@@ -674,7 +945,7 @@ marker is inert there, but the *filename* still matters to consumer 2.
 
 The marker's filename advertises which port a gateway serves, so `marker_ports()`
 lets a local client command (`token` / `status` / `logout` / `stop`, via
-`cli_server.resolve_client_port`) find a gateway on a non-default port with no
+`port_resolution.resolve_client_port`) find a gateway on a non-default port with no
 configuration. That path reads only the filename and ignores marker *contents*
 entirely. Resolution order is `--port`, then `KIROCREW_PORT`, then a port named
 by `dashboard.url`, then the sole gateway-owned marker, then the default 5476.
@@ -683,7 +954,7 @@ by `dashboard.url`, then the sole gateway-owned marker, then the default 5476.
 graceful shutdown, so a crash or SIGKILL leaves the file behind and an unrelated
 process may since have bound that port. Because client commands send the local
 secret (`X-Local-Secret`) to whatever answers, the consumer must verify the
-listener before trusting a discovered port. `cli_server._gateway_owns_port()`
+listener before trusting a discovered port. `port_resolution._gateway_owns_port()`
 does that in four fail-closed steps: the recorded pid must exist, must be among
 `platform_compat.find_listening_pids(port)`, must be owned by the caller's uid
 (which closes pid recycling into another user's process), and must look like a
@@ -693,9 +964,80 @@ file-permission argument does not hold, so Windows users keep `--port` /
 `KIROCREW_PORT`. This module deliberately offers no bare "is something
 listening" helper, so no caller can mistake reachability for identity.
 
-The live gateway prunes markers naming other ports on startup: a gateway is a
-singleton per data home, so any other marker belongs to a crashed earlier run,
-and each stale one costs a future client command a listener lookup.
+The live gateway prunes markers naming other ports on startup, EXCEPT any whose
+gateway passes the same ownership proof its readers use. `gateway.lock` makes a
+gateway a singleton per data home only when every start goes through it, and in
+practice one machine runs several that share a home (a second gateway launched by
+hand, one started from another checkout that inherits the default data home, a
+cutover overlapping its predecessor). A blanket prune deletes a LIVE gateway's
+marker and pid sidecar, which makes it undiscoverable to `token` / `status` /
+`stop` and destroys the evidence section 12.1 depends on. The ownership check fails
+closed by RETURNING FALSE rather than raising -- non-POSIX returns False outright,
+and a missing or throwing listener-lookup tool is folded into False as well -- so a
+False answer means "ownership not proven", NOT "process gone", and the two cases are
+indistinguishable from the caller. Such a marker still prunes, so markers do not
+accumulate forever -- but the prune removes only the marker and pid sidecar, never
+the credential, because treating False as death would strip a LIVE incumbent's
+credential on every Windows host and push its clients onto a shared file a newcomer
+may have replaced. `clear_marker()` owns credential deletion.
+
+### 12.1 The internal-API credential is keyed by port
+
+`<data-home>/run/gateway-<port>.secret` holds the internal-API credential of the
+gateway serving that port, written `0600` beside the marker and removed by
+`clear_marker()` with it.
+
+The credential is generated per gateway start (`os.urandom(16).hex()`) and kept in
+memory as the value the auth middleware compares against, so it identifies ONE
+generation. Published only to the single shared `<data-home>/.local_secret`, it
+was last-writer-wins per home: a second gateway starting in the same home replaced
+the file while the first kept serving the port, the incumbent went on comparing
+against its own in-memory value, and every internal caller then sent the
+newcomer's credential to the incumbent. The whole internal channel answers 403
+with a body of exactly `Forbidden` until one of them restarts: `learn_add`,
+`spawn`, `session-keepalive`, artifact writes, the task runner, all at once, with
+no warning and no metric.
+
+Two rules keep the two halves paired:
+
+- **The writer** (`dashboard.server._write_instance_credentials`) always writes the
+  per-port file, and writes the shared `.local_secret` only when no other gateway
+  in the home is verifiably alive on a different port. The shared file is still
+  written in the single-instance case because pre-per-port readers (an older CLI,
+  a cron script from a previous install) know only that path.
+- **The reader** is ONE shared helper, `config.loader.read_local_secret(port)`: it
+  returns the credential for the port the caller is about to dial and falls back to
+  `.local_secret` when no per-port file exists. It lives there rather than in each
+  reader because every surface that implements its own read reintroduces the bug for
+  itself. **`port` is required.** An optional port would resolve the dial target from
+  process context, so a converted call site could read the credential for one gateway
+  while dialing another -- the same desync, reintroduced one call site at a time and
+  invisible in the hunk under review. A caller with no port resolves one explicitly
+  and passes it, where the choice is reviewable. `mcp_core`, `mcp_shared`,
+  `cron_script`, `computer_use/screencast` and the Sage review driver each name their
+  dial target; a test greps for a no-argument call so the shape cannot come back.
+- **The dialed port's own credential outranks any path a caller names.**
+  `cron_trigger.trigger_cron_job` reads the per-port credential for the port it posts
+  to FIRST, and falls back to the `secret_path` its caller named only when that is
+  absent. The order is deliberate and is dictated by the callers: both of them pass
+  `config_dir() / ".local_secret"`, the home-wide file, which is exactly the file a
+  second gateway generation replaces -- so preferring the named path would reinstate
+  the defect this module exists to prevent.
+  The cost of that order, stated rather than hidden: a crash-orphaned
+  `run/gateway-<port>.secret` (the prune never deletes credentials, see section 12)
+  is preferred over a correct named path, so a caller that genuinely names another
+  home's credential for a port this home once served would send the stale one and get
+  a 403. No caller does that today -- both name the ambient home-wide file -- and
+  closing it properly means the credential-path parameter going away rather than the
+  order flipping.
+
+A denial carries a machine-readable `code` (`internal_auth_mismatch`) beside the
+prose, because a genuine permission denial produces the same `Forbidden` body and a
+consumer matching on text misdiagnoses one as the other. It also names both sides by
+fingerprint (a short SHA-256 prefix plus length, never the value), so a
+cross-generation mismatch is distinguishable from a forged header and from a caller
+that had no credential at all; without it a real desync is unattributable from the
+log.
 
 ### Why `run/` is on the sensitive-path floor
 
@@ -943,7 +1285,14 @@ was unreachable (the peer's own `code` is forwarded).
 
 **`send-session` is NOT a third token-crossing route.** §6's invariant holds:
 `connect` and `refresh-token` remain the only two routes whose response carries a
-minted token. The transfer needs the credential but the browser does not, so the
+minted token. The chat proxy cannot become a third one in-band either: its
+allowlist (§6) forwards only the peer's `api/chat` and `api/stream` surfaces —
+neither of which mints anything — so the peer's own token-minting routes are
+unreachable through it. That is a property of the allowlist, so it must be
+re-checked whenever a prefix is added: a new row that reached a minting route
+would make the proxy a third token-crossing route without touching this file.
+The transfer needs the
+credential but the browser does not, so the
 request is issued **inside `SshTunnelManager.send_session_bundle`** — the token
 never leaves the manager, is sent as a cookie (so it cannot land in the peer's
 access log), and is never logged. Any audit of where tokens leave the gateway
@@ -978,3 +1327,109 @@ other direction is therefore done by registering the peers you want on each host
 that should originate a transfer, and a hub-initiated **pull** (read a peer's
 session over the same forward) is the natural follow-on that would make
 remote → hub and remote → remote work without any reverse reachability.
+
+## 15. Federated session search (search every connected instance at once)
+
+`GET /api/instances/search-sessions` answers one query with sessions from the
+local gateway **and** every instance whose tunnel is currently `CONNECTED`. The
+dashboard's two search surfaces switch to it automatically whenever at least one
+warm connection exists (the ⌘K palette's Sessions tab and the sidebar's Older
+Sessions search); with no warm instance they keep calling the plain local
+`/api/sessions/search`, so a peerless install never pays the detour.
+
+### 15.1 It is the hub-initiated pull §14.6 anticipated
+
+The search reuses the transfer's transport shape exactly: the hub GETs a peer's
+own `/api/sessions/search` **over the already-open forward** — no SSH spawn, no
+new port, no reverse reachability. `SshTunnelManager.search_sessions_remote`
+follows `send_session_bundle`'s credential rules to the letter: **the token
+never leaves the manager** (§6's invariant holds — `connect` and `refresh-token`
+remain the only routes whose response carries one), it travels as the
+port-scoped cookie so it cannot land in the peer's access log, and a `401/403`
+gets exactly one transparent re-mint retry, because a retained credential can go
+stale while the tunnel stays `CONNECTED`.
+
+"Follows the same rules" is now **enforced rather than asserted**: all three
+peer-request methods — `send_session_bundle`, `search_sessions_remote` and
+`proxy_request` — resolve their target and credential through one shared private
+pair, `_peer_target` (connected-only, loopback target, port-scoped cookie name)
+and `_peer_cookie_header` (credential re-read per attempt, sent as a cookie,
+never logged). A fourth caller inherits the invariant instead of copying it.
+What is deliberately *not* shared is each method's error contract: the
+`proxy_`/`transfer_`/`search_` code families belong to three separate route
+contracts, so the helper reports a neutral reason and each caller names its own
+code as a literal — a drift test asserts the three stay distinct.
+
+Each peer request runs under `DEFAULT_SEARCH_PROXY_TIMEOUT_SECS` (6s) — sized
+between the token probe (2s, a bare ping, which would produce false
+"unreachable" verdicts on a loaded peer doing real scan work) and the transfer
+budget (30s, which would let one dead tunnel stall a keystroke-driven search).
+Peers are fanned out concurrently, so the slowest peer bounds the whole reply.
+
+### 15.2 Merging without a cross-instance score
+
+The aggregator **rank-interleaves**: position *k* of the reply cycles through
+each source's *k*-th best hit, local source first. Raw scores are never compared
+across gateways — each instance may run a different ranking version (a newer hub
+searching an older peer, or vice versa), so a numeric merge would silently
+prefer whichever version inflates its scores. Interleaving needs no score wire
+format, keeps every source represented in the top rows, and preserves each
+source's own internal order.
+
+An unreachable or refusing peer never fails the request: it is reported in the
+reply's `unreachable` array as `{id, name, code}` so a caller can tell what was
+NOT searched instead of having the result set silently narrowed. The shipped
+dashboard surfaces log the report (a visible "N instances unreachable" affordance
+is a follow-up); only CONNECTED peers are fanned out, so a miss here is a rare
+mid-search transient rather than the steady state for a down instance.
+Machine-readable codes distinguish a stale credential (`search_unauthorized`)
+from a dead tunnel (`search_unreachable`), a peer error (`search_peer_refused`),
+and a garbled reply (`search_malformed_reply`); the same codes are recorded in
+the SEL audit event for the request, so an operator can audit which peer failed
+and why without reproducing the search.
+
+### 15.3 Peer replies are untrusted input
+
+A peer's rows are re-shaped through a strict allowlist before they reach the
+browser: only known fields are copied, strings are type-checked, and `title` /
+`snippet` are re-run through the local credential + exfiltration redaction — the
+peer claims to have redacted, but this hub does not take its word for it. Rows
+from a peer additionally carry `instance_id` + `instance_name`; local rows carry
+neither, so the reply shape for a hub with no peers degrades to exactly the
+local search's own.
+
+The endpoint runs behind the same `_guard()` as every §6 route (owner-only,
+never Slack, `instances.enabled`, SEL-audited as `instances_search_sessions`)
+and mirrors the local search's input contract (`q` sanitized, capped at 256
+chars, min `SEARCH_MIN_CHARS`; `limit` default 50, max 200). The local rows are
+also redacted here: the aggregator calls `conversation_log.search_sessions`
+directly rather than going through the `/api/sessions/search` handler where the
+local redaction normally lives.
+
+### 15.4 What the UI does with a remote row
+
+A remote row's transcript lives on the other gateway, so the local dashboard can
+neither resume nor delete it:
+
+- **Activation switches panes.** Both surfaces route through
+  `useSelectInstance` (the single owner of switch-to-a-pane semantics, §3), so
+  clicking a remote row activates that instance's embedded pane —
+  reconnecting it first if needed. Deep-linking to the specific session inside
+  the embedded SPA is a follow-up: the iframe protocol has no open-session
+  message yet.
+- **The local delete action is hidden** on remote rows. `deleteHistorySession`
+  targets the LOCAL session file; with colliding keys across gateways it would
+  delete a same-keyed, unrelated local conversation.
+- **⌘Enter (open in local split grid) is inert** for remote rows in the
+  palette — bound to an explicit no-op, because an absent handler makes the
+  palette's Enter dispatch fall back to plain activation and the chord would
+  silently switch panes.
+- Remote rows are badged with the instance's **raw name** (never translated —
+  it is the user's own label, which also keeps the change i18n-neutral), and
+  result ids are namespaced by instance so two gateways' same-keyed sessions
+  cannot collide in the palette's keyed list. Snippet-highlight offsets are
+  shifted by the prefix length so remote rows highlight the same match a local
+  row would.
+- Any federated-endpoint failure in the UI — including the `403` when the
+  instances feature is off — falls back to the plain local search, which is
+  always the floor.

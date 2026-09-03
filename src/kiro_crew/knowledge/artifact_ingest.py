@@ -154,6 +154,41 @@ def _get_state(
     return row["content_hash"], ids
 
 
+def _record_deduped_state(
+    kstore: KnowledgeStore,
+    source_id: str,
+    slug: str,
+    content_hash: str,
+    name: str,
+    kind: str | None,
+) -> None:
+    """Terminal write for an artifact the pre-ingest gate refused.
+
+    Invoked BY the gate as its ``on_duplicate`` finalizer, from inside the gate's
+    own ``BEGIN IMMEDIATE`` and on its worker thread, so it takes no lock and no
+    transaction of its own. The delete of the previous group, the location claim on
+    the holder's items, the terminal job row and this record are one atomic unit.
+
+    That ordering is load-bearing for a FIRST-TIME document in particular: after the
+    gate's commit this row may not exist yet, and a ``delete_source_cascade``
+    landing in that gap reassigns the surviving item here and then has no row to
+    adopt it into -- ``_adopt_reassigned_item`` matches on ``(source_id,
+    content_hash)``, finds nothing, and returns without logging. Writing inside the
+    transaction means the cascade sees either no claim at all or a claim WITH the
+    row that names it.
+
+    The group is still DERIVED rather than assumed empty, for the cascade that
+    committed before this transaction took the lock. A row that ends up owning items
+    is ``active``, not ``deduped``: ``find_document_by_hash`` only matches
+    ``active``, and a row owning content while reporting ``deduped`` would let the
+    same text in again under a second slug.
+    """
+    adopted = kstore.surviving_group_in_txn("artifact_item_state", source_id, slug)
+    _write_state_row(
+        kstore, source_id, slug, content_hash, adopted, name,
+        status="active" if adopted else "deduped", kind=kind)
+
+
 def _set_state(
     kstore: KnowledgeStore,
     source_id: str,
@@ -179,6 +214,23 @@ def _set_state(
     ``INSERT OR REPLACE``: omitting it would reset a ``deduped`` marker back to
     the column default, and the artifact would be re-ingested and re-collapsed on
     every event."""
+    _write_state_row(kstore, source_id, slug, content_hash, item_ids, name,
+                     status=status, kind=kind)
+    kstore.db.commit()
+
+
+def _write_state_row(
+    kstore: KnowledgeStore,
+    source_id: str,
+    slug: str,
+    content_hash: str,
+    item_ids: list[str],
+    name: str,
+    status: str = "active",
+    kind: str | None = None,
+) -> None:
+    """The row write alone, with no transaction control, so a caller already
+    holding one can include it."""
     now = datetime.now().isoformat()
     kstore.db.execute(
         "INSERT OR REPLACE INTO artifact_item_state "
@@ -195,7 +247,6 @@ def _set_state(
             kind,
         ),
     )
-    kstore.db.commit()
 
 
 def refresh_artifact_name(
@@ -350,16 +401,41 @@ async def ingest_artifact(
         # (e.g. someone configured an unsupported kind). Skip rather than guess.
         return None
 
-    # Capture the source's items before/after so we can attribute exactly this
-    # slug's newly-created items (the only ones the call below adds; the old
-    # group is deleted inside ingest_file). The caller serializes events, so
-    # nothing else mutates this source concurrently.
-    before_ids = {
-        r["id"]
-        for r in kstore.db.execute(
-            "SELECT id FROM items WHERE source_id = ?", (source_id,)
-        ).fetchall()
-    }
+    # The ids this slug's ingest creates, reported by the pipeline through
+    # ``on_committed`` from INSIDE the finalize hop that commits them (the same
+    # contract agent_source.py consumes). Collected at the write, not inferred
+    # from a before/after snapshot of the source: a snapshot diff costs a full
+    # per-source id read on the event loop and would also attribute anything a
+    # concurrent writer (e.g. import_bundle) commits into the same aggregate
+    # source while this ingest is awaiting.
+    committed_ids: list[str] = []
+    ownership_persisted = False
+
+    def _record_ownership(new_ids: list[str]) -> None:
+        # Runs INSIDE the pipeline's finalize hop, on its worker thread -- the
+        # same uncancellable unit that commits the group. Persisting the state
+        # row HERE, not after ingest_file returns, closes the orphan window:
+        # the awaits between the commit and the status check below (temp-file
+        # cleanup, the job-status read) are cancellation points, and a
+        # shutdown landing there would leave committed items no state row
+        # names -- the next reconcile re-ingests the artifact alongside them.
+        nonlocal ownership_persisted
+        committed_ids.extend(new_ids)
+        # Fail-safe, never fail-closed: this write is a durability UPGRADE over
+        # the in-memory capture, not a precondition. A raise escaping here would
+        # poison the finalize hop AFTER the group committed and the old group
+        # was deleted, making the pipeline report the whole ingest failed. On a
+        # swallowed error the fallback write below still lands on the
+        # uncancelled path.
+        try:
+            _set_state(kstore, source_id, slug, content_hash, new_ids, title,
+                       kind=art.kind)
+            ownership_persisted = True
+        except Exception:
+            logger.warning(
+                "could not persist artifact ownership for %s inside the commit "
+                "callback; deferring to the post-ingest state write",
+                slug, exc_info=True)
     # Route through the SAME path as folders/uploads: write the redacted content
     # to a temp file with the kind's real extension and hand it to
     # ingest_file -> FileReader. This gives html artifacts the ``_read_html``
@@ -383,6 +459,16 @@ async def ingest_artifact(
             original_name=f"{title}{ext}",
             source_id=source_id,
             old_item_ids=old_item_ids,
+            # Fires inside the finalize hop, only on the fully-committed branch
+            # -- the same branch that reports status 'completed' below -- and
+            # persists the ownership row there (see _record_ownership).
+            on_committed=_record_ownership,
+            # Recorded inside the gate's own hop: by the time it reports a refusal
+            # it has already committed the delete and the location claim, and a
+            # cancellation between here and a post-hoc write would leave both
+            # durable with nothing naming them.
+            on_duplicate=lambda _text_hash: _record_deduped_state(
+                kstore, source_id, slug, content_hash, title, art.kind),
         )
     finally:
         if tmp_path:
@@ -393,42 +479,36 @@ async def ingest_artifact(
 
     status = (pipeline.get_job_status(job_id) or {}).get("status") if job_id else None
     if status == DUPLICATE_JOB_STATUS:
-        # The pre-ingest gate refused the write because this text is already in
-        # the Library under another source, and deleted this artifact's previous
-        # items on the way out. Record that: leaving the prior state would point
-        # at deleted items and make every subsequent artifact event re-attempt a
-        # write the gate will refuse again.
-        _set_state(
-            kstore,
-            source_id,
-            slug,
-            content_hash,
-            [],
-            title,
-            status="deduped",
-            kind=art.kind,
-        )
+        # The gate refused the write and recorded the terminal state through the
+        # ``on_duplicate`` finalizer above, so there is nothing left to write here.
         return job_id
     if status != "completed":
         # Partial/failed ingest: ingest_file kept the old group and rolled back
         # the new items. Leave the recorded state untouched so the next event
         # retries from the prior good group.
         return job_id
-    after_ids = {
-        r["id"]
-        for r in kstore.db.execute(
-            "SELECT id FROM items WHERE source_id = ?", (source_id,)
-        ).fetchall()
-    }
-    new_ids = list(after_ids - before_ids)
-    _set_state(kstore, source_id, slug, content_hash, new_ids, title, kind=art.kind)
+    if not ownership_persisted:
+        # Fallback ONLY for a hop write that failed and was swallowed as
+        # fail-safe. Never an unconditional re-write: the awaits between the
+        # finalize hop and here (temp-file cleanup, job-status read) are windows
+        # where a concurrent dedup sweep may legitimately rewrite this slug's
+        # state row (collapse the group, mark it deduped), and blindly restoring
+        # the captured ids would resurrect an 'active' row over that result --
+        # unchanged ingests would then short-circuit against stale ids forever.
+        # Offloaded: the plausible reason the hop write failed is writer-lock
+        # contention, and retrying the same blocking SQLite write (busy_timeout
+        # up to 10s) on the event loop would stall the gateway loop.
+        await asyncio.to_thread(
+            _set_state, kstore, source_id, slug, content_hash,
+            list(committed_ids), title, kind=art.kind)
     sel().log_tool_invocation(
         session_key="gateway",
         agent="knowledge-artifacts",
         tool_name="knowledge.artifact_ingest",
         outcome="completed",
         resources=str(
-            {"slug": slug, "items": len(new_ids), "content_hash": content_hash[:16]}
+            {"slug": slug, "items": len(committed_ids),
+             "content_hash": content_hash[:16]}
         ),
     )
     return job_id

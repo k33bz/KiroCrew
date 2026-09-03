@@ -250,6 +250,39 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByRole('button', { name: 'Check again' })).toBeEnabled()
   })
 
+  it('swaps the ask-the-owner body for the re-auth remedy while the auth banner is up', async () => {
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      platform: 'gateway',
+      setup_allowed: false,
+    }))
+    // The stale-owner banner element is the signal source: present at mount.
+    const banner = document.createElement('div')
+    banner.id = 'mc-session-expired'
+    document.body.prepend(banner)
+    try {
+      renderWithProviders(
+        <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+      )
+      // One instruction, not two: eyebrow, headline, and body all name the
+      // sign-in remedy instead of telling the viewer to ask someone else.
+      expect(await screen.findByText(/Sign in again to continue/)).toBeInTheDocument()
+      expect(screen.getByText(/Sign in required/)).toBeInTheDocument()
+      expect(screen.getByText(/predates the configured owner/)).toBeInTheDocument()
+      expect(screen.queryByText(/gateway owner needs to finish setup/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/Ask the .* owner to install/)).not.toBeInTheDocument()
+      // "Check again" cannot succeed until sign-in, so the state carries no
+      // retry affordance — the banner is the single action.
+      expect(screen.queryByRole('button', { name: 'Check again' })).not.toBeInTheDocument()
+      // Clearing the banner flips the whole surface back to the setup copy.
+      window.dispatchEvent(new CustomEvent('mc-auth-cleared'))
+      expect(await screen.findByText(/Ask the .* owner to install/)).toBeInTheDocument()
+      expect(screen.getByText(/gateway owner needs to finish setup/)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Check again' })).toBeEnabled()
+    } finally {
+      banner.remove()
+    }
+  })
+
   it('lets a non-owner observe owner completion without reloading', async () => {
     vi.mocked(api.kiroPrerequisite)
       .mockResolvedValueOnce(status({
@@ -317,6 +350,94 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByText(/kirocrew\.json/)).toBeInTheDocument()
     expect(screen.getByText(/kirocrew-lite\.json/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Check again' })).toBeEnabled()
+  })
+
+  it('gates on a spec that is PRESENT but which kiro-cli refuses', async () => {
+    // The gap the missing-specs card cannot cover: statting the file says it is
+    // there, while kiro-cli drops it from its agent table, so Kiro Crew's agent
+    // silently becomes kiro-cli's default one with none of its MCP servers.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: true,
+      ready: false,
+      initial_setup_complete: true,
+      repair_required: true,
+      missing_agent_specs: [],
+      rejected_agent_specs: ['kirocrew.json'],
+      agent_spec_rejection_detail:
+        'Error: Json supplied at /home/u/.kiro/agents/kirocrew.json is invalid: '
+        + 'data did not match any variant of untagged enum Repr',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(
+      await screen.findByText("Kiro CLI will not load Kiro Crew's agent specs"),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
+    // Exact match on the list entry: the reason below also contains the filename
+    // as part of a full path, so a loose regex matches both nodes.
+    expect(screen.getByText('kirocrew.json')).toBeInTheDocument()
+    // kiro-cli's own words are what make the report actionable, so they are
+    // surfaced verbatim rather than replaced with our own paraphrase.
+    expect(screen.getByText(/data did not match any variant/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeEnabled()
+  })
+
+  it('does not promise that checking again rewrites a rejected spec', async () => {
+    // The button deliberately does NOT rewrite a rejected spec: the file is on
+    // disk, and regenerating it would discard a concurrent MCP toggle's
+    // tools/allowedTools grant. So the copy must not imply a rewrite, must name
+    // the control the user can actually see, and must point at the two real
+    // remedies (update, or an explicit setup --clean).
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: true,
+      initial_setup_complete: true,
+      rejected_agent_specs: ['kirocrew.json'],
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    const note = await screen.findByText(/Check again asks Kiro CLI to load the specs again/)
+    expect(note).toHaveTextContent('does not rewrite them')
+    // The leading cause is a kiro-cli upgrade, which re-checking cannot fix, so
+    // both remedies must be present as their own lines rather than buried.
+    expect(screen.getByText(/Update Kiro Crew\./)).toBeInTheDocument()
+    expect(screen.getByText(/Rewrite the specs from scratch/)).toBeInTheDocument()
+    // The command must NOT come from a catalog value: a translator must not be
+    // able to alter a string the user pastes into a shell.
+    const command = screen.getByText('kirocrew setup --agent-only --clean')
+    expect(command.tagName).toBe('CODE')
+    // The label the copy names must be the label actually rendered.
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeInTheDocument()
+  })
+
+  it('shows the missing-specs card, not the rejected one, when a spec is absent', async () => {
+    // One fault, one card. A spec that is absent cannot also be rejected, and
+    // the absent case has a repair that definitely works.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: true,
+      initial_setup_complete: true,
+      missing_agent_specs: ['kirocrew.json'],
+      rejected_agent_specs: ['kirocrew-lite.json'],
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(
+      await screen.findByText("Kiro Crew's agent specs are not installed"),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText("Kiro CLI will not load Kiro Crew's agent specs"),
+    ).not.toBeInTheDocument()
   })
 
   it('points a terminal diagnoser past the app-not-running dead end', async () => {

@@ -37,12 +37,14 @@ from kiro_crew.dashboard.chat_runner import _run_chat
 from kiro_crew.dashboard.handlers.kiro_prerequisite import (
     api_kiro_prerequisite_repair_specs,
     api_kiro_prerequisite_status,
+    api_kiro_prerequisite_update_cli,
 )
 from kiro_crew.dashboard.kiro_readiness import kiro_session_ready
 from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.kiro_prerequisite import (
     KIRO_CLI_LOGIN_COMMAND,
     KIRO_CLI_SSO_LOGIN_COMMAND,
+    KIRO_CLI_UPDATE_COMMAND,
     OFFICIAL_INSTALL_DOCS_URL,
     KiroPrerequisiteService,
     PrerequisiteStatus,
@@ -86,6 +88,11 @@ class _FakeRuntime:
         self.executable = executable
         self.installed = executable.exists()
         self.authenticated = False
+        # Whether this fake CLI exposes the `acp` subcommand the readiness probe
+        # now checks with `acp --help`. Defaults True so an authenticated fake is
+        # `ready` exactly as before this probe existed; a test that exercises the
+        # too-old path flips it to False.
+        self.acp_supported = True
         self.calls: list[tuple[str, list[str]]] = []
         self.kwargs: list[dict[str, Any]] = []
 
@@ -101,11 +108,40 @@ class _FakeRuntime:
             return ProcessResult(ok=self.installed)
         if args == ["whoami"]:
             return ProcessResult(ok=self.authenticated)
+        if args == ["acp", "--help"]:
+            if self.acp_supported:
+                return ProcessResult(ok=True, output="Usage: kiro-cli acp [OPTIONS]")
+            return ProcessResult(
+                ok=False,
+                returncode=2,
+                output="error: unrecognized subcommand 'acp'",
+            )
         return ProcessResult(ok=False)
 
 
 async def _no_audit(**kwargs: Any) -> None:
     del kwargs
+
+
+@pytest.fixture(autouse=True)
+def _agents_dir_never_the_real_home(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every test in this module off the developer's real ``~/.kiro/agents``.
+
+    The readiness probe asks kiro-cli to validate each required spec it finds, and
+    that enumeration resolves through the shared (KIRO_HOME-aware) agents dir. With
+    KIRO_HOME unset, tests that only meant to assert binary resolution would spawn
+    a validate per spec that happens to exist on the host — making their call-count
+    assertions depend on the machine they run on.
+    """
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path_factory.mktemp("kiro-home")))
+    import kiro_crew.kiro_prerequisite as kiro_prerequisite_module
+
+    monkeypatch.setattr(
+        kiro_prerequisite_module, "_default_spec_lister", lambda: [], raising=True
+    )
 
 
 async def _wait_for_operation(service: KiroPrerequisiteService) -> None:
@@ -115,6 +151,38 @@ async def _wait_for_operation(service: KiroPrerequisiteService) -> None:
 
 
 class TestKiroPrerequisiteHelpers:
+    def test_identity_file_lockdown_precedes_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged identity file must never exist with content in it before
+        it is locked down.
+
+        ``_atomic_write_secret_bytes`` routes through
+        ``atomic_write(restrict_to_owner=True)``, which applies the lockdown
+        to the TEMP file before the identity bytes reach it (the previous
+        post-rename lockdown left them readable under the inherited DACL on
+        Windows for the write window, issue #5285). Asserted by measuring the
+        file's SIZE at lockdown time — zero means no payload byte existed yet.
+        """
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring(target):
+            sizes.append(os.stat(target).st_size)
+            return real_restrict(target)
+
+        monkeypatch.setattr("kiro_crew.platform_compat.restrict_to_owner", _measuring)
+        target = tmp_path / "staged" / "kiro-token.json"
+        prerequisite_module._atomic_write_secret_bytes(target, b"identity-bytes")
+
+        assert target.read_bytes() == b"identity-bytes"
+        if platform_compat.IS_POSIX:
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert sizes, "premise: the lockdown ran at all"
+        assert sizes[0] == 0, (
+            f"the file already held {sizes[0]} payload bytes at lockdown time"
+        )
+
     @pytest.mark.parametrize("windows", [True, False], ids=["windows", "posix"])
     def test_identity_env_forwards_proxy_configuration_and_refuses_secrets(
         self,
@@ -195,9 +263,13 @@ class TestKiroPrerequisiteHelpers:
         real_open = os.open
         real_read = os.read
 
-        def windows_open(path: str, flags: int, mode: int = 0o777) -> int:
+        # ``**kwargs`` because this replaces the os module attribute, so it is live for
+        # the whole test INCLUDING teardown, where pytest's own tmp_path cleanup calls
+        # os.open with dir_fd=. A stub narrower than the API it stands in for turns that
+        # cleanup into a TypeError reported as an error at teardown.
+        def windows_open(path: str, flags: int, mode: int = 0o777, **kwargs: object) -> int:
             real_flags = flags if native_binary_flag else flags & ~binary_flag
-            fd = real_open(path, real_flags, mode)
+            fd = real_open(path, real_flags, mode, **kwargs)  # type: ignore[arg-type]
             if flags & binary_flag:
                 binary_fds.add(fd)
             return fd
@@ -455,7 +527,7 @@ class TestKiroPrerequisiteHelpers:
                 environ={},
             )
 
-    def test_windows_candidate_includes_official_msi_directory(self, tmp_path: Path) -> None:
+    def test_windows_candidate_includes_machine_wide_directory(self, tmp_path: Path) -> None:
         program_files = tmp_path / "Program Files"
         executable = program_files / "Kiro-Cli" / "kiro-cli.exe"
         _make_executable(executable)
@@ -467,6 +539,93 @@ class TestKiroPrerequisiteHelpers:
         )
 
         assert str(executable) in candidates
+
+    def test_windows_candidates_include_standard_user_tool_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        home = tmp_path / "Users" / "new-user"
+        managed_bin = home / ".local" / "bin"
+        executable = managed_bin / "kiro-cli.exe"
+        _make_executable(executable)
+
+        candidates = find_kiro_cli_candidates(
+            "win32",
+            home,
+            {
+                "LOCALAPPDATA": str(tmp_path / "AppData" / "Local"),
+                "ProgramFiles": str(tmp_path / "Program Files"),
+                "PATH": "",
+            },
+        )
+
+        assert str(executable) in candidates
+
+    def test_windows_truncated_per_user_candidate_does_not_shadow_machine_wide(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        local_app_data = tmp_path / "AppData" / "Local"
+        truncated = local_app_data / "Kiro-Cli" / "kiro-cli.exe"
+        truncated.parent.mkdir(parents=True)
+        truncated.write_bytes(b"")
+        machine_wide = tmp_path / "Program Files" / "Kiro-Cli" / "kiro-cli.exe"
+        _make_executable(machine_wide)
+
+        candidates = find_kiro_cli_candidates(
+            "win32",
+            tmp_path / "Users" / "new-user",
+            {
+                "LOCALAPPDATA": str(local_app_data),
+                "ProgramFiles": str(tmp_path / "Program Files"),
+                "PATH": "",
+            },
+        )
+
+        assert candidates[0] == str(machine_wide)
+        assert str(truncated) not in candidates
+
+    @pytest.mark.asyncio
+    async def test_windows_refresh_discovers_per_user_install_without_new_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        local_app_data = tmp_path / "AppData" / "Local"
+        executable = local_app_data / "Kiro-Cli" / "kiro-cli.exe"
+        calls: list[tuple[str, list[str]]] = []
+
+        async def run(command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append((command, args))
+            return ProcessResult(ok=True)
+
+        service = KiroPrerequisiteService(
+            platform_name="win32",
+            environ={
+                "LOCALAPPDATA": str(local_app_data),
+                "PATH": "",
+                "ProgramFiles": str(tmp_path / "Program Files"),
+            },
+            home=tmp_path / "Users" / "new-user",
+            data_home=tmp_path / "data-home",
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+
+        missing = await service.snapshot(force=True)
+        assert missing["installed"] is False
+
+        # The native installer updates the user's PATH, but a running desktop
+        # gateway keeps its old environment. A forced refresh must find the
+        # install at its fixed per-user location without a process restart.
+        _make_executable(executable)
+        refreshed = await service.snapshot(force=True)
+
+        assert refreshed["ready"] is True
+        assert calls == [
+            (str(executable), ["--version"]),
+            (str(executable), ["whoami"]),
+            (str(executable), ["acp", "--help"]),
+        ]
 
     def test_windows_candidates_include_inherited_path(
         self,
@@ -841,6 +1000,8 @@ class TestKiroPrerequisiteWorkflow:
         ) -> ProcessResult:
             if args == ["--version"]:
                 return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                return ProcessResult(ok=True, output="Usage: kiro-cli acp")
             home = kwargs["env"]["HOME"]
             whoami_calls.append(home)
             # Signed-out under a rewritten HOME, signed-in against the real home.
@@ -2122,6 +2283,7 @@ class TestKiroPrerequisiteWorkflow:
         assert calls == [
             (str(planted), ["--version"]),
             (str(planted), ["whoami"]),
+            (str(planted), ["acp", "--help"]),
         ]
 
     @pytest.mark.asyncio
@@ -2161,6 +2323,7 @@ class TestKiroPrerequisiteWorkflow:
         assert calls == [
             (str(planted), ["--version"]),
             (str(planted), ["whoami"]),
+            (str(planted), ["acp", "--help"]),
         ]
 
     @pytest.mark.asyncio
@@ -2196,6 +2359,7 @@ class TestKiroPrerequisiteWorkflow:
         assert calls == [
             (str(official), ["--version"]),
             (str(official), ["whoami"]),
+            (str(official), ["acp", "--help"]),
         ]
 
     @pytest.mark.asyncio
@@ -2613,6 +2777,120 @@ class TestKiroPrerequisiteWorkflow:
         assert ticked_during_cleanup
         release_cleanup.set()
         assert (await process_task).ok is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_sandbox_preparation_unlinks_the_launcher(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """First-cancellation semantics: the recovery waits for the worker to
+        settle, removes the launcher it materialized, and re-raises."""
+        preparation_started = threading.Event()
+        release_preparation = threading.Event()
+        cleanup_path = tmp_path / "sandbox-launcher"
+        cleanup_path.write_text("launcher", encoding="utf-8")
+
+        def sandbox(
+            argv: list[str],
+            **_kwargs: Any,
+        ) -> tuple[list[str], dict[str, str], str]:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+            return argv, {}, str(cleanup_path)
+
+        monkeypatch.setattr(prerequisite_module, "sandboxed_spawn_argv", sandbox)
+
+        outer = asyncio.create_task(
+            prerequisite_module._prepare_sandboxed_spawn(
+                ["/fixed/tool"],
+                mode=prerequisite_module._UNVERIFIED_SANDBOX_MODE,
+                env={},
+                extra_hidden_dirs=(),
+                extra_visible_dirs=(),
+            )
+        )
+        assert await asyncio.to_thread(preparation_started.wait, 5)
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        assert not cleanup_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancellation_in_sandbox_recovery_still_unlinks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A REPEAT cancellation landing on the recovery await is a
+        ``BaseException``, so it escaped the old ``suppress(Exception)``
+        before ``_unlink_off_loop`` ran, leaking the materialized launcher
+        (#5841). The recovery must absorb repeat cancellations in BOTH of
+        its phases — while the worker settles and while the unlink runs —
+        still remove the launcher, and let the ORIGINAL cancellation (pinned
+        by its message) propagate rather than a repeat."""
+        preparation_started = threading.Event()
+        release_preparation = threading.Event()
+        unlink_started = threading.Event()
+        release_unlink = threading.Event()
+        cleanup_path = tmp_path / "sandbox-launcher"
+        cleanup_path.write_text("launcher", encoding="utf-8")
+        real_unlink = os.unlink
+
+        def sandbox(
+            argv: list[str],
+            **_kwargs: Any,
+        ) -> tuple[list[str], dict[str, str], str]:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+            return argv, {}, str(cleanup_path)
+
+        def slow_unlink(path: str) -> None:
+            if path == str(cleanup_path):
+                unlink_started.set()
+                assert release_unlink.wait(timeout=5)
+            real_unlink(path)
+
+        monkeypatch.setattr(prerequisite_module, "sandboxed_spawn_argv", sandbox)
+        monkeypatch.setattr(prerequisite_module.os, "unlink", slow_unlink)
+
+        outer = asyncio.create_task(
+            prerequisite_module._prepare_sandboxed_spawn(
+                ["/fixed/tool"],
+                mode=prerequisite_module._UNVERIFIED_SANDBOX_MODE,
+                env={},
+                extra_hidden_dirs=(),
+                extra_visible_dirs=(),
+            )
+        )
+        assert await asyncio.to_thread(preparation_started.wait, 5)
+        # First cancellation: delivered at the shielded hop; the coroutine
+        # enters its recovery block. Its message pins exception identity: if
+        # a repeat cancellation were the one to propagate (or to merge into
+        # the first delivery), the message assertion below goes red.
+        outer.cancel("original-cancellation-5841")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # REPEAT cancellation while the worker is still settling — the
+        # launcher must still exist for the repeat to be able to leak it.
+        assert cleanup_path.exists()
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_preparation.set()
+        # REPEAT cancellation while the unlink itself is in flight.
+        assert await asyncio.to_thread(unlink_started.wait, 5)
+        assert cleanup_path.exists()
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_unlink.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await outer
+        # The coroutine's actual exception object propagates, so the original
+        # cancel message survives the message-less repeats above.
+        assert exc_info.value.args == ("original-cancellation-5841",)
+        assert not cleanup_path.exists()
 
     @pytest.mark.asyncio
     async def test_process_timeout_escalates_while_supervisor_anchors_group(
@@ -3184,6 +3462,10 @@ class TestKiroPrerequisiteHandlers:
             "/api/kiro-prerequisite/repair-specs",
             api_kiro_prerequisite_repair_specs,
         )
+        app.router.add_post(
+            "/api/kiro-prerequisite/update-cli",
+            api_kiro_prerequisite_update_cli,
+        )
         return app
 
     @pytest.mark.asyncio
@@ -3231,6 +3513,51 @@ class TestKiroPrerequisiteHandlers:
             assert body["sso_login_command"] == KIRO_CLI_SSO_LOGIN_COMMAND
             assert (await client.post("/api/kiro-prerequisite/login")).status == 404
             assert (await client.post("/api/kiro-prerequisite/install")).status == 404
+
+    @pytest.mark.asyncio
+    async def test_owner_update_cli_runs_self_update_and_returns_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The owner may POST update-cli to run the CLI's in-place self-update.
+        # The handler awaits the service, then returns the post-update snapshot
+        # (cli_update_error empty on success) with setup_allowed for the owner.
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": ""},
+            home=tmp_path,
+            audit_writer=_no_audit,
+        )
+
+        called_with: list[str] = []
+
+        async def fake_update_cli(caller: str) -> dict[str, Any]:
+            called_with.append(caller)
+            return {
+                "platform": "Linux",
+                "installed": True,
+                "authenticated": True,
+                "ready": True,
+                "acp_supported": True,
+                "update_command": KIRO_CLI_UPDATE_COMMAND,
+                "cli_update_error": "",
+            }
+
+        monkeypatch.setattr(service, "update_cli", fake_update_cli)
+
+        async with TestClient(TestServer(self._app(service, app_claim=""))) as client:
+            resp = await client.post("/api/kiro-prerequisite/update-cli")
+            assert resp.status == 200
+            body = await resp.json()
+
+        # The success path re-probes and reports acp support restored with no
+        # update error, and the owner branch stamps setup_allowed.
+        assert body["acp_supported"] is True
+        assert body["cli_update_error"] == ""
+        assert body["setup_allowed"] is True
+        # The handler forwards the resolved caller identity to the service.
+        assert called_with == ["test-user"]
 
     @pytest.mark.asyncio
     async def test_status_endpoint_returns_not_ready_instead_of_500_on_probe_error(
@@ -3653,6 +3980,7 @@ class TestKiroPrerequisiteHandlers:
             for method, path in (
                 ("get", "/api/kiro-prerequisite"),
                 ("post", "/api/kiro-prerequisite/repair-specs"),
+                ("post", "/api/kiro-prerequisite/update-cli"),
             ):
                 response = await getattr(client, method)(path)
                 assert response.status == 403
@@ -3717,14 +4045,21 @@ class TestKiroPrerequisiteHandlers:
             # reach the owner and leave this caller's client reading undefined.
             assert body["login_command"] == KIRO_CLI_LOGIN_COMMAND
             assert body["sso_login_command"] == KIRO_CLI_SSO_LOGIN_COMMAND
+            # Redacted-but-present for the same reason as the sandbox keys: whether
+            # the probe timed out describes how slow the HOST is. Asserted here
+            # because the hazard the comment above names is not hypothetical -- this
+            # branch is hand-built, so the key has to be added by hand with it.
+            assert body["probe_timed_out"] is False
             # The pre-upgrade-tab shim is served to every caller, so the payload
             # shape does not vary by who asks.
             assert body["operation"]["status"] == "idle"
 
             # The repair route is a mutation on the agent home, so it is
-            # owner-gated. It is also the ONLY mutation left on this surface.
+            # owner-gated. The update-cli route spawns the CLI's self-update, an
+            # equally owner-only host mutation.
             for method, path in (
                 ("post", "/api/kiro-prerequisite/repair-specs"),
+                ("post", "/api/kiro-prerequisite/update-cli"),
             ):
                 response = await getattr(client, method)(path)
                 assert response.status == 403
@@ -3978,6 +4313,209 @@ class TestSandboxUnavailableIsNotAMissingBinary:
         assert status["sandbox_unavailable"] is False
         assert status["sandbox_failure_kind"] == ""
         assert status["sandbox_detail"] == ""
+        assert status["probe_timed_out"] is False
+
+
+class TestTimedOutProbeIsNotAMissingBinary:
+    """A probe that never ANSWERED must not be reported as "not installed".
+
+    The third condition, and the one issue #4577 was filed on. The sandbox branch
+    keys on a typed ``sandbox_failure``; a timeout raises none, so the timed-out
+    probe fell through to a bare ``PrerequisiteStatus`` whose every field is a
+    default: ``installed=False``, ``sandbox_unavailable=False`` and all
+    ``sandbox_*`` empty. That combination is worse than unhelpful — it rules the
+    true cause OUT, and points the operator at reinstalling or re-signing-in a CLI
+    that is installed, signed in, and serving chat turns the entire time.
+
+    Driven through ``ProcessResult.timed_out`` (the flag ``_run_process`` already
+    sets on the timeout path, and which the SEL audit already records as
+    ``error=timeout``) so no test here depends on real wall-clock timing.
+    """
+
+    @staticmethod
+    def _service(tmp_path: Path, run: Any) -> KiroPrerequisiteService:
+        return KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            home=tmp_path,
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+
+    @staticmethod
+    async def _timed_out(
+        _command: str,
+        _args: list[str],
+        **_kwargs: Any,
+    ) -> ProcessResult:
+        """The runner shape ``_run_process`` produces when the probe never answers."""
+        return ProcessResult(ok=False, error="timeout", timed_out=True)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_probe_does_not_claim_the_cli_is_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The load-bearing assertion: present on disk, so NOT ``installed=False``."""
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["installed"] is True
+        assert status["probe_timed_out"] is True
+        assert status["ready"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_not_attributed_to_the_sandbox(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Over-claim guard, and the reason this is a new field not a reused one.
+
+        A caller that keys a userns remedy off ``sandbox_unavailable`` must not be
+        handed a slow filesystem to fix with an AppArmor profile. Nothing about the
+        sandbox failed here: the spawn was accepted and raised no typed failure.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["sandbox_unavailable"] is False
+        assert status["sandbox_failure_kind"] == ""
+        assert status["sandbox_detail"] == ""
+        assert status["sandbox_remedy"] == ""
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_offer_an_action_that_cannot_help(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Neither a reinstall nor a sign-in can speed up a slow probe.
+
+        ``authenticated`` is false as UNKNOWN, not as a verdict: ``whoami`` runs
+        through the same probe path and on this host is never reached at all, which
+        is why the report showed a signed-in account as signed out.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["repair_required"] is False
+        assert status["authenticated"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_a_runnable_candidate_is_still_not_installed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No binary on disk means the timeout says nothing about installation.
+
+        Symmetric with the sandbox branch's ``candidate_runnable`` requirement: the
+        claim ``installed=True`` rests on having STAT'd a runnable candidate, never
+        on the failure mode alone. Without that evidence the honest answer is the
+        unchanged default.
+
+        ``HOME`` is patched on the REAL process env, not just in the injected
+        ``environ``: candidate discovery runs the injected PATH through
+        ``env.augmented_path``, which resolves its extra directories from
+        ``os.path.expanduser("~")`` and so reaches the developer's own
+        ``~/.local/bin`` regardless of what this service was constructed with. Not
+        patching it makes the no-candidate premise silently false on any machine
+        that actually has kiro-cli installed — which is every machine a contributor
+        runs this on — and the test then asserts the opposite branch's behaviour.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["installed"] is False
+        assert status["probe_timed_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_persistent_timeout_warns_once_not_once_per_probe(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A line about a slow host must not evict the evidence about it.
+
+        This branch runs on EVERY probe, and on an affected host that is one probe per
+        ~40s (the readiness gate's 30s staleness window plus this probe's own 10s
+        timeout), i.e. ~90 lines/hour into the dashboard's 1000-entry log ring. The
+        latched status carries the transition, so no timestamp is needed to tell a new
+        outage from an ongoing one.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        service = self._service(tmp_path, self._timed_out)
+
+        with caplog.at_level("DEBUG", logger="kiro_crew.kiro_prerequisite"):
+            for _ in range(6):
+                status = await service.snapshot(force=True)
+
+        assert status["probe_timed_out"] is True
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        debugs = [
+            r
+            for r in caplog.records
+            if r.levelname == "DEBUG" and "already reported" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        # Accounted for, not dropped: a reader who turns up DEBUG sees the rest.
+        assert len(debugs) == 5
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_probe_re_arms_the_timeout_warning(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One WARNING per OUTAGE, and the latched status re-arms it for free.
+
+        No clear-on-observe step and no floor: every probe rewrites the status, so a
+        recovery resets the transition record whether or not anything watched it
+        happen.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        healthy_calls = {"n": 0}
+
+        async def flapping(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if healthy_calls["n"]:
+                healthy_calls["n"] -= 1
+                return ProcessResult(ok=args == ["--version"])
+            return ProcessResult(ok=False, error="timeout", timed_out=True)
+
+        service = self._service(tmp_path, flapping)
+
+        with caplog.at_level("DEBUG", logger="kiro_crew.kiro_prerequisite"):
+            await service.snapshot(force=True)  # outage 1 -> WARNING
+            await service.snapshot(force=True)  # same outage -> DEBUG
+            healthy_calls["n"] = 2
+            await service.snapshot(force=True)  # recovered
+            await service.snapshot(force=True)  # outage 2 -> WARNING again
+
+        timeouts = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "the probe timed out" in r.getMessage()
+        ]
+        assert len(timeouts) == 2
+
+    @pytest.mark.asyncio
+    async def test_plain_failure_is_not_reported_as_a_timeout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The ordinary broken-CLI path must keep its own reporting."""
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        async def run(_command: str, _args: list[str], **_kwargs: Any) -> ProcessResult:
+            return ProcessResult(ok=False, error="exited with code 1")
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["probe_timed_out"] is False
+        assert status["installed"] is False
 
 
 class TestKiroCrewNeverSetsUpKiroCli:
@@ -4200,8 +4738,13 @@ class TestKiroCrewNeverSetsUpKiroCli:
             *(service.snapshot(force=True, coalesce=True) for _ in range(6))
         )
 
-        # Exactly one probe's worth of spawns: --version then whoami.
-        assert [args for _, args in runtime.calls] == [["--version"], ["whoami"]]
+        # Exactly one probe's worth of spawns: --version, whoami, then the
+        # acp-subcommand support check.
+        assert [args for _, args in runtime.calls] == [
+            ["--version"],
+            ["whoami"],
+            ["acp", "--help"],
+        ]
 
     def test_status_names_the_command_the_user_runs(self) -> None:
         # The UI needs the command to show, and the user runs it themselves.
@@ -4546,6 +5089,437 @@ class TestAgentSpecsNarrowReadiness:
 
         assert (await service.snapshot())["ready"] is False
         assert await service.session_ready() is True
+
+
+class TestRejectedAgentSpecsNarrowReadiness:
+    """A spec that is PRESENT can still be one kiro-cli refuses to load.
+
+    ``missing_agent_specs`` answers presence by statting the file, which cannot
+    see this: kiro-cli drops a spec it rejects from its agent table, so
+    ``--agent kirocrew`` resolves to the default agent with none of Kiro Crew's
+    MCP servers and only a line on stderr. That is the shape of the customer
+    report behind issue #3116 — "my migrated agents stopped working" with a
+    perfectly present file on disk.
+
+    The oracle is the binary, not a schema copied into this repo, so a future
+    kiro-cli that changes the spec format is REPORTED rather than guessed at.
+
+    Two properties are load-bearing and are pinned in both directions:
+
+    * ``kiro-cli agent validate`` exits 0 whether or not it accepted the file, so
+      the verdict lives only in its output. A test that asserted on the exit code
+      would pass while detecting nothing.
+    * output that is NOT a schema rejection (a sandbox denial, a vanished file)
+      must NOT be reported as a rejected spec, or the gate sends the user to
+      rewrite a spec that was fine.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_agents_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep the ownership guard in ``agent.py`` from declining under a worktree.
+
+        These tests supply their specs through ``spec_lister`` (see ``_service``),
+        so all this needs to do is keep the env from pointing at the real home.
+        """
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / ".kiro"))
+
+    @staticmethod
+    def _spec_dir(tmp_path: Path) -> Path:
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        return agents
+
+    @staticmethod
+    def _service(
+        tmp_path: Path,
+        runner: Any,
+    ) -> KiroPrerequisiteService:
+        # Staged inside tmp_path so binary discovery and sign-in eligibility do
+        # not depend on the host: without these, a machine with a real kiro-cli
+        # reaches the probe while CI finds nothing viable and never gets far
+        # enough to ask about specs.
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        token = tmp_path / ".aws" / "sso" / "cache" / "kiro-auth-token-cli.json"
+        token.parent.mkdir(parents=True, exist_ok=True)
+        token.write_text('{"accessToken":"secret"}', encoding="utf-8")
+        agents = tmp_path / ".kiro" / "agents"
+
+        def _lister() -> list[tuple[str, Path]]:
+            from kiro_crew.agent_files import REQUIRED_KIRO_AGENT_FILES
+
+            # Mirrors present_required_agent_specs (required-and-present only) over
+            # this test's dir, so the probe's spawn count is stated here rather than
+            # inherited from the host's real agents dir.
+            return [
+                (name, agents / name)
+                for name in REQUIRED_KIRO_AGENT_FILES
+                if (agents / name).is_file()
+            ]
+
+        return KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            home=tmp_path,
+            process_runner=runner,
+            audit_writer=_no_audit,
+            spec_lister=_lister,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_required_spec_blocks_readiness_and_names_the_reason(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text("{}", encoding="utf-8")
+        reason = (
+            f"Error: Json supplied at {agents / 'kirocrew.json'} is invalid: "
+            "data did not match any variant of untagged enum Repr"
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args[:2] == ["agent", "validate"]:
+                # Exit 0 WITH an error message is exactly what kiro-cli does.
+                return ProcessResult(ok=True, output=reason, returncode=0)
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert status["ready"] is False
+        assert status["repair_required"] is True
+        assert "is invalid" in status["agent_spec_rejection_detail"]
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_spec_leaves_readiness_alone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text("{}", encoding="utf-8")
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args[:2] == ["agent", "validate"]:
+                # Acceptance is SILENT — no output at all.
+                return ProcessResult(ok=True, output="", returncode=0)
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert status["agent_spec_rejection_detail"] == ""
+        assert status["ready"] is True
+        assert status["repair_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_output_that_is_not_a_schema_rejection_is_not_reported(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A probe that could not READ the spec must not indict the spec.
+
+        Without this, a sandbox denial or a spec deleted between the stat and the
+        spawn would put the install behind a repair card whose only remedy is to
+        rewrite a file that was never malformed.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text("{}", encoding="utf-8")
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args[:2] == ["agent", "validate"]:
+                return ProcessResult(
+                    ok=False,
+                    output="Error: Permission denied (os error 13)",
+                    returncode=1,
+                )
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert status["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_absent_spec_costs_no_spawn(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Absence is ``missing_agent_specs``' job, so it is not probed here.
+
+        Also bounds the added cost: the probe budget grows only by the specs that
+        actually exist, and a home with none pays nothing.
+        """
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert not any(a[:2] == ["agent", "validate"] for a in calls)
+        assert status["rejected_agent_specs"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_signed_out_cli_is_not_asked_about_specs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """One fault, one card: a CLI that cannot authenticate is reported as that.
+
+        Asking a signed-out binary whether it likes our specs spends a spawn per
+        spec on an answer the user cannot act on until sign-in is fixed, and would
+        stack a rejection card on top of the sign-in card. Pins the gate so a later
+        refactor cannot quietly reintroduce those spawns.
+        """
+        spec = self._spec_dir(tmp_path) / "kirocrew.json"
+        spec.write_text("{}", encoding="utf-8")
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            # Version succeeds so a binary is found; whoami fails -> signed out.
+            if args[:1] == ["whoami"] or "whoami" in args:
+                return ProcessResult(ok=False, output="not logged in")
+            return ProcessResult(ok=True, output="1.0.0")
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert not status["authenticated"]
+        assert not any(a[:2] == ["agent", "validate"] for a in calls)
+        assert status["rejected_agent_specs"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_mcp_server_with_no_command_is_reported_without_a_spawn(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``agent validate`` accepts this; the loader cannot start the server.
+
+        Probed against the shipped binary: a spec whose ``mcpServers`` entry omits
+        ``command`` produces no output and exit 0 from ``agent validate``, so the
+        binary alone would call it accepted while the session runs without the
+        tools the spec declares. Structural, so it must cost no subprocess.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {"broken": {"args": ["x"]}}}),
+            encoding="utf-8",
+        )
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            # Mimics the real binary on this input: silent acceptance.
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "broken" in status["agent_spec_rejection_detail"]
+        assert "neither a command" in status["agent_spec_rejection_detail"]
+        assert not any(a[:2] == ["agent", "validate"] for a in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_spec_the_bounded_reader_rejects_fails_open(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An unreadable spec is a different fault with its own reporting.
+
+        The structural read goes through the module's bounded helper so a
+        pathologically large spec cannot OOM the gateway through the readiness
+        probe. That helper also refuses a symlink, and when it refuses, the
+        structural check must decline to judge rather than invent a rejection —
+        the binary still gets its say.
+        """
+        agents = self._spec_dir(tmp_path)
+        real = tmp_path / "elsewhere.json"
+        real.write_text(json.dumps({"mcpServers": {"broken": {"args": []}}}), encoding="utf-8")
+        (agents / "kirocrew.json").symlink_to(real)
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        # No structural verdict, and the binary was still consulted.
+        assert status["rejected_agent_specs"] == []
+        assert any(a[:2] == ["agent", "validate"] for a in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_structural_rejection_detail_is_redacted(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The detail names the MCP server, and a server name is user-supplied.
+
+        Every dashboard-facing string in this module goes through
+        ``_sanitize_detail``; the structural finding must not be the one exception,
+        or a name carrying a credential reaches the readiness payload verbatim.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "svc?token=AKIAIOSFODNN7EXAMPLE": {"args": []},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in status["agent_spec_rejection_detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_remote_url_mcp_server_is_launchable_and_not_reported(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A remote MCP server has no ``command`` and is perfectly valid.
+
+        The custom-MCP handler's own contract is "spec needs 'command' (stdio) or
+        'url' (remote)", and ``rebuild_agent_config`` writes a URL-only entry into
+        the required spec. Treating that as unlaunchable would force a healthy
+        install into a readiness gate whose only escape discards the user's MCP tool
+        selections — worse than the silent gap this check closes.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {"remote": {"url": "https://mcp.example.com/sse"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert status["ready"]
+
+    @pytest.mark.asyncio
+    async def test_a_launchable_mcp_server_still_reaches_the_binary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The structural check must not become the only oracle.
+
+        It answers one narrow question. Everything else — including whether this
+        build of kiro-cli likes the schema at all — stays the binary's call, so a
+        spec that passes the structural read must still be validated.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {"name": "kirocrew", "mcpServers": {"ok": {"command": "uvx", "args": []}}}
+            ),
+            encoding="utf-8",
+        )
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert any(a[:2] == ["agent", "validate"] for a in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_spec_is_re_probed_but_never_rewritten(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The rejection card's button re-asks the binary; it must not rewrite.
+
+        ``_repair_agent_specs`` documents that it only rebuilds when the main spec
+        is ABSENT, which is what keeps it out of a lost-update class: the rebuild
+        regenerates the whole file and re-merges ``mcpServers``, but not the
+        ``tools``/``allowedTools`` half ``api_mcp_toggle`` writes separately. A
+        rejected spec is present, so rebuilding it can silently drop a concurrent
+        toggle's grant. Pins both halves: no write, and a forced re-probe so the
+        button still does something only the binary can answer.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text("{}", encoding="utf-8")
+        rebuilt: list[str] = []
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            if args[:2] == ["agent", "validate"]:
+                return ProcessResult(ok=True, output="x is invalid: bad", returncode=0)
+            return ProcessResult(ok=True)
+
+        service = self._service(tmp_path, run)
+        await service.snapshot(force=True)
+        assert service._status.rejected_agent_specs == ["kirocrew.json"]
+
+        async def _fake_repair() -> str:
+            rebuilt.append("called")
+            return ""
+
+        # Patch the write itself: this asserts the guard's decision, not that
+        # rebuild_agent_config works (which has its own coverage).
+        service._repair_agent_specs = _fake_repair  # type: ignore[method-assign]
+
+        await service.repair_agent_specs(caller="test")
+
+        # A rejected spec exists on disk, so regenerating it would drop a
+        # concurrent api_mcp_toggle edit to the tools/allowedTools half that
+        # rebuild_agent_config does not re-merge. Losing a user's tool grants to
+        # clear a rejection is worse than the rejection, so the write must NOT
+        # happen -- the button re-asks the binary instead.
+        assert rebuilt == []
+        # The button is not inert: a forced re-probe means a spec kiro-cli now
+        # accepts clears the card, which a stat-only overlay could never decide.
+        assert sum(1 for a in calls if a[:2] == ["agent", "validate"]) >= 2
+
+    @pytest.mark.asyncio
+    async def test_repair_declines_when_nothing_is_wrong(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The widened guard must not turn every Check again into a write."""
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text("{}", encoding="utf-8")
+        (agents / "kirocrew-lite.json").write_text("{}", encoding="utf-8")
+        rebuilt: list[str] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            return ProcessResult(ok=True)
+
+        service = self._service(tmp_path, run)
+        await service.snapshot(force=True)
+
+        async def _fake_repair() -> str:
+            rebuilt.append("called")
+            return ""
+
+        service._repair_agent_specs = _fake_repair  # type: ignore[method-assign]
+
+        await service.repair_agent_specs(caller="test")
+
+        assert rebuilt == []
 
 
 class TestAgentSpecRepairIsAPostNotAGet:
@@ -4966,3 +5940,460 @@ class TestKiroCliApiKeyCountsAsSignedIn:
         assert status["installed"] is True
         assert status["authenticated"] is False
         assert status["ready"] is False
+
+
+class TestAcpSubcommandSupportNarrowsReadiness:
+    """A signed-in CLI too old for the `acp` subcommand cannot start a session.
+
+    It runs and authenticates, so the pre-existing probes both pass — but every
+    session launches as `kiro-cli acp ...`, so a CLI without that subcommand
+    fails at session-create with an opaque error. The readiness probe therefore
+    asks `acp --help` and narrows `ready` when the subcommand is unknown, with
+    an UPDATE (not a reinstall) as the remedy.
+    """
+
+    def _service(
+        self,
+        tmp_path: Path,
+        runner: Any,
+    ) -> KiroPrerequisiteService:
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        return KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": str(executable.parent)},
+            home=tmp_path,
+            data_home=tmp_path / "data-home",
+            process_runner=runner,
+            audit_writer=_no_audit,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_acp_subcommand_narrows_ready(self, tmp_path: Path) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"]:
+                return ProcessResult(ok=True)
+            if args == ["whoami"]:
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                # A clap CLI too old to have the subcommand exits nonzero here.
+                return ProcessResult(
+                    ok=False,
+                    returncode=2,
+                    output="error: unrecognized subcommand 'acp'",
+                )
+            return ProcessResult(ok=False)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        # Installed and authenticated, but not ready: the acp subcommand is the
+        # missing piece, and its remedy is an update.
+        assert status["installed"] is True
+        assert status["authenticated"] is True
+        assert status["acp_supported"] is False
+        assert status["ready"] is False
+        assert status["update_command"] == KIRO_CLI_UPDATE_COMMAND
+
+    @pytest.mark.asyncio
+    async def test_present_acp_subcommand_is_ready(self, tmp_path: Path) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["acp", "--help"]:
+                return ProcessResult(ok=True, output="Usage: kiro-cli acp [OPTIONS]")
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["acp_supported"] is True
+        assert status["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_probe_that_cannot_run_is_treated_as_supported(
+        self, tmp_path: Path
+    ) -> None:
+        """A timeout or unrecognized failure must NOT be reported as too-old.
+
+        Only a clean "unknown subcommand" rejection sets acp_supported False; a
+        probe that merely failed to run leaves a healthy install ready rather
+        than blocking it behind an update card it does not need.
+        """
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["acp", "--help"]:
+                # Failed, but with no recognizable rejection wording (e.g. a
+                # transient spawn error captured as generic text).
+                return ProcessResult(ok=False, returncode=1, output="some unrelated error")
+            return ProcessResult(ok=True)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["acp_supported"] is True
+        assert status["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_acp_probe_is_gated_on_a_successful_whoami(self, tmp_path: Path) -> None:
+        """A signed-out CLI is not asked about acp — one fault, one card."""
+        acp_probed = False
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            nonlocal acp_probed
+            if args == ["--version"]:
+                return ProcessResult(ok=True)
+            if args == ["whoami"]:
+                return ProcessResult(ok=False)
+            if args == ["acp", "--help"]:
+                acp_probed = True
+            return ProcessResult(ok=False)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["authenticated"] is False
+        assert acp_probed is False
+        # acp_supported stays at its safe default when the probe never ran.
+        assert status["acp_supported"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_cli_runs_the_self_update_and_reprobes(
+        self, tmp_path: Path
+    ) -> None:
+        """A successful `kiro-cli update` flips acp_supported and clears ready."""
+        acp_ok = {"value": False}
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"] or args == ["whoami"]:
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                if acp_ok["value"]:
+                    return ProcessResult(ok=True, output="Usage: kiro-cli acp")
+                return ProcessResult(ok=False, returncode=2, output="unrecognized subcommand 'acp'")
+            if args == ["update"]:
+                # The update makes the next acp probe succeed.
+                acp_ok["value"] = True
+                return ProcessResult(ok=True, output="updated")
+            return ProcessResult(ok=False)
+
+        service = self._service(tmp_path, run)
+        before = await service.snapshot(force=True)
+        assert before["acp_supported"] is False and before["ready"] is False
+
+        after = await service.update_cli("owner")
+
+        assert after["cli_update_error"] == ""
+        assert after["acp_supported"] is True
+        assert after["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_cli_reports_a_nonzero_update_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A failed update surfaces its output as cli_update_error, not a crash."""
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"] or args == ["whoami"]:
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                return ProcessResult(ok=False, returncode=2, output="unrecognized subcommand 'acp'")
+            if args == ["update"]:
+                return ProcessResult(
+                    ok=False, returncode=1, output="update failed: network unreachable"
+                )
+            return ProcessResult(ok=False)
+
+        service = self._service(tmp_path, run)
+        # The gate probes and finds acp unsupported before offering the update.
+        before = await service.snapshot(force=True)
+        assert before["acp_supported"] is False
+        result = await service.update_cli("owner")
+
+        assert "network unreachable" in result["cli_update_error"]
+        # Still not ready — the update did not fix anything.
+        assert result["acp_supported"] is False
+
+    @pytest.mark.asyncio
+    async def test_update_cli_runs_unverified_binary_under_strict_sandbox(
+        self, tmp_path: Path
+    ) -> None:
+        """The self-update spawn hardens against a planted binary.
+
+        ``candidates[0]`` is whatever sits first on PATH, so the update must run
+        under the strict sandbox (``~/.aws`` / ``~/.ssh`` hidden) — not the
+        standard, real-home posture — and must forward proxy config for network
+        reach WITHOUT handing the unverified binary the Kiro identity credential.
+        """
+        seen: dict[str, Any] = {}
+
+        async def run(_command: str, args: list[str], **kwargs: Any) -> ProcessResult:
+            if args == ["--version"] or args == ["whoami"]:
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                return ProcessResult(
+                    ok=False, returncode=2, output="unrecognized subcommand 'acp'"
+                )
+            if args == ["update"]:
+                seen.update(kwargs)
+                return ProcessResult(ok=True, output="updated")
+            return ProcessResult(ok=False)
+
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={
+                "HOME": str(tmp_path),
+                "PATH": str(executable.parent),
+                "HTTPS_PROXY": "http://proxy.example:8080",
+                prerequisite_module.CRED_KIRO_API_KEY: "secret-token",
+            },
+            home=tmp_path,
+            data_home=tmp_path / "data-home",
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+        await service.snapshot(force=True)
+        await service.update_cli("owner")
+
+        assert seen.get("sandbox_mode") == prerequisite_module._UNVERIFIED_SANDBOX_MODE
+        # The identity token store must be hidden from the unverified binary too —
+        # same isolation the read-only probe applies, not the weaker crew-only set.
+        assert seen.get("extra_hidden_dirs") == service._hidden_probe_dirs
+        env = seen.get("env") or {}
+        assert env.get("HTTPS_PROXY") == "http://proxy.example:8080"
+        assert prerequisite_module.CRED_KIRO_API_KEY not in env
+
+
+class TestTerminalAuditErrorLabels:
+    """Pin the three SEL terminal-audit error labels to their exact values.
+
+    ``_terminal_audit_detail`` is the single source for the ``error`` field on
+    the terminal audit event of every finished kiro-cli child run — consumed by
+    ``update_cli``, ``_audited_probe`` (probe_version / probe_acp_support), and
+    ``_audited_identity_probe`` (probe_identity). Before these tests nothing
+    read the label's VALUE off an emitted event, so the mapping could change,
+    or invert "timeout" and "nonzero exit", with the suite staying green.
+    """
+
+    @pytest.mark.parametrize(
+        ("succeeded", "result", "label"),
+        [
+            # The success verdict always maps to the empty label.
+            (True, ProcessResult(ok=True), ""),
+            # *succeeded* is the caller's verdict, not ``result.ok``, so it
+            # wins even over a result that says timed_out: the label can never
+            # contradict the ``outcome`` recorded beside it.
+            (True, ProcessResult(ok=False, timed_out=True), ""),
+            (False, ProcessResult(ok=False, timed_out=True), "timeout"),
+            (
+                False,
+                ProcessResult(ok=False, timed_out=False, returncode=1),
+                "nonzero exit",
+            ),
+            # No caller reaches succeeded=False with result.ok=True today, but
+            # the second parameter permits it: a failed verdict over an ok
+            # result is labeled as an exit failure, never as silence.
+            (False, ProcessResult(ok=True), "nonzero exit"),
+        ],
+    )
+    def test_detail_matrix(
+        self, succeeded: bool, result: ProcessResult, label: str
+    ) -> None:
+        assert prerequisite_module._terminal_audit_detail(result, succeeded) == label
+
+    # -- End-to-end: the label as it lands on the emitted SEL event ----------
+
+    def _service_with_audit(
+        self, tmp_path: Path, run: Any
+    ) -> tuple[KiroPrerequisiteService, list[dict[str, Any]]]:
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        events: list[dict[str, Any]] = []
+
+        async def audit(**kwargs: Any) -> None:
+            events.append(kwargs)
+
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": str(executable.parent)},
+            home=tmp_path,
+            data_home=tmp_path / "data-home",
+            process_runner=run,
+            audit_writer=audit,
+        )
+        return service, events
+
+    @staticmethod
+    def _terminal_labels(events: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+        """The (action, outcome) audit inspection, extended with the error label."""
+        return [
+            (item["action"], item["outcome"], item["error"])
+            for item in events
+            if item["outcome"] != "invoked"
+        ]
+
+    @staticmethod
+    def _assert_outcome_and_error_agree(events: list[dict[str, Any]]) -> None:
+        """``completed`` and an empty error label imply each other, both ways."""
+        for item in events:
+            if item["outcome"] == "invoked":
+                continue
+            assert (item["outcome"] == "completed") == (item["error"] == ""), item
+
+    @pytest.mark.asyncio
+    async def test_successful_probes_carry_the_empty_label(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args in (["--version"], ["whoami"]):
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                return ProcessResult(ok=True, output="Usage: kiro-cli acp")
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.snapshot(force=True)
+
+        assert self._terminal_labels(events) == [
+            ("probe_version", "completed", ""),
+            ("probe_identity", "completed", ""),
+            ("probe_acp_support", "completed", ""),
+        ]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_version_probe_is_labeled_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"]:
+                return ProcessResult(ok=False, timed_out=True)
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.snapshot(force=True)
+
+        # A failed version probe short-circuits the pipeline: no whoami runs.
+        assert self._terminal_labels(events) == [
+            ("probe_version", "failed", "timeout"),
+        ]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_nonzero_version_probe_is_labeled_nonzero_exit(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"]:
+                return ProcessResult(ok=False, returncode=1)
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.snapshot(force=True)
+
+        assert self._terminal_labels(events) == [
+            ("probe_version", "failed", "nonzero exit"),
+        ]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_identity_probe_is_labeled_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"]:
+                return ProcessResult(ok=True)
+            if args == ["whoami"]:
+                return ProcessResult(ok=False, timed_out=True)
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.snapshot(force=True)
+
+        # The acp probe is gated on a successful whoami, so the failed identity
+        # probe is the terminal event of the run.
+        assert self._terminal_labels(events) == [
+            ("probe_version", "completed", ""),
+            ("probe_identity", "failed", "timeout"),
+        ]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_signed_out_identity_probe_is_labeled_nonzero_exit(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["--version"]:
+                return ProcessResult(ok=True)
+            if args == ["whoami"]:
+                return ProcessResult(ok=False, returncode=1, output="Not logged in")
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.snapshot(force=True)
+
+        assert self._terminal_labels(events) == [
+            ("probe_version", "completed", ""),
+            ("probe_identity", "failed", "nonzero exit"),
+        ]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_successful_update_carries_the_empty_label(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["update"]:
+                return ProcessResult(ok=True, output="updated")
+            if args in (["--version"], ["whoami"]):
+                return ProcessResult(ok=True)
+            if args == ["acp", "--help"]:
+                return ProcessResult(ok=True, output="Usage: kiro-cli acp")
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        await service.update_cli("owner")
+
+        # The post-update re-probe appends its own probe events; the update's
+        # terminal event is pinned by filtering to its action.
+        update_labels = [
+            item for item in self._terminal_labels(events) if item[0] == "update_cli"
+        ]
+        assert update_labels == [("update_cli", "completed", "")]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_update_is_labeled_timeout(self, tmp_path: Path) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["update"]:
+                return ProcessResult(ok=False, timed_out=True)
+            if args in (["--version"], ["whoami"]):
+                return ProcessResult(ok=True)
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        result = await service.update_cli("owner")
+
+        assert "did not finish in time" in result["cli_update_error"]
+        update_labels = [
+            item for item in self._terminal_labels(events) if item[0] == "update_cli"
+        ]
+        assert update_labels == [("update_cli", "failed", "timeout")]
+        self._assert_outcome_and_error_agree(events)
+
+    @pytest.mark.asyncio
+    async def test_nonzero_update_is_labeled_nonzero_exit(
+        self, tmp_path: Path
+    ) -> None:
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if args == ["update"]:
+                return ProcessResult(ok=False, returncode=1, output="update failed")
+            if args in (["--version"], ["whoami"]):
+                return ProcessResult(ok=True)
+            return ProcessResult(ok=False)
+
+        service, events = self._service_with_audit(tmp_path, run)
+        result = await service.update_cli("owner")
+
+        assert result["cli_update_error"] == "update failed"
+        update_labels = [
+            item for item in self._terminal_labels(events) if item[0] == "update_cli"
+        ]
+        assert update_labels == [("update_cli", "failed", "nonzero exit")]
+        self._assert_outcome_and_error_agree(events)

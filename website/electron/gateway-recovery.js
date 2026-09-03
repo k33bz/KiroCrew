@@ -1,8 +1,9 @@
 "use strict";
 //
-// Pure, injectable recovery-strategy decision, extracted from main.js so it can
+// Injectable recovery-strategy decisions, extracted from main.js so they can
 // be unit-tested without Electron (mirrors gateway-liveness.js / gateway-wait.js
-// / gateway-stop.js).
+// / gateway-stop.js). Most exports are pure; revealWindowForConnect drives an
+// injected window and is testable with a fake.
 //
 // PROBLEM: the post-handoff liveness monitor fires onUnresponsive whenever
 // /api/status stops answering. main.js used to react ONE way — assume a wedged
@@ -15,26 +16,52 @@
 // a terminal error dialog that QUIT the app on any button — including Retry (the
 // perceived "crash on Retry" on network change).
 //
-// This helper is the single source of truth for that fork: given whether we own
-// the gateway, return which recovery strategy to run. Keeping it pure means the
-// ownership rule is covered by tests independently of the Electron plumbing.
+// This helper is the single source of truth for that fork: given how the
+// gateway was obtained (the launcher's single ownership state), return which
+// recovery strategy to run. Keeping it pure means the ownership rule is covered
+// by tests independently of the Electron plumbing.
+
+// The launcher's gateway-ownership vocabulary (main.js keeps exactly one of
+// these in a single module-level state; see GATEWAY_OWNERSHIP_STATES):
+//   "none"           — no gateway yet, or an adopted holder that could NOT be
+//                      positively identified as local (tunnel / external).
+//   "spawned"        — this app spawned the bundled backend on this port.
+//   "reused-local"   — adopted a local same-family Kiro Crew process.
+//   "reused-service" — like reused-local, but the holder was SERVICE-classified.
+const GATEWAY_OWNERSHIP_STATES = Object.freeze(["none", "spawned", "reused-local", "reused-service"]);
+
+/**
+ * Classify an adopted (reuse-path) gateway into the ownership vocabulary.
+ * Positive identification requires BOTH a same-family health answer and a
+ * local LISTEN owner ("kirocrew"/"service"); anything less (tunnel, no visible
+ * owner, probe failure) stays "none" — the never-kill/never-respawn external
+ * classification. Pure so the classification rule is unit-testable without
+ * Electron.
+ *
+ * @param {object} o
+ * @param {string} o.reason      the reuse decision's reason (from
+ *                               decideGatewayAction); only "same-family" is a
+ *                               positive family identification.
+ * @param {string} o.localOwner  the LISTEN-owner classification for the port
+ *                               ("kirocrew" | "service" | "other" | "none" | …).
+ * @returns {"reused-service" | "reused-local" | "none"}
+ */
+function classifyAdoptedGateway({ reason, localOwner }) {
+  const local = reason === "same-family" && (localOwner === "kirocrew" || localOwner === "service");
+  if (!local) return "none";
+  return localOwner === "service" ? "reused-service" : "reused-local";
+}
 
 /**
  * Decide how to recover an unresponsive gateway.
  *
  * @param {object} o
- * @param {boolean} o.weSpawnedGateway  true only when this app spawned the
- *                                       bundled backend on this port (spawn
- *                                       path). false on the reuse path — a
- *                                       gateway was already answering at boot
- *                                       (remote tunnel or external gateway).
- * @param {boolean} [o.reusedLocalGateway=false]  true only when the reuse
- *                                       decision positively identified the
- *                                       port-holder as a LOCAL same-family
- *                                       Kiro Crew process (localOwner
- *                                       "kirocrew"/"service" + same-family
- *                                       health). A tunnel or an unidentified
- *                                       holder never sets this.
+ * @param {string} o.gatewayOwnership  one of GATEWAY_OWNERSHIP_STATES: how the
+ *                                     gateway on this port was obtained.
+ *                                     "spawned" is the only owned state; the
+ *                                     reused-* states are adopted local
+ *                                     gateways; "none" (or anything
+ *                                     unrecognized) is external/unknown.
  * @returns {"respawn" | "reconnect-bounded" | "reconnect"}
  *   "respawn"   — we own the child: kill the wedged tree, free the port, spawn a
  *                 fresh backend, re-run the boot flow.
@@ -50,9 +77,12 @@
  *                 tunnel heals, then reconnect (re-fetching a token, since the
  *                 drop likely invalidated the old one).
  */
-function chooseRecoveryStrategy({ weSpawnedGateway, reusedLocalGateway = false }) {
-  if (weSpawnedGateway) return "respawn";
-  if (reusedLocalGateway) return "reconnect-bounded";
+function chooseRecoveryStrategy({ gatewayOwnership }) {
+  if (gatewayOwnership === "spawned") return "respawn";
+  if (gatewayOwnership === "reused-local" || gatewayOwnership === "reused-service") return "reconnect-bounded";
+  // "none", undefined, or anything unrecognized: ownership defaults to "not
+  // ours" — the safe strategy is the non-destructive reconnect, never a
+  // port-kill.
   return "reconnect";
 }
 
@@ -116,10 +146,125 @@ async function waitForProcessExit({ pids, isAlive, sleep, timeoutMs = INCUMBENT_
   }
 }
 
+// Capture listener PIDs while the port is still bound. The draining process may
+// release its socket before dropping gateway.lock, so recovery needs its PID to
+// wait for process exit rather than treating "port free" as "lock free". A null
+// result means the snapshot is unsafe: the probe failed or the listener vanished
+// before it could be captured.
+async function snapshotPortPids({
+  port,
+  isWindows = false,
+  getWindowsPids,
+  getPosixPids,
+}) {
+  const getListenPids = isWindows ? getWindowsPids : getPosixPids;
+  if (typeof getListenPids !== "function") return null;
+  try {
+    const pids = await getListenPids(port);
+    return Array.isArray(pids) && pids.length ? pids : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does an unusable incumbent snapshot have to stop an automatic respawn?
+ *
+ * A `null` snapshot means the listener probe could not name the draining
+ * process. On Windows that is anomalous — netstat ships in-box — so recovery
+ * fails closed rather than respawning into the incumbent's `gateway.lock`. On
+ * POSIX a missing or blocked `lsof` degrades to a no-op wait, and the
+ * replacement's own lock refusal is an honest arbiter, so a host without `lsof`
+ * must still be able to boot.
+ */
+function incumbentSnapshotBlocksRespawn({ pids, isWindows = false }) {
+  return pids === null && isWindows;
+}
+
+/**
+ * Build the terminal recovery dialog without loading Electron.
+ *
+ * @param {object} o
+ * @param {number|string} o.port
+ * @param {"wedged"|"held"} [o.variant]
+ * @param {boolean} [o.probeFailed]
+ * @param {boolean} [o.isPrimaryWindow]
+ * @returns {{
+ *   title:string, message:string, portConflict:false,
+ *   primaryAction:"quit", primaryLabel:string, showQuitButton:false
+ * }}
+ */
+function unrecoverableGatewayDialog({
+  port,
+  variant = "wedged",
+  probeFailed = false,
+  isPrimaryWindow = false,
+}) {
+  const held = variant === "held";
+  return {
+    title: probeFailed
+      ? `Kiro Crew: can't verify what's using port ${port}`
+      : held
+        ? `Kiro Crew: port ${port} is in use`
+        : `Kiro Crew: backend stuck on port ${port}`,
+    message: probeFailed
+      ? `Kiro Crew could not verify which process owns port ${port}, so it did not `
+        + `risk terminating an unrelated process or starting a second gateway. `
+        + `Quit and reopen Kiro Crew to try again. If the port is still blocked, `
+        + `restart your computer.`
+      : held
+        ? `Another process is holding port ${port}, so Kiro Crew can't reconnect to `
+          + `it or start its own backend there. Quit the process using port ${port} `
+          + `(the launch log below names it; look for the "port-owner:" line), `
+          + `then reopen this app.`
+        : `The Kiro Crew backend is wedged and cannot be stopped. It is in an `
+          + `uninterruptible state and is still holding port ${port}, so it can't be `
+          + `force-stopped or restarted in place. Restart your computer to clear it. `
+          + `(This is a known backend hang; see the launch log below for the cause.)`,
+    portConflict: false,
+    primaryAction: "quit",
+    primaryLabel: isPrimaryWindow ? "Quit Kiro Crew" : "Close",
+    showQuitButton: false,
+  };
+}
+
+/**
+ * Reveal a window for a connect/loading flow, raising ONLY when the user asked
+ * for it. Effectful (it drives the injected window) but injectable, so the
+ * raise-vs-silent rule is unit-testable without Electron.
+ *
+ * Cold launch and user-initiated connects (app start, dialog Retry, a new
+ * connection window) keep the historical raise-and-focus `show()`.
+ *
+ * Liveness-recovery reconnects touch NOTHING: the user did nothing, so the
+ * app must not raise, focus, un-minimize, or re-surface itself (the
+ * remote-tunnel setup reconnects on every screen lock/unlock — see #6373).
+ * The splash and dashboard load fine into a background, minimized, or hidden
+ * window; a window the user hid to tray stays hidden until THEY reopen it.
+ * The escalation rule lives in main.js: silent while self-healing, but any
+ * state that needs input (token prompt, failure dialog, the terminal
+ * unrecoverable-gateway dialog) does a full reveal via revealForUserDecision
+ * at the point it is reached.
+ *
+ * @param {object} win  BrowserWindow-like: show().
+ * @param {object} [o]
+ * @param {boolean} [o.reconnect=false]  true on liveness-recovery paths.
+ */
+function revealWindowForConnect(win, { reconnect = false } = {}) {
+  if (reconnect) return;
+  win.show();
+}
+
 module.exports = {
   chooseRecoveryStrategy,
+  classifyAdoptedGateway,
+  revealWindowForConnect,
+  GATEWAY_OWNERSHIP_STATES,
   waitForServiceRebind,
   waitForProcessExit,
+  snapshotPortPids,
+  incumbentSnapshotBlocksRespawn,
+  unrecoverableGatewayDialog,
   SERVICE_REBIND_GRACE_MS,
   INCUMBENT_EXIT_GRACE_MS,
 };

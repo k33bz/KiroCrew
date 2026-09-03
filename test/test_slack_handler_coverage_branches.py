@@ -22,6 +22,8 @@ import pytest
 
 from conftest import MockSlackClient
 from kiro_crew.config.loader import ConfigReadError
+from kiro_crew.messaging import auto_title
+from kiro_crew.messaging import commands as mc
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.slack import handler as h
 
@@ -95,11 +97,12 @@ def _clean_state():
     """Reset the module globals these tests touch, before and after."""
 
     def _reset() -> None:
-        h._titled_threads.clear()
-        # The auto-title lock is a module global created inside whichever event
-        # loop ran first. Reusing one across loops deadlocks, so drop it and let
-        # each test's loop build its own.
-        h._auto_title_lock = None
+        # Through the shared module's own hook: the auto-title claim LRU and its
+        # lock live in `messaging.auto_title` now, and `reset()` does both halves.
+        # A test that crashed mid-title leaves the claim marked AND the permit held,
+        # and `LoopBoundLock` rebinding per loop covers a new loop but not a leaked
+        # permit on the same one.
+        auto_title.reset()
         h._thread_agents.clear()
         h._thread_projects.clear()
         h._hydrated_sessions.clear()
@@ -133,6 +136,7 @@ def sessions():
     sm.has_session = MagicMock(return_value=False)
     sm.release = MagicMock()
     sm.destroy = AsyncMock()
+    sm.discard_conversation = AsyncMock()
     sm.get_session_for_thread = MagicMock(return_value=None)
     return sm
 
@@ -256,51 +260,48 @@ class TestConfigWriteFailures:
         return cfg
 
     def test_set_default_agent_read_error(self, monkeypatch):
-        def _boom(_path):
+        def _boom(_path, *, mutate):
             raise ConfigReadError("config.json is not valid JSON")
 
-        monkeypatch.setattr(h, "read_config_for_update", _boom)
+        monkeypatch.setattr(h, "update_config_locked", _boom)
         with pytest.raises(ValueError, match="Failed to read config"):
             h._set_default_agent("kirocrew")
         assert h._cached_default_agent is None
 
     def test_set_default_agent_write_error(self, monkeypatch):
-        monkeypatch.setattr(h, "read_config_for_update", lambda _p: {})
-
-        def _boom(_path, _data):
+        def _boom(_path, *, mutate):
             raise OSError("disk full")
 
-        monkeypatch.setattr(h, "write_config_atomically", _boom)
+        monkeypatch.setattr(h, "update_config_locked", _boom)
         with pytest.raises(ValueError, match="Failed to write config"):
             h._set_default_agent("kirocrew")
         # Cache must NOT advance past a failed write.
         assert h._cached_default_agent is None
 
     def test_persist_channel_config_read_error(self, monkeypatch):
-        def _boom(_path):
+        def _boom(_path, *, mutate):
             raise ConfigReadError("truncated file")
 
-        monkeypatch.setattr(h, "read_config_for_update", _boom)
+        monkeypatch.setattr(h, "update_config_locked", _boom)
         with pytest.raises(ValueError, match="Failed to read config"):
             h._persist_channel_config("C1", activation="mention")
 
     def test_persist_channel_config_write_error(self, monkeypatch):
-        monkeypatch.setattr(h, "read_config_for_update", lambda _p: {})
-
-        def _boom(_path, _data):
+        def _boom(_path, *, mutate):
             raise OSError("read-only filesystem")
 
-        monkeypatch.setattr(h, "write_config_atomically", _boom)
+        monkeypatch.setattr(h, "update_config_locked", _boom)
         with pytest.raises(ValueError, match="Failed to write config"):
             h._persist_channel_config("C1", agent="kirocrew")
 
-    def test_persist_channel_config_merges_both_fields(self, monkeypatch):
-        written: dict = {}
-        monkeypatch.setattr(h, "read_config_for_update", lambda _p: {"slack": {"bot": "x"}})
-        monkeypatch.setattr(
-            h, "write_config_atomically", lambda _p, data: written.update(data)
-        )
+    def test_persist_channel_config_merges_both_fields(self, monkeypatch, tmp_path):
+        # Real file through the real locked primitive: the write must merge
+        # into existing settings, not overwrite them.
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"slack": {"bot": "x"}}), encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "config_path", lambda: cfg)
         h._persist_channel_config("C9", activation="always", agent="kirocrew")
+        written = json.loads(cfg.read_text(encoding="utf-8"))
         ch = written["slack"]["channels"]["C9"]
         assert ch == {"activation": "always", "agent": "kirocrew"}
         # Sibling keys survive the merge.
@@ -425,9 +426,9 @@ class TestCompactCommandFailureArms:
     ):
         slack = FlakySlack("post_message", "remove_reaction")
         sessions.get_provider = MagicMock(return_value=_provider(compact_raises=True))
-        sessions.destroy = AsyncMock(side_effect=RuntimeError("registry locked"))
+        sessions.discard_conversation = AsyncMock(side_effect=RuntimeError("registry locked"))
         await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
-        sessions.destroy.assert_awaited_once_with("slack:t1")
+        sessions.discard_conversation.assert_awaited_once_with("slack:t1")
         sessions.release.assert_called_once_with("slack:t1")
 
     @pytest.mark.asyncio
@@ -491,7 +492,7 @@ class TestUnknownBangCommand:
 class TestCommandHelperEarlyReturns:
     def test_spawn_with_no_task_declines(self):
         manager = MagicMock()
-        assert h._do_spawn("", manager) is None
+        assert mc.spawn_task_reply("", manager) is None
         manager.spawn.assert_not_called()
 
     def test_spawn_keyword_without_prefix_declines(self):

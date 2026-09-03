@@ -2,22 +2,27 @@ import { useState, useRef, useEffect, useCallback, useMemo, Fragment, type React
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
+import { useLongPressReorder } from '../../hooks/useLongPressReorder'
 import { Reorder } from 'framer-motion'
-import { FileText, Bot, Workflow, ScrollText, MessageSquare, TerminalSquare, GitCompare, GitPullRequest, Plus, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, PanelRight, PanelBottom, Layers } from 'lucide-react'
-import { PanelRightLight, PanelBottomSolid } from '../../components/icons/panels'
+import { FileText, Bot, Workflow, ScrollText, MessageCircleQuestionMark, TerminalSquare, GitCompare, GitPullRequest, GitBranch, Plus, MoreHorizontal, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, Folders, Link as LinkIcon, PanelRight, PanelBottom, Layers, ListTree, Pin } from 'lucide-react'
+import { PanelRightLight } from '../../components/icons/panels'
 import ActivityViewer from './ActivityViewer'
 import DiffPanel from '../../components/DiffPanel'
 import DetailPanel from '../../components/DetailPanel'
-import MarkdownPanel from '../../components/MarkdownPanel'
+import MarkdownPanel, { type MarkdownPanelHandle } from '../../components/MarkdownPanel'
 import ArtifactPanel from '../../components/ArtifactPanel'
 import FolderPanel from './FolderPanel'
+import FilesHomePanel from './FilesHomePanel'
+import FileBrowserRail, { useTreeAvailable } from './FileBrowserRail'
 import WebPreviewPanel from '../../components/WebPreviewPanel'
 import CliPanel, { disposeTerminalSession, useDeleteTerminalSession } from '../../components/CliPanel'
 import { countLines } from '../../components/FileChangeChips'
+import { useQuery } from '@tanstack/react-query'
+import { api } from '../../api/client'
 import { useTerminalEnabled, useTerminalTitle } from '../../utils/terminalRegistry'
-import { adoptTab as adoptBottomTerminal } from '../../hooks/useBottomTerminal'
 import type { usePanelTabs, ViewKind, PanelTab, TabKind } from '../../hooks/usePanelTabs'
 import { PINNED_VIEWS, useAllAppTabs } from '../../hooks/usePanelTabs'
+import { scrollMemoryKeyFor } from '../../hooks/useScrollMemory'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { useSidePanelDock } from '../../hooks/useSidePanelDock'
 import {
@@ -28,16 +33,18 @@ import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
 import McpAppFrame from '../../components/McpAppFrame'
-import type { TouchedFile } from '../../hooks/useTouchedFiles'
 import type { ExtractedLink } from '../../utils/extractChatLinks'
 import type { PullRequestLink } from '../../utils/pullRequestLinks'
+import type { ChatPin } from '../../api/pins'
 
 import { i18nT } from '../../i18n/t'
 const KIND_ICON: Record<TabKind, ReactNode> = {
-  changes: <GitPullRequest size={16} />, issues: <CircleDot size={16} />, files: <FileText size={16} />, artifacts: <Component size={16} />, subagents: <Bot size={16} />, workflows: <Workflow size={16} />,
-  logs: <ScrollText size={16} />, context: <Layers size={16} />, side: <MessageSquare size={16} />, terminal: <TerminalSquare size={16} />, browser: <Globe size={16} />,
+  changes: <GitPullRequest size={16} />, issues: <CircleDot size={16} />, files: <Folders size={16} />, links: <LinkIcon size={16} />, artifacts: <Component size={16} />, subagents: <Bot size={16} />, workflows: <Workflow size={16} />,
+  logs: <ScrollText size={16} />, context: <Layers size={16} />, side: <MessageCircleQuestionMark size={16} />, terminal: <TerminalSquare size={16} />, browser: <Globe size={16} />,
+  summary: <ListTree size={16} />,
+  pins: <Pin size={16} />,
   file: <FileText size={16} />, diff: <GitCompare size={16} />, artifact: <Component size={16} />, folder: <Folder size={16} />,
-  app: <PanelRight size={16} />,
+  app: <PanelRight size={16} />, git: <GitBranch size={16} />,
 }
 
 /**
@@ -60,6 +67,7 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind, string> = {
   changes: 'pages.chat.sidePanel.menu_changes',
   issues: 'pages.chat.sidePanel.menu_issues',
   files: 'pages.chat.sidePanel.menu_files',
+  links: 'pages.chat.sidePanel.menu_links',
   artifacts: 'pages.chat.sidePanel.menu_artifacts',
   subagents: 'pages.chat.sidePanel.menu_subagents',
   workflows: 'pages.chat.sidePanel.menu_workflows',
@@ -67,12 +75,16 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind, string> = {
   context: 'pages.chat.sidePanel.menu_context',
   side: 'pages.chat.sidePanel.menu_side',
   browser: 'pages.chat.sidePanel.menu_browser',
+  git: 'pages.chat.sidePanel.menu_git',
+  summary: 'pages.chat.sidePanel.menu_summary',
+  pins: 'pages.chat.sidePanel.menu_pins',
 }
 
 export const NEW_MENU_DESC_KEY: Record<ViewKind, string> = {
   changes: 'pages.chat.sidePanel.menu_changes_desc',
   issues: 'pages.chat.sidePanel.menu_issues_desc',
   files: 'pages.chat.sidePanel.menu_files_desc',
+  links: 'pages.chat.sidePanel.menu_links_desc',
   artifacts: 'pages.chat.sidePanel.menu_artifacts_desc',
   subagents: 'pages.chat.sidePanel.menu_subagents_desc',
   workflows: 'pages.chat.sidePanel.menu_workflows_desc',
@@ -80,6 +92,9 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind, string> = {
   context: 'pages.chat.sidePanel.menu_context_desc',
   side: 'pages.chat.sidePanel.menu_side_desc',
   browser: 'pages.chat.sidePanel.menu_browser_desc',
+  git: 'pages.chat.sidePanel.menu_git_desc',
+  summary: 'pages.chat.sidePanel.menu_summary_desc',
+  pins: 'pages.chat.sidePanel.menu_pins_desc',
 }
 
 /** Views offered by the + menu, in the three semantic groups the menu renders
@@ -93,34 +108,54 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind, string> = {
  *  (rules only): three group headings would add ~90px of chrome to an
  *  eight-row menu for hierarchy the grouping already conveys.
  *
+ *  Each group carries a stable `id`. It is never rendered — it exists to be the
+ *  group's React key. Neither the group's index nor its contents can serve:
+ *  gating rows changes the contents and dropping an emptied group shifts the
+ *  indices, and either shift remounts a group mid-interaction, detaching the
+ *  menu item the user is clicking. The id is fixed at declaration, so a gate
+ *  flipping only re-renders rows within a group that keeps its identity.
+ *
  *  Every key of `NEW_MENU_LABEL_KEY` must appear exactly once across the
  *  groups — `sidePanelAddMenu.test.tsx` pins that partition, so adding a view
  *  without placing it in a group fails rather than silently dropping it. */
-const NEW_MENU_GROUPS: { kind: ViewKind; icon: ReactNode }[][] = [
+const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind; icon: ReactNode }[] }[] = [
   // Session output — what this chat referenced or produced. (Changes / Files /
   // Artifacts are auto-pinned and filtered out below; they are listed here so
   // this table stays the complete catalog of views.)
-  [
-    { kind: 'changes', icon: <GitPullRequest size={15} /> },
-    { kind: 'issues', icon: <CircleDot size={15} /> },
-    { kind: 'files', icon: <FileText size={15} /> },
-    { kind: 'artifacts', icon: <Component size={15} /> },
-    { kind: 'subagents', icon: <Bot size={15} /> },
-    { kind: 'workflows', icon: <Workflow size={15} /> },
-  ],
+  {
+    id: 'session-output',
+    items: [
+      { kind: 'summary', icon: <ListTree size={15} /> },
+      { kind: 'pins', icon: <Pin size={15} /> },
+      { kind: 'changes', icon: <GitPullRequest size={15} /> },
+      { kind: 'issues', icon: <CircleDot size={15} /> },
+      { kind: 'files', icon: <Folders size={15} /> },
+      { kind: 'links', icon: <LinkIcon size={15} /> },
+      { kind: 'artifacts', icon: <Component size={15} /> },
+      { kind: 'subagents', icon: <Bot size={15} /> },
+      { kind: 'workflows', icon: <Workflow size={15} /> },
+      { kind: 'git', icon: <GitBranch size={15} /> },
+    ],
+  },
   // Interactive workspaces — the surfaces the user types into.
-  [
-    { kind: 'side', icon: <MessageSquare size={15} /> },
-    { kind: 'browser', icon: <Globe size={15} /> },
-  ],
+  {
+    id: 'workspaces',
+    items: [
+      { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
+      { kind: 'browser', icon: <Globe size={15} /> },
+    ],
+  },
   // Diagnostics.
-  [
-    { kind: 'logs', icon: <ScrollText size={15} /> },
-    { kind: 'context', icon: <Layers size={15} /> },
-  ],
+  {
+    id: 'diagnostics',
+    items: [
+      { kind: 'logs', icon: <ScrollText size={15} /> },
+      { kind: 'context', icon: <Layers size={15} /> },
+    ],
+  },
 ]
 
-const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'files', 'artifacts', 'subagents', 'workflows', 'logs', 'context', 'side'])
+const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'links', 'files', 'artifacts', 'subagents', 'workflows', 'logs', 'context', 'side', 'git', 'summary', 'pins'])
 
 /** Views behind the Developer Mode consent gate (Settings > Developer) — the
  *  same gate the standalone Developer page uses. Both are raw instrumentation
@@ -131,37 +166,49 @@ const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'files', 'artifacts', 
  *  `newMenuSections` drops. */
 const DEV_ONLY_VIEWS = new Set<ViewKind>(['logs', 'context'])
 
-/** Which `+`-menu entries are offered, given the two gates that hide entries:
- *  Terminal is hidden when the feature is disabled server-side, and the
- *  diagnostics views (Logs, Context breakdown) are hidden unless Developer Mode
- *  is on. The auto-managed pinned views (Changes / Files / Artifacts) are never
- *  listed; they appear on their own when they have content.
+/** Which `+`-menu entries are offered, given the gates that hide entries:
+ *  the diagnostics views (Logs, Context breakdown) are hidden unless Developer
+ *  Mode is on, and **Summary is hidden while session summaries are disabled**.
+ *  The auto-managed pinned views (Changes / Files / Artifacts) are never listed;
+ *  they appear on their own when they have content.
+ *
+ *  Summary is gated because the feature is opt-in and its settings toggle ships
+ *  separately: advertising the entry while `session_summary.enabled` is false
+ *  sends every reader to a panel that explains it is off and offers no way to
+ *  change that. Hiding the row is the only option that removes the dead end
+ *  rather than wording around it, and it reverses itself the moment the flag
+ *  flips.
  *
  *  Grouped, and **emptied groups are dropped**: with Developer Mode off the
  *  whole diagnostics group disappears. A group that filtered down to nothing
  *  would otherwise render as a separator with no rows after it. */
 export function newMenuSections(
-  opts: { devMode: boolean; terminalEnabled: boolean },
-): { kind: ViewKind; icon: ReactNode }[][] {
+  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean },
+): { id: string; items: { kind: ViewKind; icon: ReactNode }[] }[] {
   return NEW_MENU_GROUPS
-    .map(group => group.filter(item =>
-      (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
-      && !(PINNED_VIEWS as string[]).includes(item.kind),
-    ))
-    .filter(group => group.length > 0)
+    .map(group => ({
+      id: group.id,
+      items: group.items.filter(item =>
+        (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
+        && (opts.summaryEnabled || item.kind !== 'summary')
+        && !(PINNED_VIEWS as string[]).includes(item.kind),
+      ),
+    }))
+    .filter(group => group.items.length > 0)
 }
 
 interface SidePanelProps {
   tabsCtl: ReturnType<typeof usePanelTabs>
   slot: string
-  files?: TouchedFile[]
-  onFileOpen?: (path: string, opts?: { replaceId?: string; line?: number; endLine?: number }) => void
+  onFileOpen?: (path: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => void
   /** Open an artifact as a panel tab (the artifact twin of onFileOpen).
    *  Threaded to the Artifacts tab so its rows open here instead of
    *  hard-navigating to the standalone detail page. */
   onArtifactOpen?: (slug: string) => void
-  onFileRemove?: (path: string) => void
-  onFilesClear?: (source: 'history' | 'tool') => void
+  /** Right-click "Add to context" on a file-browser row: forwards the ABSOLUTE
+   *  path and whether it is a file or a directory to the composer host, which
+   *  inserts the same `@`-mention the file picker does. */
+  onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   projectDir?: string
   navLinks?: ExtractedLink[]
   navResolving?: boolean
@@ -178,13 +225,27 @@ interface SidePanelProps {
   onReconcileIssue?: (url: string) => void
   onAddSourceToChat?: (text: string) => void
   onSubmitComments?: (message: string) => void
+  /** Pinned messages for this session, plus the two actions the Pins tab needs.
+   *  Prop-drilled rather than re-queried here because the JUMP is ChatPage's:
+   *  landing on a pin that is not in the loaded window has to page older
+   *  history in, which only ChatPage's transcript state can drive. */
+  pins?: ChatPin[]
+  pinsLoading?: boolean
+  onJumpToPin?: (messageTs: string, mid?: string) => void
+  onUnpin?: (id: string) => void
+  /** Only shape the copyable deep link a pin row offers. */
+  slotTitle?: string
+  chatMode?: string
   onFileSave: (filePath: string, content: string) => Promise<void>
   /** Close the whole panel (hides the side column). */
   onClose: () => void
-  /** Lifted Files-tab inline preview state (owned by ChatPage so it survives
-   *  panel collapse and coordinates with document-tab opens). */
-  inlinePreviewPath?: string | null
-  onInlinePreviewChange?: (path: string | null) => void
+  /** Is the whole panel mounted-but-invisible? A live app or browser tab keeps
+   *  the subtree mounted through a close (its iframe / WebContentsView cannot
+   *  survive a remount), and the find pane hides it while owning the dock — so
+   *  "panel closed" is a visibility state, not an unmount. Tab bodies that bind
+   *  document-level keys need it: the SELECTED tab is still selected while the
+   *  panel is hidden, so tab selection alone does not mean the user can see it. */
+  panelHidden?: boolean
   /** Preview "focus" mode: when true the panel takes its maximum width (chat
    *  shrinks to its minimum), driven by the Web Preview tab's expand toggle. */
   expanded?: boolean
@@ -284,7 +345,20 @@ export function measureSidePanelReservedW(): number {
   const clusters = Array.from(header.children).filter(
     c => c.tagName !== 'A' && !c.hasAttribute('data-topbar-overlay'),
   ) as HTMLElement[]
-  const content = clusters.reduce((sum, c) => sum + c.getBoundingClientRect().width, 0)
+  // Measure each cluster's CONTENT extent, not its box. The header is a grid
+  // whose side tracks are `minmax(0,1fr)` remainders and whose items stretch, so
+  // a cluster's own box tracks the TRACK width (about half the window) rather
+  // than what it holds — summing boxes inflated the reserve enough to halve a
+  // maximized panel. The extent spans first-child left to last-child right, so
+  // it includes the cluster's internal gaps but not the stretch slack.
+  const extent = (c: HTMLElement) => {
+    const kids = Array.from(c.children)
+      .map(k => k.getBoundingClientRect())
+      .filter(r => r.width > 0)
+    if (kids.length === 0) return 0
+    return Math.max(...kids.map(r => r.right)) - Math.min(...kids.map(r => r.left))
+  }
+  const content = clusters.reduce((sum, c) => sum + extent(c), 0)
   const cs = getComputedStyle(header as HTMLElement)
   const pad = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0)
   // +24: minimum breathing gap between the two clusters.
@@ -292,13 +366,15 @@ export function measureSidePanelReservedW(): number {
 }
 
 export default function SidePanel({
-  tabsCtl, slot, files, onFileOpen, onArtifactOpen, onFileRemove, onFilesClear,
+  tabsCtl, slot, onFileOpen, onArtifactOpen, onAddToContext,
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
-  onAddSourceToChat, onSubmitComments, onFileSave, onClose,
-  inlinePreviewPath, onInlinePreviewChange, expanded, fillWidth, canDockBottom = true,
+  onAddSourceToChat, onSubmitComments, onFileSave, onClose, panelHidden,
+  pins, pinsLoading, onJumpToPin, onUnpin,
+  slotTitle, chatMode,
+  expanded, fillWidth, canDockBottom = true,
 }: SidePanelProps) {
-  const { tabs, activeId, openView, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned, openFolder } = tabsCtl
+  const { tabs, activeId, openView, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
   // EVERY app frame, every slot, rendered from one stable-keyed list below so a
   // chat switch cannot change a frame's React key and remount its iframe.
   const allAppTabs = useAllAppTabs()
@@ -311,16 +387,32 @@ export default function SidePanel({
   const toolLog = useAppSelector(s => selectSlotToolLog(s, slot))
   const terminalEnabled = useTerminalEnabled()
   const devMode = useDevMode()
+  // Whether to offer the Summary row at all. Read from the panel's OWN endpoint
+  // and under the SAME query key the Summary tab uses, so this is one cheap
+  // request per slot that doubles as that tab's prefetch rather than a second
+  // source of truth. The endpoint is read-only and never triggers generation.
+  //
+  // Fails OPEN (`!== false`): while the flag is unknown the row is offered, so a
+  // slow request can never hide a feature that IS enabled. The reverse default
+  // would make the panel look missing, which is worse than the brief window it
+  // would close.
+  const { data: summaryMeta } = useQuery({
+    queryKey: ['session-summary', slot],
+    queryFn: () => api.sessionSummary(slot),
+    staleTime: Infinity,
+    retry: false,
+  })
+  const summaryEnabled = summaryMeta?.enabled !== false
   // The + menu / empty-state launcher hide Terminal when the feature is
   // disabled server-side and Context breakdown unless Developer Mode is on, and
   // never list the auto-managed pinned views (Changes / Files / Artifacts) —
   // those appear on their own when they have content (see the syncPinned
   // reconcile below).
-  const menuSections = newMenuSections({ devMode, terminalEnabled })
+  const menuSections = newMenuSections({ devMode, terminalEnabled, summaryEnabled })
   // The empty-state launcher shows the same entries flat: its two-column grid
   // has nowhere to put a separator, but it must not disagree with the menu
   // about ORDER, so it reads the groups rather than its own list.
-  const menuItems = menuSections.flat()
+  const menuItems = menuSections.flatMap(section => section.items)
   // Files / Artifacts / Changes are ALWAYS present — pinned to the front,
   // non-closable, and never in the + menu — regardless of whether they
   // currently have content.
@@ -328,9 +420,6 @@ export default function SidePanel({
   // Split the strip: pinned (fixed, non-closable) vs. dynamic (draggable).
   const pinnedTabs = useMemo(() => tabs.filter(t => (PINNED_VIEWS as string[]).includes(t.id)), [tabs])
   const dynamicTabs = useMemo(() => tabs.filter(t => !(PINNED_VIEWS as string[]).includes(t.id)), [tabs])
-  // Paths already open as `file:` document tabs — passed to the Files view so
-  // opening such a path inline routes to its existing tab (one editor per path).
-  const openDocPaths = useMemo(() => new Set(tabs.filter(t => t.kind === 'file' && t.path).map(t => t.path as string)), [tabs])
   // Terminal opens a NEW tab (its own PTY session) starting in the chat's
   // working dir; every other menu item is a singleton view.
   const openMenuItem = useCallback((kind: ViewKind | 'terminal') => {
@@ -351,13 +440,6 @@ export default function SidePanel({
   }, [tabs, closeTab, deleteTerminalSession])
   // Move a terminal tab OUT of this chat into the app-wide bottom panel. Unlike
   // handleCloseTab this must NOT dispose the session — the PTY + xterm live in
-  // terminalRegistry/termCache keyed by session id and simply re-attach in the
-  // bottom panel. Only drop it from this chat once the panel accepts it.
-  const handleTransferToBottom = useCallback((id: string) => {
-    const t = tabs.find(x => x.id === id)
-    if (t?.kind !== 'terminal' || !t.sessionId) return
-    if (adoptBottomTerminal(t.sessionId, t.cwd)) closeTab(id)
-  }, [tabs, closeTab])
   // Diff view preferences — persisted; 'mc-diff-split' is shared with the
   // file view's git-diff toggle so split/unified is one app-wide preference.
   const [diffLineNumbers, setDiffLineNumbers] = usePersistedBool('mc-diff-linenums', false)
@@ -463,71 +545,70 @@ export default function SidePanel({
           <div className="absolute left-0 top-0 bottom-0 w-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
         </div>
       ) : null}
-      {/* Tab strip — drag chips horizontally to reorder (framer Reorder).
-          Per Figma "left-nav" (7328:10637): the row is a rounded elevated card
-          (bg-elevated, 12px radius, 8px padding) floating above the content,
-          not a flat bordered bar. side-panel-strip punches the strip out of the
-          Electron window-drag region (see index.css) so chips receive events. */}
-      <div className="side-panel-strip flex items-center gap-1.5 shrink-0 p-2 rounded-tl-xl bg-bg-elevated">
-        {/* Collapse the panel (far-left), separated from the tabs by a hairline. */}
-        <button
-          className="pi-morph flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-          onClick={onClose}
-          title={i18nT('pages.chat.sidePanel.close_panel')}
-          aria-label={i18nT('pages.chat.sidePanel.close_panel')}
-        >
-          <PanelRightLight size={15} />
-        </button>
-        {canDockBottom && !isMobile && (
-          <button
-            className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-            onClick={() => setDock(isBottom ? 'right' : 'bottom')}
-            title={isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}
-            aria-label={isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}
-          >
-            {isBottom ? <PanelRight size={15} /> : <PanelBottom size={15} />}
-          </button>
-        )}
-        <span aria-hidden="true" className="w-px h-5 bg-border shrink-0" />
+      {/* Tab strip — the row scrolls by touch/wheel; a chip is reordered by
+          dragging it (press and hold first on touch, see useLongPressReorder).
+          Browser-tab construction: the strip is an elevated band whose chips
+          BOTTOM-ALIGN (items-end, pb-0) so the active chip's background runs
+          straight into the panel body below — the strip/body seam is what the
+          tab shape fuses across, in both dock placements (right dock and
+          bottom dock render this same row above their content).
+          side-panel-strip punches the strip out of the Electron window-drag
+          region (see index.css) so chips receive events. */}
+      {/* border-b draws the seam hairline the corner arcs land on: the flare
+          curve ends tangent-horizontal, and without a line to continue into it
+          would truncate mid-air. The chip rows drop 1px over the border row
+          (-mb-px on the GROUPS, not the chips — the tablist scrolls and would
+          clip an overflowing chip) so the active chip's opaque background
+          covers the line across its own span, keeping the mouth open. */}
+      <div className="side-panel-strip flex items-end gap-1.5 shrink-0 px-2 pt-2 pb-0 min-h-10 rounded-tl-xl bg-bg-elevated border-b border-border">
         {/* Pinned views (Changes / Files / Artifacts): always present, fixed at
-            the front, non-closable, not draggable, compact. Wrapped in a
-            tight-gap group so the three sit closer together than the strip's
-            default spacing. */}
-        <div className="flex items-center gap-1.5 shrink-0">
+            the front, non-closable, not draggable, compact. The group's 8px gap
+            matches the active chip's corner-piece width, so a piece lands in the
+            gap instead of over a neighbour. */}
+        <div className="flex items-end gap-2 shrink-0 -mb-px">
           {pinnedTabs.map(t => (
             <TabChip key={t.id} tab={t} active={t.id === activeId} closable={false} pinned onSelect={() => setActive(t.id)} onClose={() => {}} />
           ))}
         </div>
+        {/* Chrome's separator rule, extended to the pinned↔dynamic divider: a
+            hairline adjacent to the ACTIVE chip goes transparent. The active
+            chip's 8px corner piece travels across this 6px gap, and a divider
+            slicing through it reads as a detached blob on any theme where --bg
+            differs from --bg-elevated (glaring on light). Transparent rather
+            than unmounted, so activating an adjacent tab cannot shift the row
+            by the divider's layout width. The dynamic group's own separators
+            already follow the same suppression rule. */}
         {pinnedTabs.length > 0 && dynamicTabs.length > 0 && (
-          <span aria-hidden="true" className="w-px h-5 bg-border shrink-0" />
+          <span
+            aria-hidden="true"
+            data-testid="strip-divider"
+            className={`w-px h-5 shrink-0 self-center relative z-10 ${
+              pinnedTabs[pinnedTabs.length - 1].id === activeId || dynamicTabs[0].id === activeId
+                ? 'bg-transparent'
+                : 'bg-border'
+            }`}
+          />
         )}
         <Reorder.Group
           axis="x"
           values={dynamicTabs}
           onReorder={(next) => setOrder([...pinnedTabs, ...next])}
           role="tablist"
-          className="flex items-center gap-2 flex-1 min-w-0 overflow-x-auto scrollbar-none list-none m-0 p-0"
+          className="flex items-end gap-2 min-w-0 overflow-x-auto scrollbar-none list-none m-0 p-0 px-2 -mb-px"
         >
           {dynamicTabs.map((t, i) => (
-            <Reorder.Item
+            <DraggableTabItem
               key={t.id}
-              value={t}
-              className="relative shrink-0 list-none"
-              // Reorder.Item's layout prop can't be disabled (true | "position"
-              // only) — instead make the layout correction instant while
-              // resizing so chips track the panel edge 1:1. Otherwise use a
-              // tight spring (high stiffness, near-critical damping) so the
-              // reorder shuffle snaps into place instead of floating.
-              transition={resizing ? { duration: 0 } : { type: 'spring', stiffness: 700, damping: 45 }}
-            >
-              {/* Chrome-style separator: hairline between adjacent chips,
-                  suppressed on both edges of the selected tab (its pill
-                  background already delineates it). Centered in the gap-2. */}
-              {i > 0 && t.id !== activeId && dynamicTabs[i - 1].id !== activeId && (
-                <span aria-hidden="true" className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border" />
-              )}
-              <TabChip tab={t} active={t.id === activeId} onSelect={() => setActive(t.id)} onClose={() => handleCloseTab(t.id)} onTransfer={t.kind === 'terminal' ? () => handleTransferToBottom(t.id) : undefined} />
-            </Reorder.Item>
+              tab={t}
+              active={t.id === activeId}
+              // Chrome-style separator: hairline between adjacent chips,
+              // suppressed on both edges of the selected tab (its pill
+              // background already delineates it).
+              separator={i > 0 && t.id !== activeId && dynamicTabs[i - 1].id !== activeId}
+              instantLayout={resizing}
+              onSelect={() => setActive(t.id)}
+              onClose={() => handleCloseTab(t.id)}
+            />
           ))}
         </Reorder.Group>
         {/* + menu — the shared shadcn/Radix dropdown, so this strip gets the
@@ -538,7 +619,7 @@ export default function SidePanel({
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
-              className="flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-muted hover:text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover data-[state=open]:text-text transition-colors bg-transparent border-none cursor-pointer"
+              className="flex items-center justify-center w-7 h-7 shrink-0 self-center rounded-md text-muted hover:text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover data-[state=open]:text-text transition-colors bg-transparent border-none cursor-pointer"
               title={i18nT('pages.chat.sidePanel.open_side_panel_tab')}
               aria-label={i18nT('pages.chat.sidePanel.open_side_panel_tab')}
             >
@@ -547,12 +628,13 @@ export default function SidePanel({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" sideOffset={6} className="min-w-[200px]">
             {menuSections.map((section, i) => (
-              // Keyed by the group's first surviving row, not the index: a gate
-              // that empties a whole group changes what index i means, and a
-              // stale index key would let React reuse the wrong group's rows.
-              <Fragment key={section[0].kind}>
+              // Keyed by the group's stable declared id — see NEW_MENU_GROUPS.
+              // Keying on contents (the first surviving row) or on the index
+              // makes the key move when a gate resolves, and React then remounts
+              // the group, detaching the row mid-click.
+              <Fragment key={section.id}>
                 {i > 0 && <DropdownMenuSeparator />}
-                {section.map(item => (
+                {section.items.map(item => (
                   <DropdownMenuItem
                     key={item.kind}
                     className="gap-2.5 py-2"
@@ -566,6 +648,45 @@ export default function SidePanel({
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+        {/* Flexible gap: the tabs and + hug the leading edge; this absorbs the
+            slack so the panel chrome sits at the trailing edge. */}
+        <div aria-hidden="true" className="flex-1 min-w-0" />
+        {/* Panel chrome, trailing edge. Collapse (frequent) stays a one-tap
+            button; the rarely-used dock toggle moves into a ⋯ menu so the two
+            panel-square glyphs are never adjacent look-alikes. */}
+        <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 self-center relative z-10" />
+        <div className="flex items-center gap-0.5 shrink-0 self-center">
+        {canDockBottom && !isMobile && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-muted hover:text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover data-[state=open]:text-text transition-colors bg-transparent border-none cursor-pointer"
+                title={i18nT('pages.chatSidebar.more_options')}
+                aria-label={i18nT('pages.chatSidebar.more_options')}
+              >
+                <MoreHorizontal size={15} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" sideOffset={6} className="min-w-[200px]">
+              <DropdownMenuItem
+                className="gap-2.5 py-2"
+                onSelect={() => setDock(isBottom ? 'right' : 'bottom')}
+              >
+                <span className="text-muted shrink-0">{isBottom ? <PanelRight size={16} /> : <PanelBottom size={16} />}</span>
+                <span className="flex-1">{isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        <button
+          className="pi-morph flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
+          onClick={onClose}
+          title={i18nT('pages.chat.sidePanel.close_panel')}
+          aria-label={i18nT('pages.chat.sidePanel.close_panel')}
+        >
+          <PanelRightLight size={15} />
+        </button>
+        </div>
       </div>
 
       {/* Body — render every doc/terminal tab mounted (hidden when inactive) so
@@ -583,14 +704,14 @@ export default function SidePanel({
               <div className="grid grid-cols-2 gap-2.5 w-full">
               {menuItems.map(item => {
                 // Live badges from data already flowing into the panel — a
-                // quiet accent pill when non-zero, muted otherwise.
-                const badge = item.kind === 'files' && files && files.length > 0
-                  ? `${files.length} touched`
-                  : item.kind === 'subagents' && Object.values(subagents).some(s => s.status === 'running' || s.status === 'tool')
-                    ? `${Object.values(subagents).filter(s => s.status === 'running' || s.status === 'tool').length} running`
-                    : item.kind === 'logs' && toolLog.length > 0
-                      ? `${toolLog.length} calls`
-                      : null
+                // quiet accent pill when non-zero, muted otherwise. Files
+                // carries none: it browses the project tree rather than
+                // listing what this session touched, so there is no count.
+                const badge = item.kind === 'subagents' && Object.values(subagents).some(s => s.status === 'running' || s.status === 'tool')
+                  ? `${Object.values(subagents).filter(s => s.status === 'running' || s.status === 'tool').length} running`
+                  : item.kind === 'logs' && toolLog.length > 0
+                    ? `${toolLog.length} calls`
+                    : null
                 return (
                   <button
                     key={item.kind}
@@ -601,7 +722,7 @@ export default function SidePanel({
                       <span className="shrink-0 opacity-80">{item.icon}</span>
                       <span className="text-[13px] font-medium">{i18nT(NEW_MENU_LABEL_KEY[item.kind])}</span>
                       {badge && (
-                        <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent/12 text-accent font-medium shrink-0">{badge}</span>
+                        <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent-subtle text-accent font-medium shrink-0">{badge}</span>
                       )}
                     </div>
                     <div className="text-[11px] text-muted leading-snug">{i18nT(NEW_MENU_DESC_KEY[item.kind])}</div>
@@ -614,27 +735,34 @@ export default function SidePanel({
         )}
         {tabs.map(t => {
           const isActive = t.id === activeId
-          // Category views: mount only the active one. The Files tab hosts an
-          // inline file editor, but it does NOT need to stay mounted while
-          // inactive — an in-progress edit survives a tab switch via the
-          // module-level draft store, and which file is open inline is owned by
-          // ChatPage (both above the SidePanel subtree). Keeping it mounted-but-
-          // hidden would leave its global Escape handler live, letting an
-          // invisible editor swallow Escape and drop the draft; so unmount it.
-          // Cross-slot safety: the inline-preview path is reset by ChatPage when
-          // the active chat slot changes.
+          // Category views: mount only the active one. They hold no editable
+          // buffer, so unmounting an inactive one loses nothing, and it keeps
+          // exactly one panel-level Escape handler live at a time.
           // App tabs render from `allAppTabs` below (one stable key for every slot);
           // rendering them here too would mount the same iframe twice.
           if (t.kind === 'app') return null
+          // The pinned Files tab renders the file-browser home directly — it
+          // is not one of ActivityViewer's multiplexed session views.
+          if (t.kind === 'files') {
+            if (!isActive) return null
+            return (
+              <div key={t.id} className="absolute inset-0">
+                <FilesHomePanel
+                  projectDir={projectDir ?? ''}
+                  onFileOpen={(abs, diff) => onFileOpen?.(abs, { diffMode: diff })}
+                  onAddToContext={onAddToContext}
+                />
+              </div>
+            )
+          }
           if (VIEW_KINDS.has(t.kind)) {
             if (!isActive) return null
             return (
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer
-                  view={t.kind as 'changes' | 'issues' | 'files' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side'}
+                  view={t.kind as 'changes' | 'issues' | 'links' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side' | 'git' | 'summary' | 'pins'}
                   open onToggle={onClose} slot={slot}
                   subagents={subagents} toolLog={toolLog}
-                  files={files}
                   sources={sources}
                   selectedSourceUrl={selectedSourceUrl}
                   onSelectSource={onSelectSource}
@@ -644,18 +772,15 @@ export default function SidePanel({
                   onSelectIssue={onSelectIssue}
                   onReconcileIssue={onReconcileIssue}
                   onAddToChat={onAddSourceToChat}
-                  // The Files/Artifacts/Changes tabs are permanent (pinned).
-                  // Files opens its file inline (kept in the Files tab, with a
-                  // back button); the Artifacts tab opens document rows as file
-                  // tabs via onFileOpen and artifact rows as artifact tabs via
-                  // onArtifactOpen.
+                  // Of the pinned tabs, only Artifacts and Changes reach this
+                  // component — Files short-circuits to FilesHomePanel above.
+                  // Changes renders the session's pull-request sources; Artifacts
+                  // opens document rows as file tabs via onFileOpen and artifact
+                  // rows as artifact tabs via onArtifactOpen.
                   onFileOpen={onFileOpen}
-                  onFolderOpen={(p) => openFolder(p, slot)}
                   onArtifactOpen={onArtifactOpen}
-                  onFileRemove={onFileRemove} onFilesClear={onFilesClear}
-                  onFileSave={onFileSave} onSubmitComments={onSubmitComments}
-                  openDocPaths={openDocPaths}
-                  previewPath={inlinePreviewPath ?? null} onPreviewPathChange={onInlinePreviewChange}
+                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onUnpin={onUnpin}
+                  slotTitle={slotTitle} chatMode={chatMode}
                   projectDir={projectDir} navLinks={navLinks} navResolving={navResolving}
                 />
               </div>
@@ -665,16 +790,22 @@ export default function SidePanel({
           return (
             <div key={t.id} className="absolute inset-0" style={{ display: isActive ? 'block' : 'none' }}>
               <TabBody
-                tab={t} active={isActive}
+                // Visible to the user means BOTH: this tab is the selected one
+                // AND the panel itself is on screen. A hidden panel still has a
+                // selected tab, so selection alone would let a closed panel's
+                // editor answer Escape and Cmd+S.
+                tab={t} active={isActive && !panelHidden}
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
+                onDiskContent={(c) => patchTab(t.id, { content: c, savedContent: c })}
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
                 onPathChange={(p) => patchTab(t.id, { path: p, title: p.replace(/\/+$/, '').split('/').pop() || p })}
                 onFileSave={onFileSave}
                 onFileOpen={onFileOpen}
-                onFolderOpen={(p) => openFolder(p, slot)}
+                onAddToContext={onAddToContext}
+                projectDir={projectDir}
                 onSubmitComments={onSubmitComments}
                 onTerminalSendToChat={onAddSourceToChat}
                 diffLineNumbers={diffLineNumbers}
@@ -744,10 +875,95 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
   return <div className="h-full w-full overflow-auto"><McpAppFrame payload={payload} /></div>
 }
 
-function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onFolderOpen, onSubmitComments, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
+/**
+ * The one true file surface: MarkdownPanel (full-width header, viewer/editor
+ * body) with the file-browser rail docked on the right, under the header.
+ * Every file-open path — chat file chips, a diff tab's title, the pinned
+ * Files tab's tree, another file tab's tree — lands in a tab rendering this.
+ *
+ * Rail visibility is a single app-wide preference; the rail only renders at
+ * all when the chat has a project dir whose tree the backend serves.
+ */
+function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, onRevealConsumed }: {
+  tab: PanelTab
+  /** Is this the visible tab? Background file tabs stay mounted, so the panel
+   *  needs this to keep its Cmd+F handler off a document the user cannot see. */
+  active: boolean
+  projectDir?: string
+  /** Cross-remount scroll identity (slot + tab id) — see `useScrollMemory`. */
+  scrollMemoryKey?: string
+  onContentChange: (c: string) => void
+  /** Disk-originated content (file watch / Refresh): the panel routes it here
+   *  so the tab's saved baseline moves with the buffer it just replaced. */
+  onDiskContent: (c: string) => void
+  onDiffModeChange: (diffMode: boolean) => void
+  onFileSave: (fp: string, c: string) => Promise<void>
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; replaceId?: string; canReplace?: () => boolean }) => void
+  /** Right-click "Add to context" on a rail row. */
+  onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
+  onClose: () => void
+  onSubmitComments?: (m: string) => void
+  onRevealConsumed: () => void
+}) {
+  const [railOpen, setRailOpen] = usePersistedBool('mc-files-rail-open', false)
+  const treeAvailable = useTreeAvailable(projectDir)
+  const railUsable = treeAvailable && !!projectDir && !!onFileOpen
+  // The rail re-targets this tab in place, so the panel's own dirty guard has to
+  // approve the navigation the way it approves a close.
+  const panelRef = useRef<MarkdownPanelHandle>(null)
+  return (
+    <MarkdownPanel
+      ref={panelRef}
+      embedded
+      active={active}
+      filePath={tab.path || ''}
+      content={tab.content || ''}
+      scrollMemoryKey={scrollMemoryKey}
+      onContentChange={onContentChange}
+      onDiskContent={onDiskContent}
+      savedBaseline={tab.savedContent}
+      initialDiffMode={tab.diffMode}
+      onDiffModeChange={onDiffModeChange}
+      onSave={onFileSave}
+      onClose={onClose}
+      liveWatch
+      onSubmitComments={onSubmitComments}
+      revealLine={tab.revealLine}
+      onRevealConsumed={onRevealConsumed}
+      railOpen={railUsable && railOpen}
+      onRailToggle={railUsable ? () => setRailOpen(v => !v) : undefined}
+      browserRail={railUsable ? (
+        <FileBrowserRail
+          projectDir={projectDir}
+          onAddToContext={onAddToContext}
+          selectedPath={tab.path || null}
+          // In-place navigation: a tree click RE-TARGETS this tab (replaceId)
+          // rather than spawning a sibling — only the pinned Files tab fans
+          // out into new tabs. Re-targeting discards the buffer, so it asks
+          // through the panel's dirty guard first, exactly as closing does.
+          // `canReplace` re-asks after the file read: the user can start typing
+          // during a slow load, and by then the up-front answer is stale.
+          onFileOpen={(abs, diff) => {
+            const nav = (stillClean?: () => boolean) =>
+              onFileOpen(abs, { diffMode: diff, replaceId: tab.id, canReplace: stillClean })
+            const panel = panelRef.current
+            if (panel) panel.requestNavigate(nav); else nav()
+          }}
+        />
+      ) : undefined}
+    />
+  )
+}
+
+function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
   tab: PanelTab; active: boolean; slot: string
+  /** The chat's project directory — the file-browser rail's tree root. */
+  projectDir?: string
   onClose: () => void
   onContentChange: (c: string) => void
+  /** Disk-originated content (file watch / Refresh): restamps the tab's saved
+   *  baseline alongside the buffer, so a re-open still treats the tab clean. */
+  onDiskContent: (c: string) => void
   onDiffModeChange: (diffMode: boolean) => void
   /** Drop the tab's one-shot line-reveal target once the panel has acted on it. */
   onRevealConsumed: () => void
@@ -755,9 +971,9 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
    *  so the strip label tracks where the user actually is. */
   onPathChange: (p: string) => void
   onFileSave: (fp: string, c: string) => Promise<void>
-  onFileOpen?: (p: string) => void
-  /** Open a directory as a folder tab — a file tab's breadcrumb segment click. */
-  onFolderOpen?: (p: string) => void
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; replaceId?: string; canReplace?: () => boolean }) => void
+  /** Right-click "Add to context" on a file-browser rail row. */
+  onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onSubmitComments?: (m: string) => void
   onTerminalSendToChat?: (text: string) => void
   diffLineNumbers: boolean; setDiffLineNumbers: (fn: (v: boolean) => boolean) => void
@@ -766,22 +982,27 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
   if (tab.kind === 'terminal') return <CliPanel sessionId={tab.sessionId ?? ''} cwd={tab.cwd} visible={active} onSendToChat={onTerminalSendToChat} />
   if (tab.kind === 'browser') return <WebPreviewPanel sessionKey={slot} active={active} />
   if (tab.kind === 'app') return <McpAppTabBody tab={tab} slot={slot} />
+  // Cross-remount scroll identity for document bodies. Same slot+id key shape
+  // as the app-frame list: the tab id is unique within a slot and stable in
+  // the persisted bucket, so leaving and returning to this chat resolves the
+  // same key.
+  const scrollMemoryKey = scrollMemoryKeyFor(slot, tab.id)
   if (tab.kind === 'file') {
     return (
-      <MarkdownPanel
-        embedded
-        filePath={tab.path || ''}
-        content={tab.content || ''}
+      <FileTabBody
+        tab={tab}
+        active={active}
+        projectDir={projectDir}
+        scrollMemoryKey={scrollMemoryKey}
         onContentChange={onContentChange}
-        initialDiffMode={tab.diffMode}
+        onDiskContent={onDiskContent}
         onDiffModeChange={onDiffModeChange}
-        onSave={onFileSave}
+        onFileSave={onFileSave}
+        onFileOpen={onFileOpen}
+        onAddToContext={onAddToContext}
         onClose={onClose}
-        liveWatch
         onSubmitComments={onSubmitComments}
-        revealLine={tab.revealLine}
         onRevealConsumed={onRevealConsumed}
-        onOpenFolder={onFolderOpen}
       />
     )
   }
@@ -789,8 +1010,10 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
     return (
       <FolderPanel
         path={tab.path || ''}
+        projectDir={projectDir}
         onClose={onClose}
         onFileOpen={onFileOpen}
+        onAddToContext={onAddToContext}
         onPathChange={onPathChange}
       />
     )
@@ -799,9 +1022,11 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
     return (
       <ArtifactPanel
         embedded
+        active={active}
         slug={tab.artifactSlug || ''}
         kind={tab.artifactKind || 'markdown'}
         content={tab.content || ''}
+        scrollMemoryKey={scrollMemoryKey}
         onClose={onClose}
         onSubmitComments={onSubmitComments}
       />
@@ -850,7 +1075,43 @@ function TerminalTabTitle({ sessionId, fallback }: { sessionId: string; fallback
   return <>{live || fallback}</>
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, onTransfer, pinned = false }: { tab: PanelTab; active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; onTransfer?: () => void; pinned?: boolean }) {
+/** One reorderable chip in the dynamic half of the strip.
+ *
+ *  A component rather than inline JSX inside the map: each chip owns its own
+ *  long-press drag state, and a hook cannot be called from a loop. */
+function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onClose}: {
+  tab: PanelTab
+  active: boolean
+  separator: boolean
+  /** Skip the layout spring while the panel is being resized — see the caller. */
+  instantLayout: boolean
+  onSelect: () => void
+  onClose: () => void}) {
+  const { itemProps, dragging } = useLongPressReorder()
+  return (
+    <Reorder.Item
+      value={tab}
+      {...itemProps}
+      // The ring is the only feedback a press-and-hold gets before the finger
+      // moves; without it an armed drag looks identical to a missed one.
+      className={`relative shrink-0 list-none rounded-t-md rounded-b-none ${dragging ? 'ring-1 ring-accent' : ''}`}
+      // Reorder.Item's layout prop can't be disabled (true | "position"
+      // only) — instead make the layout correction instant while resizing so
+      // chips track the panel edge 1:1. Otherwise use a tight spring (high
+      // stiffness, near-critical damping) so the reorder shuffle snaps into
+      // place instead of floating.
+      transition={instantLayout ? { duration: 0 } : { type: 'spring', stiffness: 700, damping: 45 }}
+    >
+      {separator && (
+        // Centered in the group's gap-2.
+        <span aria-hidden="true" className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border" />
+      )}
+      <TabChip tab={tab} active={active} onSelect={onSelect} onClose={onClose} />
+    </Reorder.Item>
+  )
+}
+
+function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false }: { tab: PanelTab; active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean }) {
   // Pinned views (Changes / Files / Artifacts) are icon-only when inactive and
   // expand to icon + label when active — a hybrid that keeps the strip compact
   // while still naming the current view. Dynamic (document / terminal) tabs
@@ -871,14 +1132,20 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, onTransfer, 
       // label is also shown.
       aria-label={pinned ? tab.title : undefined}
       title={pinned && !showLabel ? tab.title : undefined}
-      // Figma "Side Navigation" chip: 28px tall, 6px corners (not a full pill),
-      // 8px padding, 4px icon↔label gap. Active = neutral fill (--border) + accent
-      // text; inactive = muted, brightening on hover. Icon-only (inactive pinned)
-      // collapses to a square (w-7, centered) so the trio reads as an even set.
-      className={`group relative flex items-center gap-1 h-7 rounded-md cursor-pointer shrink-0 select-none transition-colors ${
-        showLabel ? `max-w-[240px] ${closable ? 'pl-2 pr-1' : 'px-2'}` : 'w-7 justify-center px-0'
+      // Browser-tab chip: 32px tall, top corners only (8px), bottom edge fused
+      // into the panel body. Active = the body's own background (--bg) plus a
+      // top/side hairline (--border, bottom open) so the silhouette survives a
+      // custom theme where --bg and --bg-elevated are equal; the ::before/::after
+      // corner pieces carry a matching 1px arc in their gradient, so the hairline
+      // FOLLOWS the outward curve instead of running straight through it (see
+      // .side-tab-active in index.css). Inactive = muted text with a hover wash.
+      // Icon-only (inactive pinned) collapses to a square (w-8, centered).
+      // This deliberately supersedes the earlier Figma "Side Navigation" pill
+      // spec (28px, 6px all-corner radius, --border active fill).
+      className={`group relative isolate flex items-center gap-1 h-8 rounded-t-md rounded-b-none border cursor-pointer shrink-0 select-none transition-colors ${
+        showLabel ? `max-w-[240px] ${closable ? 'pl-2 pr-1' : 'px-2'}` : 'w-8 justify-center px-0'
       } ${
-        active ? 'bg-border text-accent' : 'text-muted hover:text-text hover:bg-bg-elevated'
+        active ? 'side-tab-active bg-bg text-accent border-x-border border-t-border border-b-transparent' : 'side-tab-inactive border-transparent text-muted hover:text-text'
       }`}
     >
       <span className="shrink-0">{KIND_ICON[tab.kind]}</span>
@@ -889,28 +1156,16 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, onTransfer, 
             : tab.title}
         </span>
       )}
-      {(onTransfer || closable) && (
+      {closable && (
         <div className="flex items-center gap-0.5 shrink-0">
-          {onTransfer && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onTransfer() }}
-              className={`pi-morph shrink-0 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
-              title={i18nT('pages.chat.sidePanel.move_to_bottom_panel')}
-              aria-label={i18nT('pages.chat.sidePanel.move_to_bottom_panel')}
-            >
-              <PanelBottomSolid size={12} />
-            </button>
-          )}
-          {closable && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onClose() }}
-              className={`shrink-0 -ml-0.5 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
-              title={i18nT('pages.chat.sidePanel.close_tab')}
-              aria-label={i18nT('pages.chat.sidePanel.close_tab')}
-            >
-              <X size={12} />
-            </button>
-          )}
+          <button
+            onClick={(e) => { e.stopPropagation(); onClose() }}
+            className={`shrink-0 -ml-0.5 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
+            title={i18nT('pages.chat.sidePanel.close_tab')}
+            aria-label={i18nT('pages.chat.sidePanel.close_tab')}
+          >
+            <X size={12} />
+          </button>
         </div>
       )}
     </div>

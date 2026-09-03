@@ -4,12 +4,12 @@ Two sessions sharing a single backend MUST produce the same answers as if
 each had its own backend. Every attribute that changes backend behavior
 MUST be in :class:`PoolKey`, or two sessions can see cross-tenant state.
 
-The 13 dimensions captured below are the union of every spawn-time input
+The 12 dimensions captured below are the union of every spawn-time input
 that influences a Kiro MCP subprocess: identity (``server_name``,
 ``agent_name``), execution (``command_args_hash``, ``effective_env_hash``,
 ``work_dir``, ``binary_version``), security (``os_uid``, ``sandbox_mode``,
-``autoapprove_set_hash``, ``approval_mode``, ``trust_all_tools``,
-``user_identity``), and config drift (``config_snapshot_hash``).
+``autoapprove_set_hash``, ``approval_mode``, ``trust_all_tools``), and
+config drift (``config_snapshot_hash``).
 
 There is deliberately NO channel dimension. A channel is not a trust
 boundary and never was a usable proxy for one:
@@ -27,11 +27,17 @@ boundary and never was a usable proxy for one:
   onto every forwarded ``tools/call``, so a channel-aware backend learns the
   channel PER CALL and does not need a process to itself.
 
-The axis that genuinely expresses "a different person must not share a
-backend" is ``user_identity``. It is present above, and today it degrades to
-the OS user because nothing populates ``KIROCREW_PRINCIPAL`` — making that
-real is the prerequisite for a shared multi-principal gateway, and is
-tracked separately. Re-adding a channel dimension is not that fix.
+There is deliberately NO per-principal dimension either. Kiro Crew is
+single-operator: a Slack bot and a cron job are the same operator's
+automations, not separate principals, so a multi-principal shared gateway
+is not a supported deployment model. A ``user_identity`` field existed
+here historically, but nothing ever populated its ``KIROCREW_PRINCIPAL``
+source, so it always collapsed to the OS user and never isolated anything
+— it was deleted rather than kept as a misleading affordance. The
+cross-OS-user boundary that IS real is carried by ``os_uid``. If
+multi-principal isolation is ever wanted, it needs a real design (what
+counts as a principal on an unattended surface is the hard part);
+re-adding a key field would be the small part.
 
 Stable hashing uses SHA-256 over a JSON-serialized tuple with sorted keys.
 Python's built-in ``hash()`` is intentionally non-deterministic across
@@ -49,6 +55,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
+from kiro_crew import platform_compat
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 
 if TYPE_CHECKING:
@@ -133,45 +140,6 @@ def _resolve_spill_threshold() -> int:
 RESPONSE_SPILL_THRESHOLD_BYTES: int = _resolve_spill_threshold()
 
 
-# Upper bound on processes walked when summing a backend's subtree RSS. A
-# pooled MCP backend's real tree is tiny (parent shim + a handful of workers);
-# the cap only guards against a pathological/looping /proc graph.
-_RSS_SUBTREE_MAX_PROCS = 256
-
-
-def _single_proc_rss_kb(pid: int) -> int:
-    """RSS (KiB) of a single ``pid`` from /proc/<pid>/status, or -1."""
-    try:
-        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return -1
-
-
-def _proc_children(pid: int) -> list[int]:
-    """Direct child PIDs of ``pid`` via /proc/<pid>/task/<tid>/children.
-
-    Uses the kernel-provided children list (CONFIG_PROC_CHILDREN), so no
-    ``pgrep``/full-table scan. Returns ``[]`` if the file is unavailable.
-    """
-    kids: list[int] = []
-    task_dir = f"/proc/{pid}/task"
-    try:
-        tids = os.listdir(task_dir)
-    except OSError:
-        return kids
-    for tid in tids:
-        try:
-            with open(f"{task_dir}/{tid}/children", encoding="ascii") as fh:
-                kids.extend(int(tok) for tok in fh.read().split())
-        except (OSError, ValueError):
-            continue
-    return kids
-
-
 def _proc_rss_kb(pid: Optional[int]) -> int:
     """Resident set size (KiB) for ``pid`` **and all its descendants**.
 
@@ -180,31 +148,18 @@ def _proc_rss_kb(pid: Optional[int]) -> int:
     memory lives in a child process. Counting only ``pid``'s own ``VmRSS``
     under-reports the true footprint by ~30x, so we sum the whole subtree.
 
+    Delegates to :func:`platform_compat.proc_subtree_sample`, the one shared
+    ``/proc`` subtree walker — this module used to carry its own line-for-line
+    copy of that BFS plus its own copy of the process ceiling (#6096). ``rss``
+    is the only reading asked for, so the pool pays no ``/proc/<pid>/stat`` read
+    per process for a CPU figure it does not surface, and an unreadable root pid
+    still returns -1 without walking anything.
+
     Returns -1 if ``pid`` is falsy or its own status cannot be read; otherwise
     the summed KiB (descendants that vanish mid-walk are simply skipped, so the
     result degrades gracefully to parent-only when ``children`` is unreadable).
     """
-    if not pid:
-        return -1
-    own = _single_proc_rss_kb(pid)
-    if own < 0:
-        return -1
-    total = own
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                kb = _single_proc_rss_kb(child)
-                if kb > 0:
-                    total += kb
-                nxt.append(child)
-        frontier = nxt
-    return total
+    return platform_compat.proc_subtree_sample(pid, jiffies=False, counts=False).rss_kb
 
 
 # --- PoolKey ----------------------------------------------------------------
@@ -236,7 +191,6 @@ class PoolKey:
     autoapprove_set_hash: str
     approval_mode: str
     trust_all_tools: bool
-    user_identity: str
 
     # Config drift
     config_snapshot_hash: str
@@ -267,7 +221,9 @@ class PoolKey:
         # stub still reports it because gatewayd threads it into the per-call
         # caller identity (see ``_build_caller_block``), and an older stub
         # against a newer daemon must keep registering cleanly. It is simply
-        # not a pool dimension — see the module docstring.
+        # not a pool dimension — see the module docstring. The same applies
+        # to ``user_identity``, which older stubs still send: it was deleted
+        # as a pool dimension (it never isolated anything) and is ignored.
         # Security-boundary dims: type-check rather than coerce. bool("false")
         # is True and int() on a bool silently passes, so a stub sending a JSON
         # string/number for these could land in the wrong trust/uid partition.
@@ -292,7 +248,6 @@ class PoolKey:
                 autoapprove_set_hash=str(register["autoapprove_set_hash"]),
                 approval_mode=str(register["approval_mode"]),
                 trust_all_tools=trust_all_tools,
-                user_identity=str(register["user_identity"]),
                 config_snapshot_hash=str(register["config_snapshot_hash"]),
             )
         except (TypeError, ValueError) as exc:
@@ -488,33 +443,14 @@ class BackendPool:
             "exclusive": len(self._exclusive),
         }
 
-    def _metrics_snapshot(self) -> dict[str, Any]:
-        """Sync per-backend snapshot. PRIVATE: it does a blocking /proc RSS
-        walk, so it must never run on the event loop — callers use
-        :meth:`metrics_snapshot_async`, which offloads the walk via to_thread."""
-        now = time.monotonic()
-        backends = [
-            {
-                "server": b.pool_key.server_name,
-                "agent": b.pool_key.agent_name,
-                "pid": b.pid,
-                "sessions": b.refcount,
-                "idle_s": round(max(0.0, now - b.last_used_at), 1),
-                "rss_kb": _proc_rss_kb(b.pid),
-            }
-            for b in self._backends.values()
-            if b.is_alive
-        ]
-        return {**self.stats(), "backends": backends}
-
     async def metrics_snapshot_async(self) -> dict[str, Any]:
-        """Race-free, off-loop variant of :meth:`_metrics_snapshot`.
+        """Per-backend snapshot, taken off the event loop.
 
         Snapshots per-backend identity under the pool lock (fast, on-loop),
         then performs the blocking ``/proc`` RSS walk off the event loop via
-        ``asyncio.to_thread``. A plain ``to_thread(_metrics_snapshot)`` would
-        iterate ``_backends`` in the worker thread and can race a concurrent
-        add/evict ("dict changed size during iteration").
+        ``asyncio.to_thread``. Snapshotting first is load-bearing: iterating
+        ``_backends`` in the worker thread can race a concurrent add/evict
+        ("dict changed size during iteration").
         """
         now = time.monotonic()
         async with self._lock:
@@ -914,6 +850,21 @@ class BackendPool:
         """
         digest = key.stable_hash()
         self._reserved_digests[digest] = self._reserved_digests.get(digest, 0) + 1
+
+    def backends_hosting_stub(self, stub_uuid: str) -> list["Backend"]:
+        """Live backends whose inbox table names ``stub_uuid`` — normally at
+        most one; a list because a stub mid-respawn can transiently appear
+        on two. Covers BOTH pooled and exclusive (private) backends: a
+        private stub rekeys the same way a pooled one does, and omitting it
+        would leave the previous caller's subscriptions routing to the new
+        owner. Read-only snapshot for callers that must reach the backend a
+        stub is attached to (e.g. the claim rekey's subscription eviction).
+        """
+        return [
+            b
+            for b in (*self._backends.values(), *self._exclusive.values())
+            if stub_uuid in b._stub_inboxes
+        ]
 
     def unreserve(self, key: PoolKey) -> None:
         """Release the in-flight reservation for ``key``.

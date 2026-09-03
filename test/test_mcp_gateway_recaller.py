@@ -42,7 +42,6 @@ def _register(session_key: str) -> dict[str, Any]:
         "autoapprove_set_hash": "2" * 64,
         "approval_mode": "interactive",
         "trust_all_tools": False,
-        "user_identity": "rc",
         "channel_id": "C_RC",
         "config_snapshot_hash": "3" * 64,
         "session_key": session_key,
@@ -104,7 +103,9 @@ class _FakeBackend:
     async def recycle_if_idle(self) -> bool:
         return False
 
-    async def forward_from_stub(self, _uuid: str, _msg: dict, caller: Any = None) -> None:
+    async def forward_from_stub(
+        self, _uuid: str, _msg: dict, caller: Any = None, tenant_nonce: str = ""
+    ) -> None:
         self.callers.append(caller)
 
 

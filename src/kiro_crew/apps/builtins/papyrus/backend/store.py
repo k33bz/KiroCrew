@@ -55,7 +55,10 @@ MAIN_FILE_CANDIDATES = ("main.tex", "paper.tex", "article.tex", "manuscript.tex"
 #: A project name must be one lowercase slug segment. Anything else (a slash, a
 #: dot, a leading dash) is refused rather than sanitized, because a "cleaned up"
 #: name silently addresses a different project than the one the user typed.
-PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#: Anchored at ``\Z``: Python's ``$`` matches before a trailing newline, so a
+#: ``$`` anchor would accept ``"name\n"`` and mint a directory whose name
+#: carries the newline into every later ``git``/``pdflatex`` argv.
+PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 #: Ceiling on how many files ``list_files`` will walk/return. A cloned repo can
 #: contain a build tree; an unbounded walk would be both a slow response and an
@@ -67,8 +70,15 @@ MAX_PROJECT_FILES = 4000
 #: cannot balloon the gateway's memory.
 MAX_FILE_BYTES = 8 * 1024 * 1024
 
-#: Suffixes never offered as editable text (LaTeX build artifacts + binaries).
-#: Filtering them here as well as in the UI keeps the two from drifting.
+#: Suffixes that mark a LaTeX build artifact rather than paper source.
+#:
+#: Read only by ``is_artifact``. ``list_files`` does NOT filter on it, so the
+#: tree the API returns still carries artifacts and the UI is what drops them
+#: (``website/src/apps/papyrus/lib.ts``). The two lists have already drifted:
+#: the UI also lists ``.pdf`` and spells ``.synctex.gz`` as one suffix, where
+#: this set has ``.synctex`` and ``.gz`` separately -- so this one would also
+#: hide any plain ``.gz``. Reconcile them before wiring either side to the
+#: other.
 ARTIFACT_SUFFIXES = frozenset(
     {
         ".aux", ".bbl", ".blg", ".fdb_latexmk", ".fls", ".log", ".out",
@@ -486,7 +496,11 @@ def list_files(project: Path) -> list[str]:
         for entry in entries:
             if entry.name.startswith("."):
                 continue
-            if entry.is_symlink():
+            # `is_reparse_link`, not `is_symlink()`: a junction is a DIRECTORY
+            # link `is_symlink()` does not report, so it fell through to the
+            # `is_dir()` arm below and the walk followed it out of the project,
+            # returning outside names under project-relative paths.
+            if is_reparse_link(entry):
                 continue
             if entry.is_dir():
                 stack.append(entry)
@@ -505,7 +519,10 @@ def list_projects(root: Path | None = None) -> list[ProjectSummary]:
     """
     out: list[ProjectSummary] = []
     for entry in sorted(projects_dir(root).iterdir()):
-        if not entry.is_dir() or entry.is_symlink() or entry.name.startswith("."):
+        # Same helper as `safe_project_dir`, which refuses a linked project entry
+        # outright: a junction under `projects/` is a directory `is_symlink()`
+        # misses, so it was enumerated here as a real project.
+        if not entry.is_dir() or is_reparse_link(entry) or entry.name.startswith("."):
             continue
         main_file = resolve_main_file(entry)
         if main_file is None:

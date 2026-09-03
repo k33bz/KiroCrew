@@ -11,6 +11,7 @@ between apps.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
 )
+from kiro_crew.apps.interpreter import resolve_app_python, venv_provided_command
 from kiro_crew.apps.manager import (
     app_data_dir,
     app_dir,
@@ -44,8 +46,10 @@ from kiro_crew.config.loader import (
     schedule_materialized_agents_refresh,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.cron import CronStoreBusy
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.cron_script import resolve_script_path
+from kiro_crew.env import emit_env
+from kiro_crew.executors import maintenance_executor
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.sel import sel
 
@@ -142,7 +146,7 @@ def _registration_source(app_name: str) -> tuple[AppManifest | None, Path]:
                 AppManifest.from_json_file(shipped_root / "app.json"),
                 shipped_root,
             )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "App %s: shipped resource manifest is unreadable: %s",
                 app_name,
@@ -415,6 +419,12 @@ def _apply_agent_mcp_policy(
         merged = {**base, **spec}
         merged.pop("neutralized", None)
         merged.pop("disabled", None)  # a grant un-disables a previously denied server
+        # `mountOnly` (set by a policy for a built-in grant) means: mount the
+        # server so the tool is visible, but keep it OFF allowedTools no matter
+        # what the ceiling says, so every call routes through the approval gate
+        # and the user's tool-trust settings decide. It is a policy directive,
+        # not part of the kiro-cli server spec, so pop it before writing.
+        mount_only = bool(merged.pop("mountOnly", False))
         # The POLICY is a third source of `autoApprove` (after the app manifest and
         # the managed specs), so the whole map is filtered once below rather than
         # here — see the pass at the end of this function.
@@ -427,18 +437,42 @@ def _apply_agent_mcp_policy(
         # resolves to "rejected" -- the user asked for this server explicitly, so
         # granting it means granting its use.
         #
-        # ...EXCEPT where the enterprise ceiling forbids it. Auto-approve is the
-        # one path that never reaches `hooks.on_tool_call`: kiro-cli only sends
-        # `session/request_permission` for tools it must ask about, and the gate
-        # (where the governance deny runs) hangs off that request. Writing a
-        # ceiling-denied server here would therefore route around the ONE control
-        # the docs promise cannot be routed around. So the grant is intersected
-        # with the ceiling at write time: permitted -> auto-approve as before;
-        # denied -> the grant stays in `tools` but NOT here, which forces every
-        # call through request_permission, where the gate denies it. A user may
-        # grant anything; whether it RUNS remains the policy's call.
-        if ref not in allowed and _may_auto_approve(f"@{name}"):
+        # ...EXCEPT where the enterprise ceiling forbids it, OR the grant is
+        # mountOnly. Auto-approve is the one path that never reaches
+        # `hooks.on_tool_call`: kiro-cli only sends `session/request_permission`
+        # for tools it must ask about, and the gate (where the governance deny
+        # runs) hangs off that request. Writing a ceiling-denied — or mountOnly —
+        # server here would route around the ONE control the docs promise cannot
+        # be routed around. So the grant is intersected with the ceiling at write
+        # time AND skipped entirely when mountOnly: permitted & not mountOnly ->
+        # auto-approve as before; otherwise the grant stays in `tools` but NOT
+        # here, which forces every call through request_permission / the approval
+        # gate. A user may grant anything; whether it auto-runs remains the
+        # policy's (and the user's trust settings') call.
+        if ref not in allowed and not mount_only and _may_auto_approve(f"@{name}"):
             allowed.append(ref)
+        elif ref not in allowed and mount_only:
+            # A mountOnly grant deliberately withholds auto-approve — the same
+            # permission DECISION the ceiling filter makes, so it emits the same
+            # SEL audit event rather than being the one withhold path with no
+            # trail. (The ceiling case is covered by _ceiling_filtered_allowed;
+            # this is the mountOnly case, which never reaches that filter because
+            # the ref was never added to `allowed`.) Never fail the rebuild on an
+            # audit error.
+            try:
+                sel().log_api_access(
+                    caller="system",
+                    operation="mcp_auto_approve_withheld",
+                    outcome="ok",
+                    source="app_agent_materialization",
+                    resources=(
+                        f"@{name} mounted without auto-approve (mount-only grant) "
+                        f"for agent {agent_name or '?'}; calls go through the "
+                        "approval gate"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — audit must not break materialization
+                logger.debug("SEL audit unavailable for mount-only withhold", exc_info=True)
 
     for name, disabled in neutralized.items():
         if name in granted:
@@ -502,7 +536,6 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     """
     if cfg.get("command") != _HOST_CLI_COMMAND:
         return cfg
-    import sys
 
     pkg_parent = str(Path(kiro_crew_file()).parent.parent)
     env = dict(cfg.get("env") or {})
@@ -595,6 +628,48 @@ def _materialize_managed_refs(agent_data: dict[str, Any]) -> None:
             continue
         servers[name] = {"command": command, "args": list(args)}
     agent_data["mcpServers"] = servers
+
+
+def _unresolvable_tool_refs(agent_data: dict[str, Any]) -> list[str]:
+    """``@server``/``@server/tool`` grants whose server no config declares.
+
+    kiro-cli resolves a ``@`` tool reference against the agent's own
+    ``mcpServers`` plus the global ``mcp.json``; a name found in neither is
+    dropped SILENTLY at mount time — the agent simply loses the tool with no
+    exception and no log line anywhere. CI gates the shipped specs (see
+    ``test_pptx_maker_provision.py``), but a user-installed app whose server
+    failed to register is a runtime event CI cannot see, so the registration
+    path — the last point that holds both the grants and the merged server
+    map — reports it here.
+
+    Diagnostic only: the caller logs a warning and still registers the agent.
+    A dangling ref never mounts; it does not break the agent, so it must not
+    become fatal. The global config is read only when a candidate survives the
+    merged map (the common all-resolved case costs no I/O).
+    """
+    servers = agent_data.get("mcpServers")
+    known = set(servers) if isinstance(servers, dict) else set()
+    candidates: list[tuple[str, str]] = []
+    for entry in agent_data.get("tools") or []:
+        if not isinstance(entry, str) or not entry.startswith("@"):
+            continue
+        server = entry[1:].split("/", 1)[0]
+        if server not in known:
+            candidates.append((entry, server))
+    if not candidates:
+        return []
+    if agent_data.get("includeMcpJson") is False:
+        # The spec opts out of the global mcp.json, so kiro-cli will not
+        # consult it at mount time — an ambient entry cannot rescue these refs
+        # and treating it as resolvable would suppress the one signal that
+        # exists for exactly the specs (mochi's) that set this flag.
+        return [f"{entry} (server {server!r})" for entry, server in candidates]
+    ambient = set(_global_mcp_specs())
+    return [
+        f"{entry} (server {server!r})"
+        for entry, server in candidates
+        if server not in ambient
+    ]
 
 
 #: Keys the framework OWNS in a materialized app agent config: each is derived
@@ -746,12 +821,20 @@ def _placeholder_values(app_name: str) -> dict[str, str]:
     }
 
 
-def _render_shipped_agent(app_name: str, agent_path: Path) -> Path | None:
+def _render_shipped_agent(
+    app_name: str, agent_path: Path, io_failures: list[str] | None = None
+) -> Path | None:
     """Render *agent_path*'s placeholders and return the gateway-written copy.
 
     Returns *agent_path* unchanged when the shipped file holds no placeholder, and
     ``None`` when it holds one that cannot be resolved (nothing is registered rather
     than registering a config with a literal ``{ENGINE_ROOT}`` in it).
+
+    ``io_failures`` collects ONLY the write failure. This returns ``None`` for three
+    different reasons and just one of them can succeed on a retry: an unresolved
+    placeholder and invalid rendered JSON are properties of the template and will fail
+    identically forever, so reporting them to a caller that retries would spin without
+    ever converging. The ``OSError`` arm is the transient one.
 
     **The gateway renders the template itself.** An earlier version of this took the
     app's own provisioned copy from its install dir and verified it was "the template
@@ -805,12 +888,26 @@ def _render_shipped_agent(app_name: str, agent_path: Path) -> Path | None:
         atomic_write(target, rendered)
     except OSError as exc:
         logger.warning("App %s: could not write rendered agent: %s", app_name, exc)
+        if io_failures is not None:
+            io_failures.append(str(agent_path))
         return None
     return target
 
 
-def _register_agents(app_name: str, manifest: AppManifest, app_root: Path) -> list[str]:
+def _register_agents(
+    app_name: str,
+    manifest: AppManifest,
+    app_root: Path,
+    io_failures: list[str] | None = None,
+) -> list[str]:
     """Materialize app agent JSONs into ~/.kiro/agents/ with namespaced names.
+
+    ``io_failures``, when supplied, collects the agents skipped because of an OS-level
+    read or write error. That is deliberately NARROWER than "declared minus registered":
+    most skips here are PERMANENT refusals — a path escaping the app root, an unsafe
+    agent name, malformed JSON, an unresolved template placeholder — and retrying those
+    never converges. Only the I/O class can succeed on a later attempt, so only it is
+    worth reporting to a caller that retries.
 
     Written as a COPY, not a symlink, for two reasons:
 
@@ -825,129 +922,166 @@ def _register_agents(app_name: str, manifest: AppManifest, app_root: Path) -> li
     """
     registered: list[str] = []
     dispatchable: set[str] = set()
-    agents_dir = _kiro_agents_dir()
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    policy = _agent_mcp_policy(app_name)
-    own_servers = _own_mcp_servers(app_name)
+    # Held across the whole materialization, not just the writes: each agent COPIES the
+    # ambient server spec, so a read taken before a health scrub and a write landing
+    # after it would leave the agent naming a server that no longer exists. The read and
+    # the write have to be inside the same critical section as the transition they race.
+    #
+    # Kept INLINE rather than delegated to a helper: the governed-auto-approve strip
+    # below is a write chokepoint that `test_both_config_writers_run_the_pass` asserts by
+    # inspecting THIS function's source. Moving the body elsewhere would keep the
+    # behaviour and silently retire the guarantee.
+    with _health_reconcile_guard():
+        agents_dir = _kiro_agents_dir()
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        policy = _agent_mcp_policy(app_name)
+        own_servers = _own_mcp_servers(app_name)
 
-    for agent_path_str in manifest.agents:
-        agent_path = app_root / agent_path_str
-        # Path containment check — reject paths that escape the app root
-        if not agent_path.resolve().is_relative_to(app_root.resolve()):
-            logger.warning("App %s: agent path escapes app root: %s", app_name, agent_path)
-            continue
-        if not agent_path.is_file():
-            logger.warning("App %s: agent file not found: %s", app_name, agent_path)
-            continue
-        # A shipped TEMPLATE is rendered BY THE GATEWAY, from values it computes
-        # itself, into a file under the data home. `None` means a placeholder could
-        # not be resolved, so nothing is registered for this agent rather than
-        # registering a config that names a literal `{ENGINE_ROOT}`.
-        resolved = _render_shipped_agent(app_name, agent_path)
-        if resolved is None:
-            continue
-        agent_path = resolved
+        for agent_path_str in manifest.agents:
+            agent_path = app_root / agent_path_str
+            # Path containment check — reject paths that escape the app root
+            if not agent_path.resolve().is_relative_to(app_root.resolve()):
+                logger.warning("App %s: agent path escapes app root: %s", app_name, agent_path)
+                continue
+            if not agent_path.is_file():
+                logger.warning("App %s: agent file not found: %s", app_name, agent_path)
+                continue
+            # A shipped TEMPLATE is rendered BY THE GATEWAY, from values it computes
+            # itself, into a file under the data home. `None` means a placeholder could
+            # not be resolved, so nothing is registered for this agent rather than
+            # registering a config that names a literal `{ENGINE_ROOT}`.
+            resolved = _render_shipped_agent(app_name, agent_path, io_failures=io_failures)
+            if resolved is None:
+                continue
+            agent_path = resolved
 
-        # Read agent JSON to get the agent name
-        try:
-            agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
+            # Read agent JSON to get the agent name
+            try:
+                agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("App %s: unreadable agent %s: %s", app_name, agent_path, exc)
+                if isinstance(exc, OSError) and io_failures is not None:
+                    io_failures.append(str(agent_path))  # transient; a malformed spec is not
+                continue
+            if not isinstance(agent_data, dict):
+                # Valid JSON that is not an object (a list, a scalar, null) parses
+                # fine, but every `.get` below would raise. Same disposition as the
+                # unreadable case: skip this agent rather than register a config
+                # the spec never described.
+                logger.warning(
+                    "App %s: agent spec %s is not a JSON object; skipping", app_name, agent_path
+                )
+                continue
             agent_name = agent_data.get("name", agent_path.stem)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("App %s: unreadable agent %s: %s", app_name, agent_path, exc)
-            continue
 
-        # The agent name is app-controlled (read from the agent JSON) and is
-        # about to become a filesystem path component. Reject any path separator
-        # or parent-dir token BEFORE constructing link_path: on Windows a name
-        # like "..\\..\\crew\\config" would otherwise traverse out of the agents
-        # dir (backslash is a separator there) and atomic_write would overwrite
-        # an arbitrary JSON file such as ~/.kiro/crew/config.json.
-        if (
-            not isinstance(agent_name, str)
-            or "/" in agent_name
-            or "\\" in agent_name
-            or "\x00" in agent_name
-            or agent_name in ("", ".", "..")
-        ):
-            logger.warning("App %s: refusing agent with unsafe name %r", app_name, agent_name)
-            continue
+            # The agent name is app-controlled (read from the agent JSON) and is
+            # about to become a filesystem path component. Reject any path separator
+            # or parent-dir token BEFORE constructing link_path: on Windows a name
+            # like "..\\..\\crew\\config" would otherwise traverse out of the agents
+            # dir (backslash is a separator there) and atomic_write would overwrite
+            # an arbitrary JSON file such as ~/.kiro/crew/config.json.
+            if (
+                not isinstance(agent_name, str)
+                or "/" in agent_name
+                or "\\" in agent_name
+                or "\x00" in agent_name
+                or agent_name in ("", ".", "..")
+            ):
+                logger.warning("App %s: refusing agent with unsafe name %r", app_name, agent_name)
+                continue
 
-        # Namespaced link name: app-name--agent-name.json
-        link_name = _safe_link_name(_namespace(app_name, agent_name)) + ".json"
-        link_path = agents_dir / link_name
+            # Namespaced link name: app-name--agent-name.json
+            link_name = _safe_link_name(_namespace(app_name, agent_name)) + ".json"
+            link_path = agents_dir / link_name
 
-        # Snapshot the user's own edits BEFORE the unlink below — after it there
-        # is nothing left to read (see _preserve_user_agent_edits).
-        prior_on_disk = _read_agent_config(link_path)
+            # Snapshot the user's own edits BEFORE the unlink below — after it there
+            # is nothing left to read (see _preserve_user_agent_edits).
+            prior_on_disk = _read_agent_config(link_path)
 
-        # Drop a legacy SYMLINK from an older KiroCrew (which pointed at a file
-        # inside the app) so the write below lands a real file at this path.
-        #
-        # NOTHING is unlinked first — not even a legacy symlink. atomic_write does
-        # tmp+os.replace, which atomically swaps the destination NAME whether it is
-        # a regular file OR a symlink (rename operates on the path, not the
-        # symlink target), so the new real file replaces the old link in one step.
-        # Unlinking first (for either kind) opened a window where the working
-        # config was already gone and the replacement had not landed — a write
-        # that then failed (disk full, at startup reconciliation) made the agent
-        # DISAPPEAR. Leaving the old entry in place means a failed write leaves the
-        # last-good config untouched.
-        try:
-            # The app's own servers are always granted -- they are declared by
-            # the manifest, not chosen by the user, and the agent's `tools`
-            # already references them.
-            if own_servers:
-                agent_data["mcpServers"] = {
-                    **own_servers,
-                    **(agent_data.get("mcpServers") or {}),
-                }
-            # An app agent may also reference the host's managed servers
-            # (@kirocrew-cron / @kirocrew-core) in `tools`. Those specs live in
-            # the HOST agent's config, not the global mcp.json, so without this
-            # merge the reference dangles and the tool silently never mounts.
-            _materialize_managed_refs(agent_data)
-            merged = _apply_agent_mcp_policy(agent_data, agent_name, policy)
-            merged = _apply_agent_prompt(merged, agent_name, policy, app_name, app_root)
-            merged = _preserve_user_agent_edits(link_name, prior_on_disk, merged)
-            # LAST governance pass, on the map that is about to be written. By this
-            # point `autoApprove` could have come from the app's own manifest, the
-            # per-agent MCP policy, a materialized managed ref, or a preserved
-            # on-disk entry — filtering each of those separately is how earlier
-            # rounds kept leaving one open. The host agent's writer does the same
-            # thing at the same position (see agent.install_agent).
-            _servers = merged.get("mcpServers")
-            if isinstance(_servers, dict):
-                merged["mcpServers"] = _strip_ungoverned_auto_approve(_servers)
-            atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
-            registered.append(_namespace(app_name, agent_name))
-            # The DECLARED name only — kiro-cli enumerates agents by their
-            # `name` field, so the namespaced filename stem is not a name it
-            # can resolve (see _scan_materialized_agents).
-            dispatchable.add(agent_name)
-            logger.info("Registered agent: %s (from %s)", link_name, agent_path)
-        except OSError as exc:
-            logger.warning("Failed to write agent %s: %s", link_name, exc)
+            # Drop a legacy SYMLINK from an older Kiro Crew (which pointed at a file
+            # inside the app) so the write below lands a real file at this path.
+            #
+            # NOTHING is unlinked first — not even a legacy symlink. atomic_write does
+            # tmp+os.replace, which atomically swaps the destination NAME whether it is
+            # a regular file OR a symlink (rename operates on the path, not the
+            # symlink target), so the new real file replaces the old link in one step.
+            # Unlinking first (for either kind) opened a window where the working
+            # config was already gone and the replacement had not landed — a write
+            # that then failed (disk full, at startup reconciliation) made the agent
+            # DISAPPEAR. Leaving the old entry in place means a failed write leaves the
+            # last-good config untouched.
+            try:
+                # The app's own servers are always granted -- they are declared by
+                # the manifest, not chosen by the user, and the agent's `tools`
+                # already references them.
+                if own_servers:
+                    agent_data["mcpServers"] = {
+                        **own_servers,
+                        **(agent_data.get("mcpServers") or {}),
+                    }
+                # An app agent may also reference the host's managed servers
+                # (@kirocrew-cron / @kirocrew-core) in `tools`. Those specs live in
+                # the HOST agent's config, not the global mcp.json, so without this
+                # merge the reference dangles and the tool silently never mounts.
+                _materialize_managed_refs(agent_data)
+                merged = _apply_agent_mcp_policy(agent_data, agent_name, policy)
+                merged = _apply_agent_prompt(merged, agent_name, policy, app_name, app_root)
+                merged = _preserve_user_agent_edits(link_name, prior_on_disk, merged)
+                # LAST governance pass, on the map that is about to be written. By this
+                # point `autoApprove` could have come from the app's own manifest, the
+                # per-agent MCP policy, a materialized managed ref, or a preserved
+                # on-disk entry — filtering each of those separately is how earlier
+                # rounds kept leaving one open. The host agent's writer does the same
+                # thing at the same position (see agent.install_agent).
+                _servers = merged.get("mcpServers")
+                if isinstance(_servers, dict):
+                    merged["mcpServers"] = _strip_ungoverned_auto_approve(_servers)
+                # The map above is FINAL — every source of servers has been merged —
+                # so this is the one point a dangling `@` grant is decidable. Warn,
+                # never reject: kiro-cli just skips the ref, so the agent works
+                # minus the tool, and the warning is the only signal that exists.
+                dangling = _unresolvable_tool_refs(merged)
+                if dangling:
+                    logger.warning(
+                        "App %s: agent %r grants MCP tool ref(s) not found in this "
+                        "agent's merged mcpServers or the global mcp.json; kiro-cli "
+                        "will silently never mount them: %s",
+                        app_name,
+                        agent_name,
+                        ", ".join(dangling),
+                    )
+                atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
+                registered.append(_namespace(app_name, agent_name))
+                # The DECLARED name only — kiro-cli enumerates agents by their
+                # `name` field, so the namespaced filename stem is not a name it
+                # can resolve (see _scan_materialized_agents).
+                dispatchable.add(agent_name)
+                logger.info("Registered agent: %s (from %s)", link_name, agent_path)
+            except OSError as exc:
+                logger.warning("Failed to write agent %s: %s", link_name, exc)
+                if io_failures is not None:
+                    io_failures.append(link_name)
 
-    if dispatchable:
-        # Publish the names just written BEFORE scheduling the rescan, and do it
-        # synchronously: publishing is a pure set union with no filesystem access,
-        # while the rescan can be delayed arbitrarily if the default executor is
-        # saturated. That window is not cosmetic — a slot created inside it would
-        # resolve to the default agent, so the app's first turn after being enabled
-        # would be answered by the wrong agent.
-        publish_materialized_agents(dispatchable)
-    # Reconcile the whole directory UNCONDITIONALLY, even when this call wrote
-    # nothing: a re-registration whose manifest no longer declares an agent (or
-    # that follows a prune) leaves the removed name in the snapshot, and only a
-    # rescan drops it. A name that is dispatchable in memory but gone from disk is
-    # the same invisible mismatch as the bug this change fixes — kiro-cli cannot
-    # load it and falls back to its own default. `_register_agents` runs ON the
-    # loop for the dashboard enable/update handlers (see the prune note in
-    # `register_app`), so the scan goes to an executor rather than walking every
-    # agent file inline.
-    schedule_materialized_agents_refresh()
+        if dispatchable:
+            # Publish the names just written BEFORE scheduling the rescan, and do it
+            # synchronously: publishing is a pure set union with no filesystem access,
+            # while the rescan can be delayed arbitrarily if the default executor is
+            # saturated. That window is not cosmetic — a slot created inside it would
+            # resolve to the default agent, so the app's first turn after being enabled
+            # would be answered by the wrong agent.
+            publish_materialized_agents(dispatchable)
+        # Reconcile the whole directory UNCONDITIONALLY, even when this call wrote
+        # nothing: a re-registration whose manifest no longer declares an agent (or
+        # that follows a prune) leaves the removed name in the snapshot, and only a
+        # rescan drops it. A name that is dispatchable in memory but gone from disk is
+        # the same invisible mismatch as the bug this change fixes — kiro-cli cannot
+        # load it and falls back to its own default. `_register_agents` runs ON the
+        # loop for the dashboard enable/update handlers (see the prune note in
+        # `register_app`), so the scan goes to an executor rather than walking every
+        # agent file inline.
+        schedule_materialized_agents_refresh()
 
-    return registered
+        return registered
 
 
 def _deregister_agents(app_name: str) -> int:
@@ -1269,6 +1403,8 @@ def _cron_defs_from_manifest(
                 "persistent_session": cron.persistent_session,
                 "silent": cron.silent,
                 "enabled": cron.enabled,
+                "timezone": cron.timezone,
+                "skip_dates": cron.skip_dates,
             }
         )
         registered.append(namespaced)
@@ -1306,14 +1442,51 @@ def _deregister_crons(app_name: str) -> int:
 
 
 def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
-    """Load persisted cron definitions for an app (used by CronService bridge)."""
+    """Load persisted cron definitions for an app (used by CronService bridge).
+
+    The return type is a promise to the caller, so it is enforced rather than
+    assumed. ``app-crons.json`` lives in the app's INSTALL directory, which is
+    ordinary user-writable state -- a hand-edit, a partial restore, or an app
+    that writes its own file can leave valid JSON that is not a list of
+    objects. That parses cleanly, so catching ``JSONDecodeError`` does not see
+    it, and the value flows into ``register_app_crons_with_service``'s
+    ``for d in defs: d.get("name", "")`` -- which raises ``AttributeError`` on
+    a string (iterating a JSON object yields its keys) and ``TypeError`` on a
+    scalar, from OUTSIDE the per-job ``try`` that makes one bad cron skippable.
+
+    Two levels, because they fail differently:
+
+    - a non-list top level is the whole file being wrong, and is treated
+      exactly like the unreadable case above -- no definitions, app enables
+      without crons.
+    - a non-object ENTRY is one bad row among good ones, and is skipped the
+      way an entry whose registration raises already is, so the remaining
+      crons still register.
+    """
     path = _app_crons_path(app_name)
     if not path.is_file():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        logger.warning(
+            "App %s: cron manifest %s is not a JSON array (%s); ignoring it",
+            app_name,
+            path,
+            type(data).__name__,
+        )
+        return []
+    defs = [entry for entry in data if isinstance(entry, dict)]
+    if len(defs) != len(data):
+        logger.warning(
+            "App %s: cron manifest %s has %d entry/entries that are not JSON objects; skipping them",
+            app_name,
+            path,
+            len(data) - len(defs),
+        )
+    return defs
 
 
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
@@ -1432,6 +1605,12 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 persistent_session=d.get("persistent_session", False),
                 silent=bool(d.get("silent", False)),
                 enabled=bool(d.get("enabled", True)),
+                # An empty timezone resolves to the config zone and then to UTC
+                # at fire time, so a manifest that pins an hour meaningful only
+                # in one zone must have it threaded here, not corrected by a
+                # second write after the job already exists.
+                timezone=d.get("timezone") or "",
+                skip_dates=d.get("skip_dates") or None,
             )
             if job is None:
                 # Lost the race (or already present): another registrar
@@ -1487,19 +1666,23 @@ async def deregister_app_crons_from_service(app_name: str, cron_service: Any) ->
     Idempotent — safe to call when no jobs are registered (returns ``0``).
     Returns the number of jobs removed.
 
-    Propagates :class:`CronStoreBusy` (re-raised) so a contended cleanup is
-    REPORTED to the disable/uninstall caller as a failure rather than masked as
-    a successful ``0`` while owned jobs stay enabled and keep executing.
+    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
+    (re-raised) so a cleanup that could not complete is REPORTED to the
+    disable/uninstall caller as a failure rather than masked as a successful ``0``
+    while owned jobs stay enabled and keep executing. The two are siblings, not
+    subclasses, so each needs naming: an unreadable store degrades to an empty job
+    list, which is indistinguishable HERE from an app that owned nothing.
     """
     if cron_service is None:
         return 0
     sdk = CronSDK(app_name, cron_service)
     try:
         return await sdk.remove_all_async()
-    except CronStoreBusy as exc:
+    except (CronStoreBusy, CronStoreUnreadable) as exc:
         logger.warning(
-            "App %s: cron cleanup could not complete — store busy: %s",
+            "App %s: cron cleanup could not complete (%s): %s",
             app_name,
+            type(exc).__name__,
             exc,
         )
         sel().log_api_access(
@@ -1557,7 +1740,9 @@ async def reconcile_app_crons_for_execution(cron_service: Any) -> list[str]:
     if cron_service is None:
         return []
 
-    app_infos = list_apps()
+    # list_apps() walks the apps dir (two file reads per app), and this runs on
+    # the gateway boot path — off the loop.
+    app_infos = await asyncio.to_thread(list_apps)
     installed_names = {app_name for app_info in app_infos if (app_name := app_info.get("name", ""))}
     cron_owner_names: set[str] = set()
     for job in cron_service.list_jobs(include_disabled=True):
@@ -1743,6 +1928,22 @@ def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None)
         return url
 
 
+def _health_reconcile_guard() -> Any:
+    """Serialize this writer against backend health transitions.
+
+    An app's mcp.json entries and its materialized agent configs are written by two
+    independent families: the lifecycle paths here (enable, update, boot reconcile) and
+    the backend's health watch. Without a shared lock the two can interleave their
+    decisions — each doing a correct read-modify-write, with the STALE one landing last.
+
+    Deferred import: backend imports this module in its boot path, so resolving the lock
+    at call time is what keeps the bridges <-> backend cycle from closing at import.
+    """
+    from kiro_crew.apps.backend import health_reconcile_lock
+
+    return health_reconcile_lock()
+
+
 def _live_port_for(app_name: str, live_port: int | None) -> int | None:
     """The backend's actually-allocated port, or None if it isn't running yet.
 
@@ -1760,13 +1961,15 @@ def _live_port_for(app_name: str, live_port: int | None) -> int | None:
         return None
 
 
-#: Bare python launchers an app manifest may name. Each is substituted with the RUNNING
-#: interpreter, which is the only one guaranteed to import ``kiro_crew``.
+#: Bare python launchers an app manifest may name. Each is substituted with a resolved
+#: absolute interpreter — the app's own venv python when it exists (the interpreter its
+#: dependencies were installed against), else the RUNNING interpreter, which is the only
+#: one guaranteed to import ``kiro_crew``.
 _BARE_PYTHON = frozenset({"python", "python3", "py"})
 
 
-def resolve_stdio_command(cfg: dict) -> dict:
-    """Resolve a bare ``python``/``python3`` MCP command to the running interpreter.
+def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
+    """Resolve a bare stdio MCP ``command`` to an absolute path, venv first.
 
     A manifest that hard-codes ``python3`` does not launch on a native Windows install (a venv
     there ships ``python.exe`` and no ``python3.exe``), so the spawn fails with ENOENT and the
@@ -1777,13 +1980,189 @@ def resolve_stdio_command(cfg: dict) -> dict:
     ``kiro_crew`` at all. ``mcp_gateway/rewriter.py`` bakes ``sys.executable`` into its stub
     entry for exactly that reason; this is the same decision for app manifests.
 
-    Only a BARE launcher is substituted. An absolute path, ``node``, ``docker`` or anything
-    else was chosen deliberately and is left untouched, as is an HTTP entry (no ``command``).
+    With ``app_root``, the resolution matches what the app's BACKEND launcher already does
+    (see :mod:`kiro_crew.apps.interpreter`): prefer the app's own venv interpreter — that is
+    where its ``requirements.txt`` was installed, so anything else risks starting the server
+    under an interpreter missing the app's dependencies — else fall back to the gateway's
+    ``sys.executable``. The two spawn paths share one policy on purpose; a second divergent
+    copy is the defect this shape removes.
+
+    The rewrite rule, precisely: only a BARE name (no path separator) is ever touched, and
+    then only when it is a known python launcher OR the app's venv provides that exact
+    binary (a venv console script — invisible to PATH because the venv is never activated).
+    An absolute path, a command carrying a path, or a bare PATH dependency the venv does not
+    provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left untouched, as
+    is an HTTP entry (no ``command``). Getting this predicate wrong breaks working apps, so
+    the boundary is pinned by tests on both sides.
     """
     command = cfg.get("command")
-    if isinstance(command, str) and command.strip().lower() in _BARE_PYTHON:
-        cfg["command"] = sys.executable
+    if not isinstance(command, str):
+        return cfg
+    name = command.strip()
+    if (
+        not name
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+        or os.path.splitdrive(name)[0]
+    ):
+        # Carries a path (or, on Windows, a drive qualifier like ``D:foo``,
+        # which pathlib would treat as a new anchor and silently discard the
+        # venv prefix in the join below) — deliberate, never rewritten.
+        return cfg
+    # ``python.exe`` / ``python3.exe`` are ordinary Windows spellings of the
+    # same launchers; normalise the suffix so they get the interpreter policy
+    # (venv-first, sys.executable fallback) instead of the console-script probe.
+    base = name.lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    if base in _BARE_PYTHON:
+        if _targets_gateway_module(cfg):
+            # The server runs Kiro Crew's OWN code (``-m kiro_crew...``). App
+            # venvs are created WITHOUT --system-site-packages, so kiro_crew is
+            # not importable there and the venv interpreter would die on
+            # import; and even a venv that pip-installed its own kiro_crew is a
+            # version-skewed foreign copy the gateway must not execute. Gateway
+            # code runs provably under the gateway's interpreter — the same
+            # decision _pin_host_cli_command makes for the host CLI.
+            cfg["command"] = sys.executable
+        else:
+            cfg["command"] = resolve_app_python(app_root)
+            # The one remaining silent-death path: a script-entry server that
+            # imports gateway-env packages flips to the venv interpreter the
+            # moment a venv materialises and dies on import with no warning
+            # (the rewritten path exists). Make the chosen interpreter
+            # greppable so that diagnosis starts from a log line.
+            logger.debug(
+                "stdio MCP command %r resolved to interpreter %s", name, cfg["command"]
+            )
+    elif app_root is not None:
+        venv_cmd = venv_provided_command(app_root, name)
+        if venv_cmd is not None:
+            cfg["command"] = venv_cmd
     return cfg
+
+
+#: CPython interpreter options that consume the NEXT argv element as their
+#: value. Everything else the interpreter accepts is either a self-contained
+#: flag (-s, -u, -O, ...) or attaches its value in the same token (-Wignore,
+#: -Xdev). Kept as an explicit table so the scanner's skip logic is checkable
+#: against `python --help` rather than inferred per finding.
+_PY_OPTS_WITH_SEPARATE_VALUE = frozenset({"-X", "-W", "--check-hash-based-pycs"})
+
+
+def _targets_gateway_module(cfg: dict) -> bool:
+    """True when a python stdio entry launches a ``kiro_crew``-owned module.
+
+    Scans only the INTERPRETER-OPTION prefix of ``args``, mirroring CPython's
+    own argv parsing. The full branch table (each row is pinned by a test):
+
+    - ``-m`` (separate): the next element is the module — answer on it.
+    - ``-mMODULE`` (attached): CPython accepts the attached spelling too.
+    - ``-c`` / ``-cPROGRAM`` / ``--``: option parsing ends; nothing after is
+      an interpreter option, and no module launch is involved.
+    - a non-dash token: the script operand — everything after belongs to the
+      SCRIPT (``python3 server.py -m kiro_crew.mode``), never to CPython.
+    - ``-X``/``-W``/``--check-hash-based-pycs`` (separate form): consume TWO
+      tokens, so their value is never mistaken for the script operand.
+    - any other dash token: a value-less flag or an attached-value option —
+      consume one token.
+
+    Out of scope, conservatively: single-letter clustering that ends in ``m``
+    (``-sm kiro_crew``) reads here as an unknown flag followed by an operand
+    and answers False — the venv-first default applies. No manifest uses that
+    spelling; documenting the boundary beats guessing at getopt semantics.
+    """
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str):
+            return False
+        if arg == "-m":
+            if i + 1 < len(args):
+                module = args[i + 1]
+                return isinstance(module, str) and (
+                    module == "kiro_crew" or module.startswith("kiro_crew.")
+                )
+            return False
+        if arg.startswith("-m") and len(arg) > 2:
+            module = arg[2:]
+            return module == "kiro_crew" or module.startswith("kiro_crew.")
+        if arg == "--" or arg.startswith("-c") or not arg.startswith("-"):
+            return False
+        if arg in _PY_OPTS_WITH_SEPARATE_VALUE:
+            i += 2
+            continue
+        i += 1
+    return False
+
+
+def _warn_unresolvable_stdio_command(app_name: str, server_name: str, cfg: dict) -> None:
+    """Surface a stdio server whose command cannot spawn, instead of silent tool absence.
+
+    The failure mode this closes: kiro-cli spawns each registered server itself and reports
+    nothing when the spawn fails — the app's tools simply never appear. Emit one warning at
+    registration time naming the app, the server, and the command, so the operator has a log
+    line to find. Never raises: one bad server must not take down the whole registration
+    pass, and the entry is still written.
+
+    Deliberately checks only a command that CARRIES a path (one ``stat``). A bare name is
+    not probed: PATH at spawn time is not the gateway's PATH (kiro-cli strips env), a
+    legitimate binary may be installed later (``onEnable``) or live in app-local trees like
+    ``node_modules/.bin``, and walking PATH with ``shutil.which`` would multiply the stats.
+
+    Even the single stat can block in the kernel on a dead network mount, so the caller
+    (:func:`_schedule_unresolvable_warning`) runs this OFF the event loop whenever one is
+    running — the diagnostic is advisory and gates nothing, so it never needs to hold up
+    registration.
+    """
+    command = cfg.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return
+    name = command.strip()
+    has_sep = (
+        os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+        or bool(os.path.splitdrive(name)[0])
+    )
+    if not has_sep:
+        return
+    if not platform_compat.is_executable_file(name):
+        logger.warning(
+            "App %s: stdio MCP server %r declares command %r which resolves to no "
+            "existing executable — the server will likely fail to spawn and its tools "
+            "will be silently unavailable",
+            app_name,
+            server_name,
+            command,
+        )
+
+
+def _schedule_unresolvable_warning(app_name: str, server_name: str, cfg: dict) -> None:
+    """Run the unresolvable-command probe without ever blocking the event loop.
+
+    ``_register_mcp_servers`` is a sync function reachable from async dashboard
+    handlers, so its thread MAY be the loop thread: a ``stat`` on a dead
+    network-mounted path there would freeze every task until the stall watchdog
+    kills the gateway. When a loop is running, hand the probe (with a snapshot
+    of the entry — registration mutates ``cfg`` after this point) to the
+    maintenance pool; the log line is the only output, so fire-and-forget is
+    the whole contract. With no loop (CLI, tests, worker threads), probe inline.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _warn_unresolvable_stdio_command(app_name, server_name, cfg)
+        return
+    loop.run_in_executor(
+        maintenance_executor(),
+        _warn_unresolvable_stdio_command,
+        app_name,
+        server_name,
+        dict(cfg),
+    )
 
 
 def _register_mcp_servers(
@@ -1818,7 +2197,9 @@ def _register_mcp_servers(
     resolved_port = _live_port_for(app_name, live_port)
     registered: list[str] = []
     skipped: list[str] = []
-    with _mcp_lock():
+    # Reconcile guard OUTSIDE _mcp_lock: that order is fixed everywhere, so a health
+    # transition and a lifecycle registration can never deadlock against each other.
+    with _health_reconcile_guard(), _mcp_lock():
         mcp_data = _read_mcp_json_unlocked(strict=True)
         servers = mcp_data.setdefault("mcpServers", {})
         for server_name, server_config in manifest.mcpServers.items():
@@ -1838,9 +2219,20 @@ def _register_mcp_servers(
                 cfg["url"] = _resolve_live_mcp_url(app_name, cfg["url"], live_port=resolved_port)
                 cfg.pop("disabled", None)  # backend is live — ensure enabled
             else:
-                # A stdio entry: resolve a bare `python`/`python3` to the running
-                # interpreter (see `resolve_stdio_command`).
-                cfg = resolve_stdio_command(cfg) if isinstance(cfg, dict) else cfg
+                # A stdio entry: resolve a bare interpreter to an absolute one — the
+                # app's venv python when present, else the running interpreter (see
+                # `resolve_stdio_command`) — and surface an unresolvable command
+                # instead of letting the tools go silently missing.
+                if isinstance(cfg, dict):
+                    cfg = resolve_stdio_command(cfg, app_root=app_dir(app_name))
+                    _schedule_unresolvable_warning(app_name, server_name, cfg)
+                    # This file is consumed by kiro-cli, which applies a declared
+                    # env per key — an app manifest naming a PATH fragment would
+                    # hand its server that fragment as the WHOLE PATH. Emit
+                    # through the shared normalization point (env.emit_env).
+                    env = cfg.get("env")
+                    if isinstance(env, dict):
+                        cfg = {**cfg, "env": emit_env(env)}
             servers[namespaced] = cfg
             registered.append(namespaced)
         # LAST governance pass before this map hits disk. This file IS read by
@@ -1885,7 +2277,9 @@ def registered_app_mcp_servers() -> dict[str, Any]:
     return dict(servers) if isinstance(servers, dict) else {}
 
 
-def reregister_app_mcp_servers(app_name: str, live_port: int | None = None) -> list[str]:
+def reregister_app_mcp_servers(
+    app_name: str, live_port: int | None = None, io_failures: list[str] | None = None
+) -> list[str]:
     """Re-register admitted MCP servers after an app backend has started.
 
     HTTP URLs are rewritten to the live allocated port. Shipped definitions are
@@ -1900,7 +2294,14 @@ def reregister_app_mcp_servers(app_name: str, live_port: int | None = None) -> l
     ):
         _deregister_mcp_servers(app_name)
         return []
-    if not manifest or not manifest.mcpServers:
+    if not manifest:
+        # UNREADABLE, not merely empty: nothing was registered, so reporting success
+        # would let the caller record a registration that never happened and leave a
+        # healthy backend with no MCP entry and nothing to retry it.
+        if io_failures is not None:
+            io_failures.append(f"{app_name}: manifest unreadable")
+        return []
+    if not manifest.mcpServers:
         return []
     registered = _register_mcp_servers(app_name, manifest, live_port=live_port)
     # Refresh the app's AGENTS after the live server lands. register_app runs
@@ -1911,12 +2312,79 @@ def reregister_app_mcp_servers(app_name: str, live_port: int | None = None) -> l
     # declared MCP tools until some unrelated rebuild happened to run.
     if registered:
         try:
-            _register_agents(app_name, manifest, app_root)
-        except Exception:  # noqa: BLE001 — a refresh failure must not fail health re-registration
+            _register_agents(app_name, manifest, app_root, io_failures=io_failures)
+        except Exception:  # noqa: BLE001 — reported via io_failures, never raised on
             logger.warning(
                 "Could not refresh agents for app %s after live MCP registration", app_name
             )
+            if io_failures is not None:
+                io_failures.append(f"{app_name}:<all agents>")
     return registered
+
+
+def scrub_backend_mcp_url(
+    app_name: str, unreconciled: list[str] | None = None
+) -> list[str]:
+    """Remove an app's backend-dependent MCP entry, keeping the servers that need no port.
+
+    Registering with no live port is the existing path for this: it pops each HTTP entry
+    and keeps stdio/command ones, which kiro-cli launches itself and which have no port
+    to be dead. Returns the servers that were kept.
+
+    Falls back to removing EVERY entry for the app when its manifest cannot be resolved
+    or declares no servers. That case cannot distinguish a backend-dependent server from
+    an independent one, and the dead url must not survive on the strength of not knowing
+    — the failure this whole gate exists to prevent.
+
+    The fallback never touches the app's materialized AGENT files. See the comment on
+    that branch: their deletion is unrecoverable, and only ``deregister_app`` owns it.
+
+    ``unreconciled`` collects a reason when the entry could not be brought into a
+    consistent state — today, an UNREADABLE manifest. Keeping the agents there is right,
+    but it leaves them naming the server just removed and nothing else revisits them, so
+    the caller must treat it as unlanded and retry rather than record it as done. A
+    manifest that simply declares no servers is fully reconciled: there is nothing stale
+    to correct.
+    """
+    manifest, app_root = _registration_source(app_name)
+    if not manifest and unreconciled is not None:
+        # Unreadable, not merely empty: the agents are kept (see below) and therefore
+        # still name the removed server, and `refresh_app_agents` gives up on the same
+        # condition — so nothing here can finish the job. Report it so the watch retries
+        # once the manifest is readable again.
+        unreconciled.append(f"{app_name}: manifest unreadable")
+    if not manifest or not manifest.mcpServers:
+        # Scrub the entry, but NEVER the materialized agents. Deleting them is
+        # unrecoverable — it takes the user-owned fields `_preserve_user_agent_edits`
+        # carries across every refresh — while the thing it would prevent, an agent
+        # naming a server that is gone, costs failed tool calls until the next
+        # successful refresh rewrites it. An unreadable manifest is also frequently
+        # TRANSIENT, so destroying data over it trades a temporary fault for a permanent
+        # one. Uninstall removes these files through `deregister_app`, which is the path
+        # that legitimately owns their deletion.
+        removed = _deregister_mcp_servers(app_name)
+        if removed:
+            logger.warning(
+                "Scrubbed %d MCP server(s) for app %s: its manifest declares none or "
+                "could not be read. Its materialized agents are KEPT and may still name "
+                "the removed server until a refresh with a readable manifest rewrites "
+                "them.",
+                removed, app_name,
+            )
+        return []
+    # `_register_mcp_servers` directly, NOT `reregister_app_mcp_servers`: the latter also
+    # calls `_register_agents`, which would re-materialize this app's agent configs here
+    # — before the caller's enablement check runs — making a disabled app's agents
+    # dispatchable in the gap. The scrub only needs the mcp.json half; the agent refresh
+    # is the caller's, and it is gated.
+    #
+    # The admission gate that `reregister_app_mcp_servers` applies is kept explicitly: a
+    # denied app gets a FULL removal rather than the selective keep-stdio treatment,
+    # because nothing of a denied app should stay reachable.
+    if _registration_denied(app_name, action="mcp_register", app_root=app_root):
+        _deregister_mcp_servers(app_name)
+        return []
+    return _register_mcp_servers(app_name, manifest, live_port=None)
 
 
 def _scrub_legacy_shared_mcp(app_name: str) -> int:
@@ -1957,7 +2425,7 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
 def _deregister_mcp_servers(app_name: str) -> int:
     """Remove an app's MCP servers from the agent config (and the legacy shared file)."""
     prefix = f"{app_name}:"
-    with _mcp_lock():
+    with _health_reconcile_guard(), _mcp_lock():
         mcp_data = _read_mcp_json_unlocked(strict=True)
         servers = mcp_data.get("mcpServers", {})
         to_remove = [k for k in servers if k.startswith(prefix)]
@@ -2023,7 +2491,6 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             if not agent_path.resolve().is_relative_to(app_root.resolve()):
                 continue
             data = json.loads(agent_path.read_text(encoding="utf-8"))
-            agent_name = data.get("name", agent_path.stem)
         except (json.JSONDecodeError, OSError) as exc:
             # A declared agent we CANNOT read is not the same as a removed one. If
             # we skipped it, its name would be absent from `current_links` and the
@@ -2039,6 +2506,20 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             )
             current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
             break
+        if not isinstance(data, dict):
+            # Valid JSON that is not an object (a list, a scalar, null) parses
+            # fine, but it carries no readable `name` — the same cannot-read !=
+            # removed situation as above. Abort the agent prune so this agent
+            # does not fall out of `current_links` and lose its last-good
+            # materialized config.
+            logger.warning(
+                "Skipping agent prune for %s: declared agent %s is not a JSON object",
+                app_name,
+                agent_path_str,
+            )
+            current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
+            break
+        agent_name = data.get("name", agent_path.stem)
         current_links.add(_safe_link_name(_namespace(app_name, agent_name)) + ".json")
     agents_dir = _kiro_agents_dir()
     if current_links is not None and agents_dir.is_dir():
@@ -2116,12 +2597,12 @@ def register_app(app_name: str) -> RegistrationResult:
         return result
 
     # NOTE: pruning of resources a manifest UPGRADE removed is NOT done here.
-    # register_app is called on the event loop by the enable/update handlers,
-    # and a prune (directory walk over every agent file + lock acquisition)
-    # scales with agent count and would stall chat/heartbeat. Those on-loop
-    # callers all deregister_app() first, so nothing stale survives for them to
-    # prune. The one path that re-registers WITHOUT a preceding deregister — the
-    # boot reconcile — does the prune itself, off the loop, in
+    # The enable/update route handlers all deregister_app() first, so nothing
+    # stale survives for them to prune — a prune here (a directory walk over
+    # every agent file + lock acquisition, scaling with agent count) would run
+    # redundantly on every one of those deregister-first calls. The one path
+    # that re-registers WITHOUT a preceding deregister — the boot reconcile —
+    # does the prune itself, off the loop, in
     # reconcile_enabled_app_resources(). See that function.
 
     # MCP servers BEFORE agents: _register_agents copies the app's own registered
@@ -2138,6 +2619,13 @@ def register_app(app_name: str) -> RegistrationResult:
         result.agents = _register_agents(app_name, manifest, app_root)
     except Exception as exc:
         result.errors.append(f"agent registration failed: {exc}")
+
+    declared = len(manifest.agents or [])
+    if declared and not result.agents:
+        result.errors.append(
+            f"registered 0 of {declared} declared agent(s) for {app_name!r} "
+            "-- agent source missing or unreadable"
+        )
 
     try:
         result.skills = _register_skills(app_name, manifest, app_root)
@@ -2161,13 +2649,20 @@ def register_app(app_name: str) -> RegistrationResult:
     return result
 
 
-def refresh_app_agents(app_name: str) -> list[str]:
+def refresh_app_agents(
+    app_name: str, io_failures: list[str] | None = None
+) -> list[str]:
     """Re-materialize just this app's agent configs.
 
-    Called when something the agent config is derived from changes (today: the
-    app's MCP reach policy) so the change takes effect without a gateway
-    restart. Cheap and idempotent — it rewrites the same files registration
-    would.
+    Called when something the agent config is derived from changes (the app's MCP reach
+    policy, or a health scrub removing a server the agents copied) so the change takes
+    effect without a gateway restart. Cheap and idempotent — it rewrites the same files
+    registration would.
+
+    ``io_failures``, when supplied, collects the agents skipped for an OS-level read or
+    write error, so a caller that RETRIES can tell a transient failure from the several
+    permanent reasons this returns an empty list — a self-managed app, a denied one, or a
+    manifest declaring no agents are all "nothing for us to do", not failures.
     """
     manifest = get_app_manifest(app_name)
     if not manifest or not manifest.agents:
@@ -2175,7 +2670,15 @@ def refresh_app_agents(app_name: str) -> list[str]:
     info = get_app(app_name)
     if info and info.get("resources") == "app":
         return []
-    return _register_agents(app_name, manifest, _app_resource_root(app_name))
+    app_root = _app_resource_root(app_name)
+    # Admission gate — mirror register_app. A re-materialization MUST honor the
+    # same execution decision, or a revoked app's agents (and the MCP servers
+    # merged into them) would be rewritten and become dispatchable again. On
+    # denial, scrub any stale materialized agents and register nothing.
+    if _registration_denied(app_name, action="resource_register", app_root=app_root):
+        _deregister_agents(app_name)
+        return []
+    return _register_agents(app_name, manifest, app_root, io_failures=io_failures)
 
 
 def reconcile_enabled_app_resources() -> dict[str, int]:

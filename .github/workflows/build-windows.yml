@@ -77,6 +77,21 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      # Declared explicitly so callers pass this ONE secret instead of
+      # `secrets: inherit`, which would hand this lane every secret in the
+      # repository. The lane assumes a signing role and produces the installer
+      # users run, so the blast radius of a compromise here is worth bounding
+      # to the credential it actually uses. Mirrors publish-windows.yml.
+      #
+      # Not required: HAS_WINDOWS_SIGNING treats an empty value as "no signing
+      # secret" and skips every signing step, which is what keeps forks -- and
+      # the workflow_dispatch packaging probe, which deliberately runs with no
+      # credentials -- green. Making it required would turn that clean skip
+      # into a workflow-call failure.
+      AWS_WINDOWS_SIGNING_ROLE_ARN:
+        description: "Role assumed to sign the Windows installer and nupkg"
+        required: false
   # Manual build-only probe: builds the installer from any ref WITHOUT
   # publishing anything. Used to validate packaging changes before merge.
   workflow_dispatch:
@@ -169,12 +184,16 @@ jobs:
       HAS_WINDOWS_SIGNING: ${{ secrets.AWS_WINDOWS_SIGNING_ROLE_ARN != '' && inputs.use_prod_environment == true && 'true' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: website/package-lock.json
+          # cache disabled: this workflow is workflow_call-only from
+          # nightly.yml / release.yml, so every run builds published bytes.
+          # An Actions cache is writable from any branch and readable by a
+          # tag run (zizmor cache-poisoning).
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -182,6 +201,12 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        # cache disabled explicitly: setup-uv's default (enable-cache: auto)
+        # turns the cache ON for hosted runners, and this workflow only ever
+        # runs on a publish path, so a restored entry would reach the signed
+        # installer (zizmor cache-poisoning).
+        with:
+          enable-cache: false
         # The build script provisions python-build-standalone interpreters
         # through uv; windows-latest does not ship it, and the script's
         # curl|sh fallback is POSIX-shaped.
@@ -242,6 +267,45 @@ jobs:
           # Equals the Signer application name; ArtifactAccessRole's trust
           # policy requires it as sts:ExternalId.
           WINDOWS_SIGNING_EXTERNAL_ID: ${{ env.HAS_WINDOWS_SIGNING && 'KiroCrewWindows' || '' }}
+
+      # The installer and its blockmap are one artifact in two files: without
+      # the .blockmap, electron-updater silently falls back to a FULL download
+      # on every update. Failing HERE, before the upload, refuses to ship a
+      # corrupt artifact set at all (#4301): the publish lane then takes its
+      # documented build-produced-nothing skip path, exactly as for any other
+      # build failure, instead of hard-failing downstream -- where a missing
+      # blockmap on an insider run would block stable promotion of the mac,
+      # Linux and CLI artifacts (see the NOTE on release.yml's
+      # publish-windows-x64 job), the cross-platform coupling soft_fail exists
+      # to prevent. The Windows lane still goes visibly red, the step summary
+      # below carries the reason onto the run page even when soft_fail keeps
+      # the run green, and the workflow_dispatch packaging probe (soft_fail
+      # defaults false) hard-fails on this before merge.
+      # publish-windows.yml's own pairing check stays as the safety net for
+      # any artifact that reaches it by another path.
+      #
+      # The empty-glob case fails too: upload-artifact's if-no-files-found
+      # only errors when NO pattern matches, so a stray latest.yml alone would
+      # satisfy it and an installer-less artifact set would upload cleanly.
+      - name: Verify installer/blockmap pairing
+        shell: bash
+        run: |
+          shopt -s nullglob
+          fail() {
+            echo "::error::$1"
+            echo "**build-windows:** $1" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          installers=(website/electron/dist/*.exe)
+          if [ "${#installers[@]}" -eq 0 ]; then
+            fail "no installer produced: website/electron/dist contains no .exe"
+          fi
+          for exe in "${installers[@]}"; do
+            if [ ! -f "${exe}.blockmap" ]; then
+              fail "orphaned installer: ${exe} has no sibling ${exe##*/}.blockmap -- electron-updater would silently fall back to full downloads"
+            fi
+          done
+          echo "installer/blockmap pairing verified for ${#installers[@]} installer(s)"
 
       # NSIS output: electron-builder emits the installer flat into dist/ as
       # "<productName> Setup <version>.exe", alongside a .blockmap (the

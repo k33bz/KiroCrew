@@ -6,41 +6,24 @@ component in the chat instead of showing you a wall of JSON. Ask for a diagram a
 the excalidraw server gives you an editable Excalidraw canvas in the conversation;
 other servers ship PDF viewers, forms, and dashboards the same way. This is the
 [SEP-1865](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
-`ui` extension — Kiro Crew targets the **Stable 2026-01-26** revision — and it works
-with any conforming server: nothing is hardcoded per vendor.
+`ui` extension — Kiro Crew targets the **Stable 2026-01-26** revision — and it works with any conforming command-based stdio server: nothing is hardcoded per vendor.
 
-If you just want it working: **Developer → Shared MCP gateway → on**, then switch
-your server on under **Poolable MCP servers**. The rest of this page explains why
-both are needed and what to check when a render does not appear.
+If you just want it working: **Developer → MCP Management → route the server → on**. Routing adds the server to `mcp_gateway.stub_servers`; the rest of this page explains what that changes and what to check when a render does not appear.
 
 ## Enabling it
 
-Two gates must both pass. Neither is about the app itself — both are about **MCP
-pooling**, because the gateway daemon is what intercepts the tool result and
-resolves the `ui://` resource. Both have a UI toggle; you should not need to edit
-config by hand.
+Routing is the required gate: the gateway daemon intercepts a routed server's tool result and resolves its `ui://` resource. Backend sharing is a separate optional pool-wide setting; neither requires hand-editing config.
 
-> **Platform:** the shared gateway needs Unix-domain sockets, so it is supported on
-> **macOS and Linux only**. On Windows the toggle is disabled and MCP Apps are
-> unavailable.
+> **Platform:** the shared gateway is supported on macOS, Linux, and Windows. It uses a Unix-domain socket on POSIX and a named pipe on Windows.
 
 ### From the dashboard
 
 Both live on the **Developer** page (sidebar → **Developer**):
 
-1. **Turn on "Shared MCP gateway."** ⚠️ This restarts all active sessions onto the
-   new MCP routing, so in-flight agent work is interrupted — do it between tasks,
-   not mid-turn. Your dashboard stays signed in. The toggle asks for confirmation
-   and offers a roll-back.
-2. **Nothing else is required for apps.** "Share MCP Backends" and the poolable
-   allowlist decide whether several sessions reuse one MCP server *process* —
-   a resource choice, independent of whether apps render. A server that is not
-   shared still renders its apps.
+1. **Route the server through the gateway** in MCP Management. This adds the server to `mcp_gateway.stub_servers`; applying the routing change rebuilds affected agent MCP toolsets, so do it between tasks.
+2. **Share MCP Backends** is optional. `mcp_gateway.enabled` controls whether already routed stdio servers share backends across sessions; it is independent of whether their `ui://` resources render.
 
-   A row in the allowlist is **read-only** when the server can't be shared: it's
-   denylisted, its transport isn't stdio (HTTP servers aren't shared), or it's
-   already opted in via its own `poolable: true` and so isn't governed by the
-   allowlist.
+Only command-based stdio entries can be routed through a stub. URL-based HTTP/SSE entries remain direct and cannot render MCP Apps through this host.
 
 Optionally, to render apps in the right side panel instead of inline, turn on
 **Settings → Chat → Messages → "MCP Apps in Side Panel."** No restart or refresh
@@ -52,33 +35,49 @@ For scripted or headless setups:
 
 ```json
 {
-  "mcp_gateway": { "apps_enabled": true },
+  "mcp_gateway": { "stub_servers": ["excalidraw"] },
   "dashboard":   { "mcp_app_panel": true }
 }
 ```
 
-`apps_enabled` defaults to `true`, so an untouched config already renders apps.
+`stub_servers` is empty by default, so an untouched config renders no apps and runs no broker. Routing a server is the opt-in.
 Backend sharing is a separate, opt-in decision:
 
 ```json
-{ "mcp_gateway": { "enabled": true, "poolable_servers": ["excalidraw"] } }
+{ "mcp_gateway": { "enabled": true, "stub_servers": ["excalidraw"] } }
 ```
 
-A server can also opt itself in from its own MCP entry, which is the escape hatch
-for third-party configs you don't want to duplicate into the allowlist:
+`mcp_gateway.stub_servers` is the only thing that gives a server a stub. A
+`poolable: true` on the server's own MCP entry used to work as a second way in,
+and no longer does:
 
 ```json
 { "mcpServers": { "excalidraw": { "command": "...", "poolable": true } } }
 ```
 
-MCP Apps have their own switch, `mcp_gateway.apps_enabled`, independent of
-backend sharing. The full resolution order in `_mcp_apps_enabled()` is:
+That key is now ignored and stripped before the entry reaches kiro-cli. It could
+not be honoured coherently — the broker's start gate and the session's overlay
+both read the config list, so a spec-level opt-in produced a stub nothing pointed
+at. List the server instead, from the config above or from MCP Management.
+
+MCP Apps has no switch of its own any more. Capability follows THE STUB: the stub a
+stubbed server gets is what carries the render and callback path, so stubbing the
+server is what grants the feature. There is no way to *grant* Apps with a
+preference — but the two ways to say **no** still hold, so nobody who already
+turned it off starts rendering server-authored UI on upgrade:
 
 | Condition | Result |
 |---|---|
 | `KIROCREW_MCP_APPS` = `0`/`false`/`no`/`off` | disabled (explicit kill-switch, wins over everything) |
-| `KIROCREW_MCP_APPS` = `1`/`true`/`yes` | enabled (explicit override — tests, e2e harness) |
-| `KIROCREW_MCP_APPS` unset | follows `mcp_gateway.apps_enabled`, read **live** from config |
+| stored `mcp_gateway.apps_enabled` = `false` | disabled, even with `KIROCREW_MCP_APPS` on — a released opt-out is still honoured |
+| config unreadable | disabled (fails closed — the stored preference cannot be confirmed) |
+| `KIROCREW_MCP_APPS` = `1`/`true`/`yes`, no stored opt-out | enabled (explicit override — tests, e2e harness) |
+| nothing set | enabled — reaching the gate already means the server was stubbed |
+
+`apps_enabled` is **retired going forward**: nothing writes it, MCP Management does
+not surface it, and a fresh install never has it. It is read in exactly one
+direction — an operator-written `false` keeps withholding the feature. Absent
+defaults to on, so "not configured" is not an opt-out.
 
 Read live per call, so toggling the feature takes effect without restarting the
 daemon.
@@ -96,7 +95,7 @@ that animate in as they stream, which you can then drag around and edit.
 
 **If you get a wall of JSON-ish text instead:** nothing intercepted the result.
 Check `KIROCREW_MCP_APPS` is not set to an off value and that
-`mcp_gateway.apps_enabled` is on — those are the only two switches that govern
+the server is stubbed — the stub is the only switch that governs
 rendering. There is no error message when a result goes un-intercepted, which is
 what makes it confusing: the tool still worked, you just got its text.
 
@@ -254,7 +253,10 @@ Useful when something renders as text and you need to find where the chain broke
    so a slow app degrades to text rather than wedging the turn.
 3. The gateway writes the payload to a spool file at
    `$KIROCREW_HOME/mcp-apps/<uuid4hex>.json` and injects an opaque marker
-   `[kirocrew-mcp-app:<uuid4hex>]` into the tool result *text*.
+   `[kirocrew-mcp-app:<uuid4hex>]` at the START of the tool result *text*. It
+   leads the text (rather than trailing it) so it survives the ACP result
+   truncation cuts before the detector below runs — a long first text block
+   would otherwise lose a trailing marker and the app would never mount.
 4. That text reaches the dashboard backend as a tool result. `mcp_apps_render.py`
    detects the marker, loads the spooled payload, pushes an `mcp_app_render`
    websocket event to the chat slot, and strips the marker from the transcript.
@@ -274,10 +276,8 @@ app HTML is **server-controlled code running in your dashboard**.
   never reads the payload file — only deterministic code does.
 - **Missing, corrupt, or oversized spool files are tolerated**, so a bad payload
   cannot crash a turn.
-- **The dashboard CSP allows `https://esm.sh`.** `srcdoc` iframes inherit the
-  parent's CSP header, and apps commonly load their module graph from esm.sh via
-  importmap — without that allowance the app's scripts never execute and you get a
-  blank frame.
+- **The dashboard CSP allows `https://esm.sh`.** `srcdoc` iframes inherit the parent's CSP header, and apps commonly load their module graph from esm.sh via importmap — without that allowance the app's scripts never execute and you get a blank frame.
+- **Per-app CSP is additive and sanitized.** Resource metadata can request `resourceDomains`, `connectDomains`, `frameDomains`, and `baseUriDomains`; the host accepts only `https://` origin tokens, emits a CSP meta tag before app HTML, and otherwise starts from a deny-by-default policy. The parent response CSP can only further restrict that policy.
 - The host declares a limited capability set to the app (`serverTools`,
   `openLinks`). Link opening is gated to `https://` only.
 
@@ -285,15 +285,15 @@ app HTML is **server-controlled code running in your dashboard**.
 
 | Symptom | Most likely cause |
 |---|---|
-| Tool output renders as plain text | `mcp_gateway.apps_enabled` is off, or `KIROCREW_MCP_APPS` is set to an off value and is overriding it |
+| Tool output renders as plain text | the server has no stub in MCP Management, or `KIROCREW_MCP_APPS` is set to an off value |
 | Still text with both of those right | the broker did not start — check the gateway log for `mcp-gateway: broker ready`, which names the switch that started it |
-| The gateway toggle is disabled / greyed out | you're on Windows — the broker needs Unix-domain sockets (macOS and Linux only) |
-| A server's sharing row won't toggle | it's denylisted, or not stdio transport (HTTP servers can't be shared), or already opted in via its own `poolable: true` |
+| The gateway toggle is unavailable | confirm the gateway process and local IPC endpoint can start; the broker supports macOS, Linux, and Windows |
+| A server cannot be routed | only command-based stdio entries can receive a stub; URL-based HTTP/SSE entries stay direct |
 | Frame mounts but the canvas is blank | the app's scripts did not execute — check the browser console for CSP or network errors reaching its CDN |
 | Feature toggle missing from Settings | stale frontend bundle — hard-refresh the dashboard |
 | A new render appears inline despite `mcp_app_panel: true` | the flag is read at render time; diagrams already in scrollback do not move |
 | Panel shows "This app render is no longer available" | the payload was evicted (bounded per slot) — ask the agent to render it again |
-| Agent sessions all restarted unexpectedly | expected: flipping the **Shared MCP gateway** toggle re-routes MCP and interrupts in-flight work |
+| Agent sessions all restarted unexpectedly | expected: routing a server, or flipping backend sharing, re-routes MCP and interrupts in-flight work |
 
 For **which** iframe host a new dashboard feature should use, and why an iframe
 can never be moved in the DOM without reloading it, see

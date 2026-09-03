@@ -20,7 +20,9 @@ from kiro_crew import platform_compat, shutdown_event
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.llm_helpers import append_fallback_story
 from kiro_crew.memory import MemoryStore, workspace_dir
+from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
@@ -110,6 +112,26 @@ def _rewrite_heartbeat_locked(
             return len(appended)
 
 
+def _ensure_heartbeat_file(path: Path) -> None:
+    """Create the workspace dir and seed HEARTBEAT.md. Blocking; call off-loop."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(_HEADER, encoding="utf-8")
+
+
+def _read_heartbeat_file(path: Path) -> str | None:
+    """Return HEARTBEAT.md's stripped content, or ``None`` if it is absent.
+
+    Blocking; call off-loop. The existence check rides with the read so a file
+    removed between them cannot turn a missing file into a raised
+    ``FileNotFoundError``, and so the pair costs one worker hop rather than two.
+    """
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+
+
 class HeartbeatService:
     """Periodic wake-up that runs background maintenance tasks."""
 
@@ -139,10 +161,11 @@ class HeartbeatService:
         self._file_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        path = heartbeat_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            path.write_text(_HEADER, encoding="utf-8")
+        # Off the loop: start() is awaited on the gateway boot path, before
+        # KIROCREW_READY, and workspace_dir() may sit on a network or synced
+        # volume where mkdir + write_text block (AUTOSDE
+        # no-blocking-call-on-event-loop, no-new-work-on-gateway-boot-path).
+        await asyncio.to_thread(_ensure_heartbeat_file, heartbeat_path())
         self._task = asyncio.create_task(self._loop())
         logger.info("Heartbeat started (interval=%ds)", self._interval)
 
@@ -170,9 +193,7 @@ class HeartbeatService:
 
         if self._tick % _FTS_REBUILD_TICKS == 0:
             loop = asyncio.get_running_loop()
-            count = await loop.run_in_executor(
-                maintenance_executor(), self._memory.rebuild_index
-            )
+            count = await loop.run_in_executor(maintenance_executor(), self._memory.rebuild_index)
             logger.info("FTS index rebuilt: %d files", count)
 
         if self._tick % _PRUNE_TICKS == 0:
@@ -183,11 +204,31 @@ class HeartbeatService:
                 functools.partial(self._memory.prune_history, keep_days=max_days),
             )
 
-            # Prune security event log per retention policy
+            # Prune security event log per retention policy.
+            #
+            # maintenance_executor is deliberate, despite this pool's "fast
+            # periodic sweeps" charter and prune taking seconds on a large log.
+            # The three pools split on what makes a worker UN-RECLAIMABLE, not
+            # on duration: subprocess_executor is for work that can hang
+            # indefinitely on a wedged kernel resource, discovery_executor for
+            # work whose concurrency is set by remote callers.  prune is
+            # neither -- it terminates, it is awaited so it never overlaps
+            # itself, and it fires once per _PRUNE_TICKS, so one of four
+            # mc-maint workers once a day cannot starve the orphan-reaping
+            # sweeps this pool protects.  prune_history above is the same
+            # retention work on the same pool.
             try:
                 await loop.run_in_executor(maintenance_executor(), sel().prune)
             except Exception:
-                logger.debug("SEL prune failed", exc_info=True)
+                # WARNING, not debug: a dead prune means retention silently
+                # stops -- the unbounded-growth failure prune exists to
+                # prevent.  Counter so it is alarmable; guarded so a telemetry
+                # fault cannot take the heartbeat loop down with it.
+                logger.warning("SEL prune failed", exc_info=True)
+                try:
+                    get_recorder().counter("kirocrew.sel.prune_failed.count")
+                except Exception:
+                    pass
 
         # Check for idle sessions needing history consolidation (every tick)
         if self._consolidator:
@@ -206,9 +247,12 @@ class HeartbeatService:
         # Hold the file lock across the whole read→process→rewrite window so a
         # concurrent cycle can't rewrite the file from a stale snapshot.
         async with self._file_lock:
-            if not path.exists():
+            # Off the loop, like the rewrite that closes this same lock window
+            # below: this runs every tick for the life of the process, and the
+            # file lives under workspace_dir().
+            content = await asyncio.to_thread(_read_heartbeat_file, path)
+            if content is None:
                 return
-            content = path.read_text(encoding="utf-8").strip()
             tasks = _extract_tasks(content)
             if not tasks or not self._on_task:
                 return
@@ -223,8 +267,15 @@ class HeartbeatService:
                 )
                 for (task_text, deliver), result in zip(tasks, results):
                     if isinstance(result, BaseException):
+                        # A chain-exhaustion failure carries the fallback story
+                        # on the exception; this log line is the heartbeat's
+                        # terminal error text, so append it here — the walk
+                        # must not be reported as just the last candidate's
+                        # failure (llm_helpers.FALLBACK_STORY_ATTR).
                         logger.warning(
-                            "Heartbeat task failed: %s", task_text[:80], exc_info=result,
+                            "Heartbeat task failed: %s",
+                            append_fallback_story(task_text[:80], result),
+                            exc_info=result,
                         )
                         keep.append((task_text, deliver))
                     elif _should_keep(result):
@@ -237,7 +288,10 @@ class HeartbeatService:
                 # between this final read and os.replace. The entire durable
                 # transaction runs off the gateway event-loop thread.
                 appended_count = await asyncio.to_thread(
-                    _rewrite_heartbeat_locked, path, tasks, keep,
+                    _rewrite_heartbeat_locked,
+                    path,
+                    tasks,
+                    keep,
                 )
                 if appended_count:
                     logger.info(

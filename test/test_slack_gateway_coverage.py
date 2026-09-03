@@ -10,7 +10,7 @@ Focuses on the orchestrator surfaces the existing ``test_slack_gateway.py`` and
 * the orphan-notification and task-notification closures handed to
   ``SubagentManager`` / ``TaskRunner``.
 * the MCP-gateway control-plane methods (``_init_mcp_gateway``,
-  ``_stop_mcp_broker``, ``_apply_mcp_poolable``, ``_wire_mcp_gateway_dashboard``).
+  ``_stop_mcp_broker``, ``_apply_mcp_stub``, ``_wire_mcp_gateway_dashboard``).
 * ``_channel_transport_permitted``'s audit-failure and fail-closed branches.
 
 Everything is driven through mocked collaborators: no network, no subprocess, no
@@ -21,6 +21,7 @@ mirror ``test_slack_gateway.py`` / ``test_turn_duration_slack.py``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +32,8 @@ import pytest
 from kiro_crew import subagent as _sa
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.models import MonitorState
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -236,6 +239,30 @@ class TestFireDiscordNudge:
         assert kwargs["interpret_commands"] is False
 
     @pytest.mark.asyncio
+    async def test_structured_monitor_supplies_completion_hook(self):
+        """Only a structured synthetic turn carries monitor accounting state."""
+        transport = _discord_transport()
+        orch = _discord_orchestrator(transport)
+        structured = _loop(_DKEY)
+        structured.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+
+        assert await orch._fire_discord_nudge(structured) is True
+        _, structured_kwargs = _awaited(transport.dispatcher.handle_message)
+        assert isinstance(structured_kwargs["monitor_completion"], MonitorCompletionHook)
+
+        transport.dispatcher.handle_message.reset_mock()
+        assert await orch._fire_discord_nudge(_loop(_DKEY)) is True
+        _, legacy_kwargs = _awaited(transport.dispatcher.handle_message)
+        assert "monitor_completion" not in legacy_kwargs
+
+    @pytest.mark.asyncio
     async def test_dispatch_failure_returns_false(self):
         transport = _discord_transport()
         transport.dispatcher.handle_message.side_effect = RuntimeError("dispatch blew up")
@@ -340,6 +367,49 @@ class TestFireSlackNudgeGuards:
         orch.sessions.cancel_current.assert_awaited_once()
         orch.sessions.release.assert_called_once()
         orch.slack.post_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("times_out", [False, True])
+    async def test_safe_completion_is_recorded_before_cancellable_usage_persistence(
+        self, monkeypatch, times_out
+    ):
+        """A completed turn cannot remain in flight if analytics persistence is cancelled."""
+        orch = _slack_nudge_orchestrator()
+        orch.autonudge_svc = SimpleNamespace(record_monitor_turn_completion=AsyncMock())
+        loop = _loop()
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+        order: list[str] = []
+
+        async def _stream(*_args, **kwargs):
+            kwargs["on_complete"](SimpleNamespace(stop_reason="max_tokens"))
+            if times_out:
+                await asyncio.Event().wait()
+            return "reply body"
+
+        async def _report(*_args, **_kwargs):
+            order.append("completion")
+
+        async def _persist(*_args, **_kwargs):
+            order.append("persist")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(gw, "stream_and_collect", _stream)
+        monkeypatch.setattr(gw, "_persist_turn_row", _persist)
+        monkeypatch.setattr(orch, "_report_monitor_completion", _report)
+        if times_out:
+            monkeypatch.setattr(gw, "_NUDGE_TURN_TIMEOUT", 0.01)
+
+        with pytest.raises(asyncio.CancelledError):
+            await orch._fire_slack_nudge(loop)
+
+        assert order == ["completion", "persist"]
 
     @pytest.mark.asyncio
     async def test_cleanup_failures_do_not_mask_the_turn_result(self, monkeypatch):
@@ -773,26 +843,28 @@ class TestInitMcpGateway:
     """Broker startup, its two early returns and the rewriter-failure fallback."""
 
     @pytest.mark.asyncio
-    async def test_both_switches_off_returns_without_touching_platform_probe(self):
+    async def test_nothing_routed_returns_without_touching_platform_probe(self):
+        """The shipped default: no stubbed server, so no broker and no probe."""
         orch = _make_orchestrator()
         orch._cfg.mcp_gateway.enabled = False
-        orch._cfg.mcp_gateway.apps_enabled = False
+        orch._cfg.mcp_gateway.stub_servers = []
         with patch("kiro_crew.slack.gateway.is_gateway_supported") as probe:
             await orch._init_mcp_gateway()
         probe.assert_not_called()
         assert orch._mcp_gateway_manager is None
 
     @pytest.mark.asyncio
-    async def test_apps_enabled_alone_still_starts_the_broker(self):
-        """Pooling off must not keep the broker down.
+    async def test_a_routed_server_starts_the_broker_with_sharing_off(self):
+        """Sharing off must not keep the broker down for a stubbed server.
 
-        MCP Apps routes its callbacks through the stub, and the stub needs the
-        broker's socket. Returning early here is what made the apps switch a
-        dead end whenever pooling was off.
+        A stubbed server needs its stub, and the stub needs the broker's socket.
+        Sharing decides how that server's backend is acquired, so gating the
+        broker on it would make stub-only — the useful state for a stateful
+        server — unreachable.
         """
         orch = _make_orchestrator()
         orch._cfg.mcp_gateway.enabled = False
-        orch._cfg.mcp_gateway.apps_enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
         with patch(
             "kiro_crew.slack.gateway.is_gateway_supported", return_value=False
         ) as probe:
@@ -800,31 +872,36 @@ class TestInitMcpGateway:
         probe.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_turning_sharing_off_restarts_rather_than_stops_when_apps_on(self):
+    async def test_turning_sharing_off_restarts_rather_than_stops_when_routed(self):
         """The live-apply path must not strand MCP Apps.
 
         Two things have to happen when sharing goes off while apps stays on, and
         only asserting both distinguishes the fix from either failure mode:
 
-        * the broker must come back — a plain stop would leave
-          ``_mcp_apps_enabled()`` reporting a feature whose render and callback
-          paths just went away;
+        * the broker must come back — a plain stop would take away the render
+          and callback paths of servers the operator never unstubbed;
         * it must be a RESTART, not a no-op — the rewriter reads the sharing flag
           when the broker starts, so re-running it is what re-emits every stub
           without ``--poolable`` and actually stops the sharing just turned off.
+
+        The set it re-emits is the one the broker is SERVING, so the fixture has
+        to say what that is; the configured list alone is not it, because a stub
+        change is recorded for the next gateway start rather than applied.
         """
         orch = _make_orchestrator()
         orch._cfg.mcp_gateway.enabled = False
-        orch._cfg.mcp_gateway.apps_enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
         orch._mcp_gateway_manager = object()  # a broker is currently up
+        orch._mcp_stub_servers_started = frozenset({"alpha-mcp"})  # serving that stub
         calls: list[str] = []
 
         async def _stop() -> None:
             calls.append("stop")
             orch._mcp_gateway_manager = None
 
-        async def _init() -> None:
+        async def _init(stub_servers: frozenset[str] | None = None) -> None:
             calls.append("init")
+            assert stub_servers == frozenset({"alpha-mcp"})
 
         with patch(
             "kiro_crew.config.loader.KiroCrewConfig.load", return_value=orch._cfg
@@ -842,7 +919,7 @@ class TestInitMcpGateway:
         broker stays stopped rather than being restarted for nothing."""
         orch = _make_orchestrator()
         orch._cfg.mcp_gateway.enabled = False
-        orch._cfg.mcp_gateway.apps_enabled = False
+        orch._cfg.mcp_gateway.stub_servers = []
         orch._mcp_gateway_manager = object()
         calls: list[str] = []
 
@@ -896,6 +973,9 @@ class TestInitMcpGateway:
     async def test_successful_start_records_the_manager(self, tmp_path):
         orch = _make_orchestrator()
         orch._cfg.mcp_gateway.enabled = True
+        # A stubbed server is what asks for a broker at all; sharing only decides
+        # how that server's backend is acquired.
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
         manager = MagicMock()
         manager.start = AsyncMock(return_value=True)
         with patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True), patch(
@@ -911,6 +991,114 @@ class TestInitMcpGateway:
         ):
             await orch._init_mcp_gateway()
         assert orch._mcp_gateway_manager is manager
+
+    @pytest.mark.asyncio
+    async def test_the_started_set_is_recorded_and_the_override_wins(self, tmp_path):
+        """Two properties of the real start, both load-bearing for the sharing path.
+
+        The set handed to the rewriter is what the broker ends up serving, and an
+        explicit ``stub_servers`` must beat the configured list -- that argument
+        is how an unrelated restart avoids applying a stub change recorded for the
+        next gateway start. And the served set has to be REMEMBERED, because the
+        sharing path re-emits it rather than re-reading config; if it were not
+        recorded, that path would find nothing to serve and silently stop the
+        broker it was supposed to restart.
+        """
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp", "beta-mcp"]  # pending
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        with patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True), patch(
+            "kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"
+        ), patch(
+            "kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"
+        ), patch(
+            "kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"
+        ), patch(
+            "kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})
+        ) as rewriter, patch(
+            "kiro_crew.slack.gateway.GatewayManager", return_value=manager
+        ):
+            await orch._init_mcp_gateway(stub_servers=frozenset({"alpha-mcp"}))
+
+        assert rewriter.call_args.kwargs["stub_servers"] == frozenset({"alpha-mcp"}), (
+            "the configured list was used, so an unrelated restart would apply a "
+            "stub change reported as pending"
+        )
+        assert orch._mcp_stub_servers_started == frozenset({"alpha-mcp"})
+
+    @pytest.mark.asyncio
+    async def test_the_ready_log_counts_the_served_set_not_the_configured_one(
+        self, tmp_path, caplog
+    ):
+        """This line is read during "why is my stub not live?".
+
+        Config and the served set diverge exactly when a stub change is waiting
+        for the next gateway start, so counting the configured list here would
+        answer that question wrongly -- claiming two routed servers beside a
+        broker serving one.
+        """
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp", "beta-mcp"]  # beta pending
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        with patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True), patch(
+            "kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"
+        ), patch(
+            "kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"
+        ), patch(
+            "kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"
+        ), patch(
+            "kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})
+        ), patch(
+            "kiro_crew.slack.gateway.GatewayManager", return_value=manager
+        ):
+            with caplog.at_level(logging.INFO, logger="kiro_crew.slack.gateway"):
+                await orch._init_mcp_gateway(stub_servers=frozenset({"alpha-mcp"}))
+
+        ready = [r for r in caplog.records if "broker ready" in r.getMessage()]
+        assert ready, "no broker-ready line was emitted"
+        assert "1 stubbed server(s)" in ready[0].getMessage(), (
+            f"the ready line counted the configured set: {ready[0].getMessage()}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_start_still_records_the_set_so_a_retry_can_bring_it_up(
+        self, tmp_path
+    ):
+        """A start that fails leaves the broker down, and the set has to survive.
+
+        Recording only on success would make a transient start failure permanent:
+        the broker is absent, and the next restart for an unrelated reason -- the
+        sharing toggle -- would find nothing to serve and skip the start instead
+        of retrying it. The set says what the attempt was made with, not that the
+        attempt worked; ``_mcp_gateway_manager`` is what says a broker is up.
+        """
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=False)  # transient failure
+        with patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True), patch(
+            "kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"
+        ), patch(
+            "kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"
+        ), patch(
+            "kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"
+        ), patch(
+            "kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})
+        ), patch(
+            "kiro_crew.slack.gateway.GatewayManager", return_value=manager
+        ):
+            await orch._init_mcp_gateway()
+
+        assert orch._mcp_gateway_manager is None, "a failed start must leave no manager"
+        assert orch._mcp_stub_servers_started == frozenset({"alpha-mcp"}), (
+            "the failed start dropped the set, so a later restart would skip the "
+            "broker instead of retrying it"
+        )
 
     @pytest.mark.asyncio
     async def test_failed_start_leaves_no_manager(self, tmp_path):
@@ -934,7 +1122,7 @@ class TestInitMcpGateway:
 
 
 class TestStopAndApplyMcpBroker:
-    """``_stop_mcp_broker`` / ``_apply_mcp_poolable`` / ``_wire_mcp_gateway_dashboard``."""
+    """``_stop_mcp_broker`` / ``_apply_mcp_stub`` / ``_wire_mcp_gateway_dashboard``."""
 
     @pytest.mark.asyncio
     async def test_stop_is_a_noop_without_a_broker(self):
@@ -963,39 +1151,62 @@ class TestStopAndApplyMcpBroker:
         assert orch._mcp_gateway_manager is None
 
     @pytest.mark.asyncio
-    async def test_apply_poolable_without_a_broker_reports_not_applied(self):
+    async def test_apply_stub_reports_not_applied_and_asks_for_a_restart(self):
+        """``applied: False`` is the designed outcome, not a failure.
+
+        Nothing is applied in place any more, so there is no "reached state" to
+        compare against the wanted one. The pair the dashboard needs is
+        ``applied: False`` plus ``restart_required: True``: the first stops the
+        switch being drawn as live, the second stops that being read as an error.
+        """
         orch = _make_orchestrator()
         orch._mcp_gateway_manager = None
+
+        async def _init_that_must_not_run() -> None:  # pragma: no cover
+            raise AssertionError("apply must not start a broker")
+
+        orch._init_mcp_gateway = _init_that_must_not_run
+
         cfg = KiroCrewConfig()
-        cfg.mcp_gateway.poolable_servers = ["beta", "alpha"]
+        cfg.mcp_gateway.stub_servers = ["beta", "alpha"]
         with patch.object(KiroCrewConfig, "load", return_value=cfg):
-            out = await orch._apply_mcp_poolable()
-        assert out == {"applied": False, "poolable_servers": ["alpha", "beta"]}
+            out = await orch._apply_mcp_stub()
+        assert out == {
+            "applied": False,
+            "restart_required": True,
+            "stub_servers": ["alpha", "beta"],
+        }
 
     @pytest.mark.asyncio
-    async def test_apply_poolable_restarts_the_broker_and_republishes_it(self):
+    async def test_apply_stub_leaves_a_live_broker_alone(self):
+        """The drain is the destructive part: sessions attached to this manager
+        lose their in-flight tool calls to it and never re-handshake."""
         orch = _make_orchestrator()
         old = MagicMock()
         old.shutdown = AsyncMock()
         orch._mcp_gateway_manager = old
         ds = _mock_dashboard_state()
+        ds._mcp_gateway_manager = old
         orch.dashboard_state = ds
 
-        new = MagicMock()
+        async def _init_that_must_not_run() -> None:  # pragma: no cover
+            raise AssertionError("apply must not respawn the broker")
 
-        async def _fake_init() -> None:
-            orch._mcp_gateway_manager = new
-
-        orch._init_mcp_gateway = _fake_init
+        orch._init_mcp_gateway = _init_that_must_not_run
 
         cfg = KiroCrewConfig()
-        cfg.mcp_gateway.poolable_servers = ["alpha"]
+        cfg.mcp_gateway.stub_servers = ["alpha"]
         with patch.object(KiroCrewConfig, "load", return_value=cfg):
-            out = await orch._apply_mcp_poolable()
+            out = await orch._apply_mcp_stub()
 
-        old.shutdown.assert_awaited_once()
-        assert out == {"applied": True, "poolable_servers": ["alpha"]}
-        assert ds._mcp_gateway_manager is new
+        old.shutdown.assert_not_awaited()
+        assert orch._mcp_gateway_manager is old
+        assert ds._mcp_gateway_manager is old
+        assert out == {
+            "applied": False,
+            "restart_required": True,
+            "stub_servers": ["alpha"],
+        }
 
     def test_wire_dashboard_is_a_noop_without_dashboard_state(self):
         orch = _make_orchestrator()
@@ -1013,7 +1224,7 @@ class TestStopAndApplyMcpBroker:
 
         assert ds._mcp_gateway_manager is mgr
         assert ds._mcp_gateway_apply == orch._apply_mcp_gateway_enabled
-        assert ds._mcp_gateway_apply_poolable == orch._apply_mcp_poolable
+        assert ds._mcp_gateway_apply_stub == orch._apply_mcp_stub
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1112,6 +1323,9 @@ class TestFireDashboardNudgeDispatch:
         ds = _mock_dashboard_state()
         slot = MagicMock()
         slot.running = False
+        # Real _ChatSlot defaults this False; a bare MagicMock returns a truthy
+        # Mock and would make the nudge defer on the busy guard.
+        slot._in_stage_execution = False
         slot.key = "chat-1"
         ds.get_slot.return_value = slot
         orch.dashboard_state = ds
@@ -1150,6 +1364,7 @@ class TestFireDashboardNudgeDispatch:
 
         restored = MagicMock()
         restored.running = False
+        restored._in_stage_execution = False
         restored.key = "chat-9"
 
         async def _rehydrate(_state, _key, *, adopt_closed=False):

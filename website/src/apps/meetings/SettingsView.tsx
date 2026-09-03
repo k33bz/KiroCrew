@@ -7,7 +7,7 @@
 
 import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, CalendarClock, ListChecks, Plus, Trash2 } from 'lucide-react'
+import { ArrowLeft, ArrowRight, CalendarClock, Languages, ListChecks, Plus, Trash2 } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import SimpleSelect from '../../components/SimpleSelect'
@@ -29,6 +29,7 @@ import {
   type ConfigResponse,
   type MeetingsConfig,
 } from './api'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 interface Props {
   onBack: () => void
@@ -36,8 +37,12 @@ interface Props {
 }
 
 export default function SettingsView({ onBack, notify }: Props) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
-  const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config })
+  // `patch()` builds a full-replace PUT from this cache, so a backgrounded tab
+  // with stale cache would silently revert settings changed from another tab.
+  // Finite staleTime lets focus-refetch fire here (global default is Infinity).
+  const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config, staleTime: 30_000 })
   const dictionaryQuery = useQuery({
     queryKey: ['meetings', 'dictionary'],
     queryFn: meetingsApi.dictionary,
@@ -50,6 +55,7 @@ export default function SettingsView({ onBack, notify }: Props) {
   const config = configQuery.data?.config
   const calendarProviders = configQuery.data?.calendar_providers ?? []
   const taskProviders = configQuery.data?.task_providers ?? []
+  const translationLanguages = configQuery.data?.translation_languages ?? []
   const terms = dictionaryQuery.data?.terms ?? []
 
   const saveConfig = useMutation({
@@ -164,7 +170,7 @@ export default function SettingsView({ onBack, notify }: Props) {
           </Btn>
         }
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <Card>
           <CardTitle>
             <ListChecks className="lucide-inline" />
@@ -183,6 +189,29 @@ export default function SettingsView({ onBack, notify }: Props) {
           />
         </Card>
 
+        <Card>
+          <CardTitle>
+            <Languages className="lucide-inline" />
+            {i18nT('apps.meetings.settings.translationTitle')}
+          </CardTitle>
+          <p className="text-[13px] text-muted mb-3">
+            {i18nT('apps.meetings.settings.translationHelp')}
+          </p>
+          {/* "Off" is the default and the only translated entry here — every other
+              option is a language's own endonym, which is exactly what a reader
+              looking for that language will recognise. */}
+          <SimpleSelect
+            options={['', ...translationLanguages.map(row => row.id)]}
+            optionLabels={[
+              i18nT('apps.meetings.settings.translationOff'),
+              ...translationLanguages.map(row => row.label),
+            ]}
+            value={config?.translation_language ?? ''}
+            aria-label={i18nT('apps.meetings.settings.translationTitle')}
+            onChange={value => patch({ translation_language: value })}
+            style={{ maxWidth: 280 }}
+          />
+        </Card>
         <Card>
           <CardTitle>
             <CalendarClock className="lucide-inline" />
@@ -314,9 +343,7 @@ export default function SettingsView({ onBack, notify }: Props) {
               className="w-48"
               placeholder={i18nT('apps.meetings.settings.correctPlaceholder')}
               aria-label={i18nT('apps.meetings.settings.correctLabel')}
-              onKeyDown={e => {
-                if (e.key === 'Enter') submitTerm()
-              }}
+              {...ime.bindEnter({ onEnter: submitTerm })}
             />
             <SendBtn onClick={submitTerm} aria-label={i18nT('apps.meetings.settings.addTerm')}>
               <Plus className="lucide-inline" />

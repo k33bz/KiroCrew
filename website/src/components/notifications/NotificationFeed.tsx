@@ -208,8 +208,9 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
   const resolveApprovalNote = useCallback((n: Notification, action: 'approve' | 'reject') => {
     api.resolveApproval(n.approval_id || n.ts, action)
       .then(() => { dispatch(deleteNotification(n.ts)) })
-      // eslint-disable-next-line no-console -- intentional failure diagnostic;
-      // the row stays in the feed and remains retryable (detail panel too).
+      // Intentional failure diagnostic; the row stays in the feed and remains
+      // retryable (detail panel too).
+      // eslint-disable-next-line no-console
       .catch(err => { console.error(`Inline ${action} failed`, err) })
   }, [dispatch])
 
@@ -230,7 +231,13 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
         className={`px-2 py-1 rounded-md text-[12px] font-medium cursor-pointer border border-dashed transition-all font-body ${showMuted ? 'bg-bg-hover text-text border-border-strong' : 'bg-transparent text-muted border-border hover:text-text hover:border-border-strong'}`}
         onClick={() => setShowMuted(v => !v)}
       >
-        <BellOff className="lucide-inline" /> {i18nT('components.notifications.notificationFeed.muted_count', { count: silencedCount })}
+        {/* The label names the ACTION the press performs, not the state the rows
+            are in: "Muted (3)" left it ambiguous whether pressing reveals muted
+            rows or mutes something. Both halves keep the count in parentheses so
+            neither needs a plural form. */}
+        <BellOff className="lucide-inline" /> {showMuted
+          ? i18nT('components.notifications.notificationFeed.hide_muted_count', { count: silencedCount })
+          : i18nT('components.notifications.notificationFeed.show_muted_count', { count: silencedCount })}
       </button>
     </div>
   ) : null
@@ -248,7 +255,7 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
           floating card (search above the disclosure); panel mode puts the
           disclosure first, directly on the popover surface. */}
       {mac ? (
-        <div className="notif-material rounded-2xl bg-[color-mix(in_srgb,var(--card)_55%,transparent)] backdrop-blur-2xl backdrop-saturate-150 shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)] border border-[color-mix(in_srgb,var(--border)_55%,transparent)] px-2.5 pt-2 pb-1 mb-2 shrink-0">
+        <div className="notif-material rounded-2xl bg-[color-mix(in_srgb,var(--card)_72%,transparent)] backdrop-blur-2xl backdrop-saturate-150 shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)] border border-[color-mix(in_srgb,var(--border)_55%,transparent)] px-2.5 pt-2 pb-1 mb-2 shrink-0">
           <div className="flex items-center gap-1.5">
             <div className="flex-1 min-w-0">{header}</div>
             {unread > 0 && (
@@ -301,7 +308,7 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                 // (#1817). Keep the hook on every translucent mac-variant surface.
                 const macCard = silenced
                   ? 'bg-[color-mix(in_srgb,var(--card)_35%,transparent)] backdrop-blur-xl border border-dashed border-[color-mix(in_srgb,var(--border)_70%,transparent)]'
-                  : `bg-[color-mix(in_srgb,var(--card)_55%,transparent)] backdrop-blur-2xl backdrop-saturate-150 shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)] ${active ? 'border border-accent bg-accent-subtle' : 'border border-[color-mix(in_srgb,var(--border)_55%,transparent)] hover:bg-[color-mix(in_srgb,var(--card)_70%,transparent)]'}`
+                  : `bg-[color-mix(in_srgb,var(--card)_72%,transparent)] backdrop-blur-2xl backdrop-saturate-150 shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)] ${active ? 'border border-accent bg-accent-subtle' : 'border border-[color-mix(in_srgb,var(--border)_55%,transparent)] hover:bg-[color-mix(in_srgb,var(--card)_82%,transparent)]'}`
                 const panelBorder = silenced ? 'border-l-muted' : prio === 'critical' ? 'border-l-danger' : km.borderColor
                 const contentDim = silenced ? 'opacity-50' : (n.acked && !active) || prio === 'passive' ? (mac ? 'opacity-55' : '') : ''
                 const promptChannel = promptTs === n.ts && n.channel && n.source
@@ -413,8 +420,8 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                         stack -- click anywhere on the head to expand. */}
                     {mac && collapsedStack && (
                       <div aria-hidden className="mb-2">
-                        <div className={`notif-material relative z-[1] h-3 -mt-1.5 mx-2 rounded-b-2xl ${silenced ? 'bg-[color-mix(in_srgb,var(--card)_30%,transparent)]' : 'bg-[color-mix(in_srgb,var(--card)_45%,transparent)]'} backdrop-blur-xl border border-t-0 border-[color-mix(in_srgb,var(--border)_45%,transparent)] shadow-[0_4px_12px_rgba(0,0,0,.06)]`} />
-                        <div className="notif-material relative z-0 h-3 -mt-1.5 mx-4 rounded-b-2xl bg-[color-mix(in_srgb,var(--card)_35%,transparent)] backdrop-blur-lg border border-t-0 border-[color-mix(in_srgb,var(--border)_35%,transparent)]" />
+                        <div className={`notif-material relative z-[1] h-3 -mt-1.5 mx-2 rounded-b-2xl ${silenced ? 'bg-[color-mix(in_srgb,var(--card)_30%,transparent)]' : 'bg-[color-mix(in_srgb,var(--card)_58%,transparent)]'} backdrop-blur-xl border border-t-0 border-[color-mix(in_srgb,var(--border)_45%,transparent)] shadow-[0_4px_12px_rgba(0,0,0,.06)]`} />
+                        <div className="notif-material relative z-0 h-3 -mt-1.5 mx-4 rounded-b-2xl bg-[color-mix(in_srgb,var(--card)_45%,transparent)] backdrop-blur-lg border border-t-0 border-[color-mix(in_srgb,var(--border)_35%,transparent)]" />
                       </div>
                     )}
                     {promptChannel && (

@@ -17,15 +17,20 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
 from conftest import MockSlackClient
 from kiro_crew.cron import CronJob, CronSchedule, CronStoreBusy
+from kiro_crew.messaging import auto_title as auto_title_mod
+from kiro_crew.messaging import commands as mc
+from kiro_crew.messaging import privacy_mode
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import NO_EXPIRY_TEXT, fmt_grant_duration
 from kiro_crew.slack import handler as h
+from kiro_crew.task_models import Project, Task, TaskStatus
+from kiro_crew.task_reporter import build_status
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -84,6 +89,7 @@ def sessions():
     sm = MagicMock()
     sm.remove = AsyncMock()
     sm.destroy = AsyncMock()
+    sm.discard_conversation = AsyncMock()
     sm.stop_turn = AsyncMock(return_value="soft")
     sm.try_acquire = AsyncMock(return_value=False)
     sm.has_session = MagicMock(return_value=False)
@@ -106,6 +112,39 @@ def _reply(value: str | None) -> str:
     """Assert a handler returned a reply and narrow it to ``str``."""
     assert value is not None
     return value
+
+
+class _LiveTask:
+    """Stand-in for an in-flight asyncio task; ``build_status`` only calls done()."""
+
+    @staticmethod
+    def done() -> bool:
+        return False
+
+
+def _running_status(*, completed: int = 2, total: int = 5, current: int = 3) -> dict:
+    """A real ``build_status()`` payload for one in-flight run.
+
+    Built from real ``Project``/``Task`` objects instead of hand-written keys:
+    progress lives per run inside ``runs``, and there is no top-level
+    ``completed``/``steps``/``current_step``. Asserting against an invented
+    top-level shape is what let a renderer read fields the payload never
+    carries.
+    """
+    statuses = [TaskStatus.PASSED] * completed + [TaskStatus.PENDING] * (total - completed)
+    run = Project(
+        spec_path="/tmp/spec.md",
+        spec_content="",
+        task_id="live",
+        name="Live Task",
+        status="executing",
+        current_task=current,
+        tasks=[
+            Task(index=i + 1, title=f"t{i + 1}", description="", status=s)
+            for i, s in enumerate(statuses)
+        ],
+    )
+    return build_status({"live": run}, {"live": _LiveTask()}, "kirocrew")
 
 
 async def _slash(cmd, slack_client, sessions_double, *, user="U1", log=None, session="t1"):
@@ -309,7 +348,9 @@ class TestAgentCommand:
         assert "Reset to default agent." in _texts(slack)
 
     @pytest.mark.asyncio
-    async def test_write_failure_surfaces_error(self, slack, sessions, owner, agents_dir, monkeypatch):
+    async def test_write_failure_surfaces_error(
+        self, slack, sessions, owner, agents_dir, monkeypatch
+    ):
         def _boom(_name):
             raise ValueError("read-only config")
 
@@ -535,9 +576,12 @@ class TestChannelCommand:
         from kiro_crew.config.loader import config_path
 
         await _slash("!channel agent demo", slack, sessions)
-        assert json.loads(config_path().read_text(encoding="utf-8"))["slack"]["channels"]["C1"][
-            "agent"
-        ] == "demo"
+        assert (
+            json.loads(config_path().read_text(encoding="utf-8"))["slack"]["channels"]["C1"][
+                "agent"
+            ]
+            == "demo"
+        )
         slack.actions.clear()
         await _slash("!channel agent off", slack, sessions)
         assert "default" in _texts(slack)
@@ -557,7 +601,10 @@ class TestKeywordCommands:
 
     @pytest.mark.asyncio
     async def test_sessions_keyword_allowed(self, slack, sessions, owner, monkeypatch):
-        monkeypatch.setattr(h, "_collect_recent_sessions", lambda s, limit=0: [])
+        monkeypatch.setattr(
+            "kiro_crew.slack.sessions_view._collect_recent_sessions",
+            lambda s, limit=0, kind=None: [],
+        )
         handled = await h.maybe_handle_keyword_command(
             "sessions", slack, sessions, "C1", "t1", "msg1", "t1", "U1"
         )
@@ -603,7 +650,9 @@ class TestKeywordCommands:
         saver.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_spawn_keyword_skips_log_when_incognito(self, slack, sessions, owner, monkeypatch):
+    async def test_spawn_keyword_skips_log_when_incognito(
+        self, slack, sessions, owner, monkeypatch
+    ):
         saver = AsyncMock()
         monkeypatch.setattr(h, "save_conversation_turn_off_loop", saver)
         h._mark_incognito("t1")
@@ -708,17 +757,17 @@ class TestSpawnHelpers:
         assert h._handle_spawn_command("spawn   ", MagicMock()) is None
 
     def test_list_with_no_agents(self):
-        assert h._do_spawn("list", MagicMock(running=[])) == "No subagents running."
+        assert mc.spawn_task_reply("list", MagicMock(running=[])) == "No subagents running."
 
     def test_status_lists_running_agents(self):
         agent = MagicMock(id="a7", started=time.time() - 5, task="reindex the corpus")
-        out = _reply(h._do_spawn("status", MagicMock(running=[agent])))
+        out = _reply(mc.spawn_task_reply("status", MagicMock(running=[agent])))
         assert "a7" in out and "reindex the corpus" in out
 
     def test_capacity_reached(self):
         mgr = MagicMock(max_concurrent=3)
         mgr.spawn.return_value = None
-        assert "capacity reached (3)" in _reply(h._do_spawn("work", mgr))
+        assert "capacity reached (3)" in _reply(mc.spawn_task_reply("work", mgr))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -758,7 +807,9 @@ class TestCronHelpers:
     async def test_remove_found_and_missing(self):
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(return_value=True)
-        assert "Removed cron job" in _reply(await h._handle_cron_command("cron remove j1", svc, "C", "t"))
+        assert "Removed cron job" in _reply(
+            await h._handle_cron_command("cron remove j1", svc, "C", "t")
+        )
         svc.remove_job_async = AsyncMock(return_value=False)
         assert "not found" in _reply(await h._handle_cron_command("cron remove j1", svc, "C", "t"))
 
@@ -789,14 +840,19 @@ class TestCronHelpers:
     async def test_remove_all_empty(self):
         svc = MagicMock()
         svc.list_jobs.return_value = []
-        assert await h._remove_all_jobs(svc) == "No cron jobs to remove."
+        assert await mc.cron_remove_all_reply(svc, source="slack", caller="U1") == (
+            "No cron jobs to remove."
+        )
 
     @pytest.mark.asyncio
     async def test_remove_all_reports_each_job(self):
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1"), _job("j2")]
-        svc.remove_jobs = AsyncMock()
-        out = await h._remove_all_jobs(svc)
+        # remove_jobs returns (removed_ids, missing_ids); the shared reply unpacks
+        # it for the SEL batch audit, which now covers every channel rather than
+        # only Slack's own copy of the command.
+        svc.remove_jobs = AsyncMock(return_value=(["j1", "j2"], []))
+        out = await mc.cron_remove_all_reply(svc, source="slack", caller="U1")
         assert "Removed 2 cron job(s)" in out and "`j1`" in out and "`j2`" in out
 
     @pytest.mark.asyncio
@@ -804,7 +860,7 @@ class TestCronHelpers:
         svc = MagicMock()
         svc.list_jobs.return_value = [_job()]
         svc.remove_jobs = AsyncMock(side_effect=CronStoreBusy())
-        assert "busy" in (await h._remove_all_jobs(svc))
+        assert "busy" in (await mc.cron_remove_all_reply(svc, source="slack", caller="U1"))
 
     @pytest.mark.asyncio
     async def test_remove_all_via_cron_remove_all(self):
@@ -838,13 +894,7 @@ class TestRunHelper:
     @pytest.mark.asyncio
     async def test_status_when_running(self, slack):
         runner = MagicMock(running=True)
-        runner.status.return_value = {
-            "running": True,
-            "status": "executing",
-            "completed": 2,
-            "steps": 5,
-            "current_step": 3,
-        }
+        runner.status.return_value = _running_status()
         out = _reply(await h._handle_run_command("task run status", runner, slack, "C", "t"))
         assert "2/5" in out and "executing" in out
 
@@ -855,14 +905,18 @@ class TestRunHelper:
             "No task running."
         )
         busy = MagicMock(running=True)
-        assert "cancelled" in _reply(await h._handle_run_command("task run cancel", busy, slack, "C", "t"))
+        assert "cancelled" in _reply(
+            await h._handle_run_command("task run cancel", busy, slack, "C", "t")
+        )
         busy.cancel.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_missing_spec_file(self, slack, tmp_path):
         runner = MagicMock(running=False)
         out = _reply(
-            await h._handle_run_command(f"task run {tmp_path / 'absent.md'}", runner, slack, "C", "t")
+            await h._handle_run_command(
+                f"task run {tmp_path / 'absent.md'}", runner, slack, "C", "t"
+            )
         )
         assert "Spec file not found" in out
 
@@ -891,16 +945,19 @@ class TestRunHelper:
 class TestSessionsHelper:
     @pytest.mark.asyncio
     async def test_collector_failure_is_audited(self, slack, monkeypatch):
-        def _boom(_sessions, limit=0):
+        def _boom(_sessions, limit=0, kind=None):
             raise OSError("history unreadable")
 
-        monkeypatch.setattr(h, "_collect_recent_sessions", _boom)
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._collect_recent_sessions", _boom)
         await h._handle_sessions_command("sessions", slack, "C1", "t1", "msg1", "t1", None)
         assert "_Sessions unavailable._" in _texts(slack)
 
     @pytest.mark.asyncio
     async def test_rows_render_blocks(self, slack, monkeypatch):
-        monkeypatch.setattr(h, "_collect_recent_sessions", lambda s, limit=0: [{"key": "s1"}])
+        monkeypatch.setattr(
+            "kiro_crew.slack.sessions_view._collect_recent_sessions",
+            lambda s, limit=0, kind=None: [{"key": "s1"}],
+        )
         monkeypatch.setattr(h, "_build_sessions_blocks", lambda rows: [{"type": "divider"}])
         await h._handle_sessions_command("sessions", slack, "C1", "t1", "msg1", "t1", None)
         assert [a for a in slack.actions if a[0] == "blocks"]
@@ -1045,6 +1102,47 @@ class TestThreadOverrideHydration:
 # ──────────────────────────────────────────────────────────────────────
 # privacy modifiers
 # ──────────────────────────────────────────────────────────────────────
+class TestSharedPrivacyDelegation:
+    """The Slack names are wrappers over ``messaging.privacy_mode``, and the two
+    LRU dicts are the SAME objects.
+
+    Identity is what the ~45 enforcement sites in this package, the dashboard
+    predicates, and the autouse ``_clean_slack_thread_state`` conftest fixture all
+    rely on: each reaches the tracker through the Slack spelling while the shared
+    module reads its own name. A copy would leave a session restricted on one side
+    and not the other, silently.
+    """
+
+    def test_the_trackers_are_the_shared_objects(self):
+        """Mutation: rebind ``_thread_temporary`` to a fresh ``OrderedDict()`` —
+        red, and every conftest-cleared test leaks privacy state across files."""
+        assert h._thread_temporary is privacy_mode._temporary
+        assert h._thread_incognito is privacy_mode._incognito
+        assert h._titled_threads is auto_title_mod._titled
+
+    def test_the_predicates_delegate(self):
+        assert h.is_thread_temporary is privacy_mode.is_temporary
+        assert h.is_thread_incognito is privacy_mode.is_incognito
+        assert h._TEMPORARY_TOKEN_RE is privacy_mode.TEMPORARY_TOKEN_RE
+        assert h._INCOGNITO_TOKEN_RE is privacy_mode.INCOGNITO_TOKEN_RE
+
+    def test_the_slack_restricted_predicate_is_namespace_agnostic(self):
+        """The dashboard's ``_is_restricted_session`` now reaches this for every
+        channel, so it must answer for a non-Slack key.
+
+        Mutation: narrow ``_is_slack_restricted`` to
+        ``session_key.startswith("slack:") and privacy_mode.is_restricted(...)`` —
+        red here while every Slack test stays green.
+        """
+        key = "telegram:kirocrew:direct:4242"
+        privacy_mode.mark_incognito(key)
+        assert h._is_slack_restricted(key) is True
+
+    def test_the_shared_module_sees_a_slack_mark(self):
+        h._mark_temporary("slack:1.2")
+        assert privacy_mode.is_restricted("slack:1.2") is True
+
+
 class TestPrivacyModifiers:
     def test_token_strippers(self):
         assert h._strip_temporary_token("hi there") == ("hi there", False)
@@ -1117,7 +1215,9 @@ class TestPrivacyModifiers:
         await h._apply_incognito_modifier("t1", "U1", "C1", slack, sessions, "t1")
         # Assert real durability rather than that set_flag was called: a FRESH
         # map must read both flags back off disk, which is the property the
-        # restart path actually depends on.
+        # restart path actually depends on. Loop-side mutations defer their
+        # disk write, so force the flush — the deterministic durability point.
+        sessions._session_map.flush()
         fresh = SessionMap()
         assert fresh.get_flag("t1", "temporary") is True
         assert fresh.get_flag("t1", "incognito") is True
@@ -1150,22 +1250,24 @@ class TestPrivacyModifiers:
         h._hydrate_conv_flags(sessions, "t1")
         assert h.is_thread_temporary("t1") and h.is_thread_incognito("t1")
 
+    # The caps live on the shared modules the Slack names now delegate to, so the
+    # monkeypatch has to land where the eviction check reads it.
     def test_temporary_lru_evicts_oldest(self, monkeypatch):
-        monkeypatch.setattr(h, "_THREAD_TEMPORARY_MAX", 2)
+        monkeypatch.setattr(privacy_mode, "PRIVACY_LRU_MAX", 2)
         for key in ("a", "b", "c"):
             h._mark_temporary(key)
         assert not h.is_thread_temporary("a")
         assert h.is_thread_temporary("c")
 
     def test_incognito_lru_evicts_oldest(self, monkeypatch):
-        monkeypatch.setattr(h, "_THREAD_INCOGNITO_MAX", 1)
+        monkeypatch.setattr(privacy_mode, "PRIVACY_LRU_MAX", 1)
         h._mark_incognito("a")
         h._mark_incognito("b")
         assert not h.is_thread_incognito("a")
         assert h.is_thread_incognito("b")
 
     def test_titled_lru_evicts_oldest(self, monkeypatch):
-        monkeypatch.setattr(h, "_TITLED_THREADS_MAX", 1)
+        monkeypatch.setattr(auto_title_mod, "TITLE_LRU_MAX", 1)
         h._mark_titled("a", "auto")
         h._mark_titled("b", "manual")
         assert "a" not in h._titled_threads
@@ -1294,9 +1396,7 @@ class TestHandleInteractionGuards:
         provider = MagicMock()
         provider.approve_tool = AsyncMock()
         h._pending_approvals["C1:m1"] = h._PendingApproval(provider, "r1", "sess-9")
-        out = await h.handle_interaction(
-            "C1", "m1", h._ACTION_TRUST, "U1", sessions=sessions
-        )
+        out = await h.handle_interaction("C1", "m1", h._ACTION_TRUST, "U1", sessions=sessions)
         assert out == h._ACTION_TRUST
         assert h.is_slack_session_trusted("sess-9")
         sessions.set_approval_policy.assert_called_once_with("sess-9", "auto")
@@ -1347,9 +1447,7 @@ class TestLinkedApprovals:
         state = MagicMock()
         state.resolve_approval.return_value = False
         monkeypatch.setattr(h, "_dashboard_state", state)
-        ts = _reply(
-            await h.post_linked_approval(slack, "C1", "t1", "r9", "slot-1", "Delete prod")
-        )
+        ts = _reply(await h.post_linked_approval(slack, "C1", "t1", "r9", "slot-1", "Delete prod"))
         out = await h.handle_interaction("C1", ts, h._ACTION_REJECT, "U1")
         assert out == h._ACTION_REJECT
         state.resolve_approval.assert_called_once_with("r9", False)
@@ -1400,7 +1498,8 @@ class TestRouteLinkedThread:
         state.get_linked_slot.return_value = slot
         monkeypatch.setattr(h, "_dashboard_state", state)
         assert await h.maybe_route_linked_thread("do it", "t1", "U1", "C1", slack, "t1") is True
-        slot.queue_append.assert_called_once_with("do it")
+        # meta carries the admission-time containment snapshot (#5911).
+        slot.queue_append.assert_called_once_with("do it", meta=ANY, directive_user_origin=True)
         slot.append.assert_called_once()
         state.push_slots_update.assert_called_once()
 
@@ -1691,9 +1790,7 @@ class TestPureHelpers:
         _, text = h.build_timing_footer(125.0)
         assert text == "Finished in 2m 5s"
 
-    @pytest.mark.parametrize(
-        ("pct", "icon"), [(80, "🔴"), (60, "🟠"), (40, "🟡"), (5, "🟢")]
-    )
+    @pytest.mark.parametrize(("pct", "icon"), [(80, "🔴"), (60, "🟠"), (40, "🟡"), (5, "🟢")])
     def test_timing_footer_context_icon(self, pct, icon):
         client = MagicMock()
         client.context_usage_pct.return_value = pct
@@ -1757,15 +1854,15 @@ class TestPureHelpers:
             h.disable_yolo()
 
     def test_disable_yolo_when_inactive_is_a_no_op(self):
-        h._trusted_sessions.add("t1")
+        h.add_trusted_session("t1")
         h.disable_yolo()
-        assert "t1" in h._trusted_sessions
+        assert h.is_session_trusted("t1")
 
     def test_disable_yolo_clears_trusted_sessions(self):
         h.enable_yolo_with_ttl(600)
-        h._trusted_sessions.add("t1")
+        h.add_trusted_session("t1")
         h.disable_yolo()
-        assert not h._trusted_sessions
+        assert not h.is_session_trusted("t1")
 
     def test_is_owner_cross_matches_w_and_u_prefixes(self, monkeypatch):
         monkeypatch.setattr(h, "_owner_id", "U123")
@@ -1846,10 +1943,20 @@ class TestPureHelpers:
         assert not own
 
     def test_should_auto_approve_spawn(self):
+        from types import SimpleNamespace
+
         builder = MagicMock()
         builder.is_auto_approved_spawn.return_value = True
-        assert h._should_auto_approve_spawn(builder, "spawn_run") is True
-        assert h._should_auto_approve_spawn(None, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert h._should_auto_approve_spawn(builder, event) is True
+        assert h._should_auto_approve_spawn(None, event) is False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1972,11 +2079,18 @@ class TestCompactCommand:
         assert "Compaction timed out." in _texts(slack)
 
     @pytest.mark.asyncio
-    async def test_exception_destroys_the_session(self, slack, sessions):
+    async def test_exception_discards_the_conversation(self, slack, sessions):
+        """The wedged conversation goes; the session's channel identity stays.
+
+        ``discard_conversation`` shuts the provider down and drops the resume
+        sid exactly like ``destroy``, but keeps the session-map entry that
+        carries the thread linkage.
+        """
         provider = MagicMock()
         provider.compact = AsyncMock(side_effect=RuntimeError("stdio died"))
         sessions.try_acquire = AsyncMock(return_value=True)
         sessions.get_provider = MagicMock(return_value=provider)
         await h._handle_compact_command(slack, sessions, "C1", "t1", "msg1", "t1")
         assert "Compaction failed unexpectedly." in _texts(slack)
-        sessions.destroy.assert_awaited_once_with("t1")
+        sessions.discard_conversation.assert_awaited_once_with("t1")
+        sessions.destroy.assert_not_awaited()

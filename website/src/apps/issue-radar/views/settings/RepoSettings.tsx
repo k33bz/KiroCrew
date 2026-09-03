@@ -8,7 +8,7 @@ import {
   issueRadarApi, DEFAULT_REPO_SETTINGS, SettingsConflictError,
   type RepoSettings, type RepoLabel, type Issue, type RepoMember, type RepoRef,
 } from '../../api'
-import { repoWebUrl, userUrlFor, membersUrlFor, providerTerms, repoScopeKey } from '../../lib/links'
+import { repoWebUrl, userUrlFor, membersUrlFor, providerTerms, repoScopeKey, sameRepoRef } from '../../lib/links'
 import { useIssueRadar } from '../../context'
 import ReadOnlyTag, { isReadOnly } from '../../components/ReadOnlyTag'
 import LabelPicker from '../../components/LabelPicker'
@@ -80,12 +80,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
   const { repos, active, openSettings, openDashboard, switchRepo } = useIssueRadar()
   // Full-identity match: the same slug can exist on two providers, and a loose
   // match would show the other repo's permissions and settings.
-  const entry = repos.find(
-    (r) => r.owner === owner
-      && r.repo === repo
-      && (r.provider || 'github') === (repoRef.provider || 'github')
-      && (r.host || 'github.com') === (repoRef.host || 'github.com'),
-  )
+  const entry = repos.find((r) => sameRepoRef(r, repoRef))
 
   const labelsQuery = useQuery({
     queryKey: ['issue-radar', 'labels', scopeKey],
@@ -333,8 +328,11 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
   // the untagged issues they get applied to; this page keeps only the LOCAL
   // definitions above. See views/tagging/LabelsPanel.tsx.
 
+  // Narrow-first gutter, same value and same reason as GeneralSettings — the
+  // rail routes between the two, so a differing gutter would shift the page
+  // sideways as you moved between them.
   return (
-    <div className="w-full max-w-6xl px-8 py-8">
+    <div className="w-full max-w-6xl px-4 py-8 md:px-8">
       {/* Header */}
       <div className="flex items-center gap-3 mb-1 flex-wrap">
         <ProviderLogo repoRef={repoRef} size={20} />
@@ -342,7 +340,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
         {/* Only rendered for a self-managed instance, where it is the only thing
             distinguishing this project from a same-named one on the public site. */}
         <ProviderHostTag repoRef={repoRef} />
-        {isReadOnly(entry?.permissions) && <ReadOnlyTag />}
+        {isReadOnly(entry?.permissions) && <ReadOnlyTag repoRef={entry} />}
         <a
           href={repoWebUrl(repoRef)}
           target="_blank"
@@ -463,10 +461,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
             // Only when it actually differs, though — switchRepo resets the saved
             // issue and PR filters, which would be a surprising side effect of
             // navigating within the repo you are already on.
-            const sameActive = active.owner === owner
-              && active.repo === repo
-              && (active.provider || 'github') === (repoRef.provider || 'github')
-              && (active.host || 'github.com') === (repoRef.host || 'github.com')
+            const sameActive = sameRepoRef(active, repoRef)
             if (!sameActive) switchRepo(repoRef)
             openDashboard('tagging')
           }}

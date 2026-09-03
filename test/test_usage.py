@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_context_tokens,
     read_effective_agent,
     read_effective_model,
+    read_turn_model,
 )
 
 # ── _parse_sessions ─────────────────────────────────────────────────────
@@ -51,7 +53,11 @@ class TestParseSessions:
         ):
             result = _parse_sessions()
             assert "error" in result
-            assert "boom" in result["error"]
+            # The OSError carries a filesystem path; it stays server-side. The
+            # returned `error` is a generic message with a machine-readable code.
+            assert "boom" not in result["error"]
+            assert result["error"] == "cannot read sessions directory"
+            assert result["code"] == "sessions_dir_unreadable"
 
     def test_skips_non_jsonl(self, tmp_path):
         d = tmp_path / "cli"
@@ -71,6 +77,44 @@ class TestParseSessions:
         ):
             r = _parse_sessions()
             assert r["total_sessions"] == 0
+
+    def test_refused_transcripts_are_reported_not_swallowed(self, tmp_path, caplog):
+        """#6733: a refused transcript is skipped, and the skip must leave a
+        trace. Before this, a home whose every transcript the path validator
+        refused rendered as a legitimate "zero sessions" with nothing logged.
+
+        Asserted on the LOG, not the payload: the count is deliberately not an
+        API field while no renderer reads it (First Principles review on #7285).
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        _write_session(d / "s1.jsonl", [{"kind": "Prompt"}])
+        _write_session(d / "s2.jsonl", [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=None
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 0
+        # One aggregated record, not one per file: a UNC home refuses every
+        # transcript, and per-file logging would emit thousands.
+        refusals = [
+            rec for rec in caplog.records if "refused by path validation" in rec.getMessage()
+        ]
+        assert len(refusals) == 1
+        assert "2" in refusals[0].getMessage()
+
+    def test_no_refusal_log_when_every_transcript_validates(self, tmp_path, caplog):
+        """The counterpart: the healthy path stays quiet."""
+        d = tmp_path / "cli"
+        d.mkdir()
+        f = d / "s1.jsonl"
+        _write_session(f, [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=str(f)
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 1
+        assert not [rec for rec in caplog.records if "refused" in rec.getMessage()]
 
     def test_stat_oserror(self, tmp_path):
         d = tmp_path / "cli"
@@ -902,6 +946,37 @@ class TestBuildTokenRecordContextFields:
         assert rec["context_window"] == 0
         json.dumps(rec)  # must not raise
 
+    def test_stop_reason_recorded_from_event(self):
+        """The row carries the turn's terminal stop reason so watchdog outcomes
+        (tool_stall / stale_recover) can be joined against the free-form
+        ``agent`` field retroactively — per-agent stall analysis happens HERE,
+        not on OTel attrs (cardinality rule)."""
+        from types import SimpleNamespace
+
+        ev = SimpleNamespace(usage=None, stop_reason="error: tool stall")
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", ev, "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == "error: tool stall"
+        json.dumps(rec)  # must not raise
+
+    def test_stop_reason_defaults_empty_and_tolerates_non_string(self):
+        # A bare TurnUsage-shaped event (provider_last_turn_usage) has no
+        # stop_reason; a non-string on a test double must not break json.dumps.
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", self._event(), "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == ""
+
+        from types import SimpleNamespace
+
+        weird = SimpleNamespace(usage=None, stop_reason=1234)
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", weird, "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == ""
+        json.dumps(rec)
+
     def test_backcompat_defaults_when_no_kwargs(self):
         # Called positionally with no new kwargs (mirrors every legacy caller):
         # the original keys are unchanged and the new keys default to ""/0, so
@@ -1095,6 +1170,42 @@ class TestReadEffectiveModel:
         node._client = node
         node._model = "claude-opus-4.8"
         assert read_effective_model(node) == "claude-opus-4.8"
+
+
+class TestReadTurnModel:
+    """read_turn_model: display attribution — concrete id, `auto`, or blank."""
+
+    def test_concrete_id_outranks_the_sentinel(self):
+        # A resolved id anywhere in the chain wins even while an outer wrapper
+        # still reports the Auto request, so a pinned turn never reads "auto".
+        handle = type("Handle", (), {"_resolved_model_id": "claude-opus-4.8"})()
+        provider = type("P", (), {"_model": "auto", "_handle": handle})()
+        assert read_turn_model(provider) == "claude-opus-4.8"
+
+    def test_auto_request_with_no_resolved_id_reports_auto(self):
+        # The case read_effective_model collapses to "": the user chose Auto and
+        # the backend disclosed no id. Reporting the choice is not guessing.
+        assert read_turn_model(_Inner("auto")) == "auto"
+        assert read_effective_model(_Inner("auto")) == ""
+
+    def test_auto_sentinel_is_matched_case_and_space_insensitively(self):
+        assert read_turn_model(_Inner("  AUTO ")) == "auto"
+
+    def test_auto_found_deeper_in_the_chain(self):
+        inner = type("Handle", (), {"_model": "auto"})()
+        assert read_turn_model(type("P", (), {"_handle": inner})()) == "auto"
+
+    def test_no_model_information_stays_blank(self):
+        # Distinct from the Auto case: nothing is known, so nothing is claimed.
+        assert read_turn_model(object()) == ""
+
+    def test_never_raises_on_a_hostile_source(self):
+        class Boom:
+            @property
+            def _model(self):
+                raise RuntimeError("no")
+
+        assert read_turn_model(Boom()) == ""
 
 
 class TestReadEffectiveAgent:

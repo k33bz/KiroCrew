@@ -15,6 +15,10 @@ import pytest
 
 from kiro_crew.subagent import _TURN_LIMIT, SubagentManager
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py`` — no per-file fixture needed.
 
@@ -667,7 +671,7 @@ class TestSubagentReaper:
         manager._agents["hang0001"] = info
         manager._running_count = 1
 
-        # _sigkill_session is async (Mesh-2801 offloaded the Windows taskkill
+        # _sigkill_session is async (offloaded the Windows taskkill
         # to subprocess_executor via kill_process_tree_async), so callers now
         # await it — the patch must be AsyncMock or asyncio complains.
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
@@ -700,7 +704,7 @@ class TestSubagentReaper:
         manager._agents["slow0001"] = info
         manager._running_count = 1
 
-        # _sigkill_session is async (Mesh-2801) — patch with AsyncMock.
+        # _sigkill_session is async — patch with AsyncMock.
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
             "kiro_crew.subagent._RESET_TIMEOUT", 0.1
         ), patch.object(manager, "_sigkill_session", new_callable=AsyncMock):
@@ -1310,6 +1314,55 @@ class TestTimeoutContext:
             ctx = _timeout_context(info, include_elapsed=False)
         mock_redact.assert_called_once_with("some_tool")
         assert "last tool: [REDACTED]" in ctx
+
+    def test_unset_cap_omitted_not_slash_zero(self) -> None:
+        """max_turns=0 (no per-spawn cap) must not render a misleading 'turn N/0'."""
+        from kiro_crew.subagent import SubagentInfo, _timeout_context
+
+        info = SubagentInfo(id="t1", task="test", turns=41, max_turns=0, started=time.time() - 10)
+        ctx = _timeout_context(info)
+        assert "turn 41" in ctx
+        assert "turn 41/" not in ctx
+
+    def test_resolved_turn_limit_used_over_raw_zero(self) -> None:
+        """The caller-resolved effective cap is shown when the raw override is unset."""
+        from kiro_crew.subagent import SubagentInfo, _timeout_context
+
+        info = SubagentInfo(id="t1", task="test", turns=41, max_turns=0, started=time.time() - 10)
+        ctx = _timeout_context(info, turn_limit=100)
+        assert "turn 41/100" in ctx
+
+
+class TestEffectiveTurnLimit:
+    """Resolution chain: per-spawn max_turns → manager default → hardcoded."""
+
+    def _manager(self, default_turn_limit: int) -> "SubagentManager":
+        return SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=None,
+            default_turn_limit=default_turn_limit,
+        )
+
+    def test_per_spawn_override_wins(self) -> None:
+        from kiro_crew.subagent import SubagentInfo
+
+        manager = self._manager(default_turn_limit=50)
+        info = SubagentInfo(id="t1", task="test", max_turns=30)
+        assert manager._effective_turn_limit(info) == 30
+
+    def test_falls_back_to_manager_default(self) -> None:
+        from kiro_crew.subagent import SubagentInfo
+
+        manager = self._manager(default_turn_limit=50)
+        info = SubagentInfo(id="t1", task="test", max_turns=0)
+        assert manager._effective_turn_limit(info) == 50
+
+    def test_falls_back_to_hardcoded_limit(self) -> None:
+        from kiro_crew.subagent import _TURN_LIMIT, SubagentInfo
+
+        manager = self._manager(default_turn_limit=0)
+        info = SubagentInfo(id="t1", task="test", max_turns=0)
+        assert manager._effective_turn_limit(info) == _TURN_LIMIT
 
 
 class TestAgentInheritance:
@@ -1988,3 +2041,163 @@ class TestSubagentUsageRow:
 
         persist.assert_awaited_once()
         assert persist.await_args.kwargs["agent"] == "researcher"
+
+
+class TestIdentityTrustedChildParentPolicyAuto:
+    """A low-fidelity child MCP permission event whose canonical identity IS
+    verified (remote server streamed no rawInput — issue #6163) honors an
+    unconditional ``parent_policy=auto`` grant instead of stalling on the
+    interactive downgrade; without the verified identity the same event stays
+    fail-closed.
+    """
+
+    def _manager_and_stream(self, event):
+        from kiro_crew.hooks import ToolHookResult
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        sessions = _mock_sessions()
+        sessions.get_approval_policy = MagicMock(return_value="auto")
+        provider = sessions.get_or_create.return_value[0]
+
+        async def _stream(*_a, **_kw):
+            yield event
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        provider.approve_tool = AsyncMock()
+        provider.reject_tool = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("msg", None))
+        # ALLOW (not auto-approve): the approval must come from the
+        # parent_policy grant, not the hook shortcut.
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult.allow())
+
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
+        info = SubagentInfo(id="idmcp01", task="t", parent_session_key="dashboard:default")
+        manager._agents["idmcp01"] = info
+        return manager, info, provider
+
+    @staticmethod
+    def _child_mcp_event(**overrides):
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        base: dict = dict(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="@example-server/get-item",
+            request_id=7001,
+            sub_session_id="child-a",
+            shell_classified=True,
+            is_shell=False,
+            mcp_server_name="example-server",
+            tool_name="get-item",
+            # Identity provenance flag: the real permission builder sets it
+            # when the pair above resolves from the origin-scoped caches.
+            mcp_identity_trusted=True,
+        )
+        base.update(overrides)
+        return LLMEvent(**base)
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_child_approved_under_parent_policy_auto(self) -> None:
+        event = self._child_mcp_event()
+        assert event.child_low_fidelity and event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(event)
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
+            "kiro_crew.subagent.update_state"
+        ), patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_awaited_once_with(7001)
+        provider.reject_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_identity_missing_child_still_fails_closed(self) -> None:
+        """Counterfactual: same grant, same event shape, identity caches
+        missed — the request must NOT be auto-approved (headless: rejected)."""
+        event = self._child_mcp_event(mcp_server_name="", tool_name="")
+        assert event.child_low_fidelity and not event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(event)
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
+            "kiro_crew.subagent.update_state"
+        ), patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7001)
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_child_without_auto_policy_not_approved(self) -> None:
+        """Identity verification is not itself a grant: with no auto policy
+        (and no interactive approver) the event stays fail-closed."""
+        event = self._child_mcp_event()
+        manager, info, provider = self._manager_and_stream(event)
+        manager._sessions.get_approval_policy = MagicMock(return_value="")
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
+            "kiro_crew.subagent.update_state"
+        ), patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7001)
+
+
+class TestChildEscalationLimit:
+    """Child-origin permission escalations get their own volume bound, and the
+    bail must ANSWER the triggering request before tombstoning — a return
+    without a response strands the child's oneshot (under session sharing the
+    runtime outlives the subagent, so nothing else tears the connection down).
+    """
+
+    @pytest.mark.asyncio
+    async def test_escalation_limit_bail_answers_triggering_request(self) -> None:
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, ToolHookResult
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        sessions = _mock_sessions()
+        sessions.get_approval_policy = MagicMock(return_value="")
+        provider = sessions.get_or_create.return_value[0]
+
+        async def _stream(*_a, **_kw):
+            # Limit floor is 60: the 61st child escalation trips the bail.
+            for i in range(61):
+                yield LLMEvent(
+                    kind=EVENT_PERMISSION_REQUEST,
+                    title=f"child tool {i}",
+                    request_id=1000 + i,
+                    sub_session_id="child-a",
+                )
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        provider.reject_tool = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("msg", None))
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
+        ctx.hooks.auto_approve_subagent_spawn = True
+
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
+        info = SubagentInfo(id="esc01", task="t", parent_session_key="dashboard:default")
+        manager._agents["esc01"] = info
+
+        tombstones: list[str] = []
+        manager._write_tombstone = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda _i, cause: tombstones.append(cause)
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
+            "kiro_crew.subagent.update_state"
+        ), patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True):
+            await manager._run_inner(info, "subagent:esc01")
+
+        assert tombstones == ["child_escalation_limit"]
+        assert info.error.startswith("child_escalation_limit:")
+        # EVERY escalation was answered — including the triggering 61st
+        # (low-fidelity children with no approver are rejected; the bail must
+        # not strand the one that tripped the limit).
+        answered = {c.args[0] for c in provider.reject_tool.await_args_list}
+        assert 1000 + 60 in answered, "triggering request was not answered"
+        assert len(answered) == 61

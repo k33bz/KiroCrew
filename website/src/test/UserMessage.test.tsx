@@ -198,6 +198,22 @@ describe('UserMessage', () => {
     expect(normalBubble.className).not.toContain('bg-accent-subtle')
   })
 
+  // The wrapper-cap invariant itself is pinned by the two pre-existing tests
+  // that guard this chain (UserMessage.bubbleHug.test.tsx source pin,
+  // userBubbleMobileOverflow.test.tsx rendered-wrapper pin); no third copy here.
+
+  // The entrance ring must be drawn INSIDE the bubble box (inset-0), because the
+  // transcript row wrapper is overflow-hidden and hugs the bubble's edges — a
+  // ring drawn outside (-inset-*) is clipped flat on the right for every steer.
+  it('draws the entrance ring inside the bubble box so the row clip cannot cut it', () => {
+    const { container } = render(<UserMessage content="fresh steer" meta={{ steer: true }} messageTs={`steer-ring-${Date.now()}`} renderContent={renderContent} />)
+    const ring = container.querySelector('[aria-hidden="true"].absolute.border-accent') as HTMLElement
+    expect(ring).not.toBeNull()
+    expect(ring.className).toContain('inset-0')
+    expect(ring.className).not.toContain('-inset-0.5')
+  })
+
+
   // One-shot entrance guard identity: the optimistic bubble mounts with a client
   // ts; the steer_push reconcile stashes it as meta.clientTs and swaps messageTs
   // to the server ts. A later remount (virtualization scroll-away) must key the
@@ -214,5 +230,56 @@ describe('UserMessage', () => {
     // recognize the same message and skip the entrance (no ring).
     const second = render(<UserMessage content="steer me" meta={{ steer: true, clientTs: 'client-ts-guard' }} messageTs="server-ts-guard" renderContent={renderContent} />)
     expect(second.container.querySelector(ringSelector)).toBeNull()
+  })
+})
+
+describe('action footer on touch devices', () => {
+  // happy-dom does not evaluate media queries, so the hover-none utility
+  // classes themselves are pinned, the same idiom as AssistantMessage's footer.
+  const footer = () => screen.getByTitle('Copy').parentElement as HTMLElement
+
+  it('reveals the footer where the pointer cannot hover', () => {
+    render(<UserMessage content="hello" renderContent={renderContent} />)
+    expect(footer().className).toContain('[@media(hover:none)]:opacity-100')
+  })
+
+  it('keeps the footer hover-revealed for hover-capable pointers', () => {
+    render(<UserMessage content="hello" renderContent={renderContent} />)
+    const cls = footer().className
+    expect(cls).toContain('opacity-0')
+    expect(cls).toContain('group-hover/msg:opacity-100')
+    expect(cls).toContain('group-focus-within/msg:opacity-100')
+  })
+
+  it('enlarges the actions to 40px touch targets where the pointer cannot hover', () => {
+    render(<UserMessage content="hello" renderContent={renderContent} />)
+    const cls = footer().className
+    expect(cls).toContain('[@media(hover:none)]:[&_button]:p-2.5')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:h-5')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:w-5')
+    // Three 40px actions plus a localized timestamp can exceed a narrow
+    // phone's width, so the grown row must wrap rather than clip.
+    expect(cls).toContain('[@media(hover:none)]:flex-wrap')
+  })
+
+  it('keeps the compact sizing on the buttons for pointer devices', () => {
+    render(<UserMessage content="hello" renderContent={renderContent} />)
+    expect(screen.getByTitle('Copy').className).toContain('p-0.5')
+  })
+
+  // The pin toggle is a stateful control: assistive tech needs its on/off
+  // state via aria-pressed, not only the title/aria-label text swap.
+  it('exposes aria-pressed on the pin toggle reflecting the pinned prop', () => {
+    const { rerender } = render(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" onTogglePin={() => {}} />
+    )
+    const unpinned = screen.getByTitle('Pin message')
+    expect(unpinned).toHaveAttribute('aria-pressed', 'false')
+
+    rerender(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" pinned onTogglePin={() => {}} />
+    )
+    const pinned = screen.getByTitle('Unpin message')
+    expect(pinned).toHaveAttribute('aria-pressed', 'true')
   })
 })

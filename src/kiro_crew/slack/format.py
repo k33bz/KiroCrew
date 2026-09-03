@@ -84,6 +84,7 @@ def build_options_blocks(
     choices: list[str],
     *,
     redactor: Callable[[str], str] | None = None,
+    staleness_token: str | None = None,
 ) -> list[dict]:
     """Build Slack Block Kit checkboxes + Send button for multi-select OPTIONS.
 
@@ -95,6 +96,13 @@ def build_options_blocks(
     degrades to a numbered context block the user can answer by typing.
     Overflow is redacted like the widget labels — same LLM-authored text,
     same wire.
+
+    *staleness_token* rides on the actions block's ``block_id``, which Slack
+    echoes back on every click and also uses to key ``state.values``. That is
+    what lets a click be judged against the conversation it was asked in without
+    the gateway remembering anything: see
+    :func:`kiro_crew.slack.outbound.encode_options_token`. Omitting it posts a
+    control that cannot be proven stale, so clicks on it are honoured.
     """
     # Circular import: slack/transport.py imports SLACK_MSG_LIMIT from this
     # module at top level, so the capabilities object must be imported lazily.
@@ -109,24 +117,25 @@ def build_options_blocks(
         }
         for choice in safe
     ]
-    blocks: list[dict] = [
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "checkboxes",
-                    "action_id": OPTIONS_CHECKBOXES_ACTION,
-                    "options": options,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send"},
-                    "action_id": OPTIONS_SUBMIT_ACTION,
-                    "style": "primary",
-                },
-            ],
-        },
-    ]
+    actions: dict = {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "checkboxes",
+                "action_id": OPTIONS_CHECKBOXES_ACTION,
+                "options": options,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Send"},
+                "action_id": OPTIONS_SUBMIT_ACTION,
+                "style": "primary",
+            },
+        ],
+    }
+    if staleness_token:
+        actions["block_id"] = staleness_token
+    blocks: list[dict] = [actions]
     if overflow:
         # Chunk instead of slicing: a single [:2900] would re-create the
         # silent data loss this cap exists to remove, one layer down. Slack
@@ -403,8 +412,13 @@ def to_slack_mrkdwn(text: str, *, keep_tables: bool = False, in_code: bool = Fal
 
 # ── Inline conversions (outside code blocks) ──
 
-# Markdown link [text](url) → Slack <url|text>
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Markdown link [text](url) → Slack <url|text>. The lookbehind holds IMAGE
+# syntax out of the rewrite: Slack mrkdwn has no image form, so converting
+# ``![alt](dest)`` yields a stray ``!`` plus a clickable link to a destination
+# Slack cannot open — a local screenshot path is not even reachable from its
+# servers. Images pass through raw instead, as they do on Discord, until the
+# outbound upload path claims them.
+_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
 # Headings: # text → *text*
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 # Horizontal rule: --- or *** or ___ (3+ chars)

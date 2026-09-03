@@ -86,14 +86,14 @@ class TestRemoveStaleUnixSocket:
         assert victim.is_dir()
 
     @requires_unix_socket
-    def test_a_real_stale_socket_is_unlinked(self, tmp_path: Path) -> None:
+    def test_a_real_stale_socket_is_unlinked(self, short_sock_dir: Path) -> None:
         """The arm that lets a restart rebind: a real socket inode is removed.
 
         Asserted against a real ``AF_UNIX`` inode rather than a mocked
         ``os.stat``, because the whole decision is ``S_ISSOCK`` on the real
         mode bits.
         """
-        path = tmp_path / "stale.sock"
+        path = short_sock_dir / "stale.sock"
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.bind(str(path))
@@ -107,7 +107,7 @@ class TestRemoveStaleUnixSocket:
 
     @requires_unix_socket
     def test_an_unlink_failure_is_logged_and_swallowed(
-        self, tmp_path: Path, monkeypatch, caplog
+        self, short_sock_dir: Path, monkeypatch, caplog
     ) -> None:
         """A refused unlink must degrade to TCP-only, not abort startup.
 
@@ -115,7 +115,7 @@ class TestRemoveStaleUnixSocket:
         raising here would take the whole gateway down over an optional
         transport.
         """
-        path = tmp_path / "stale.sock"
+        path = short_sock_dir / "stale.sock"
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.bind(str(path))
@@ -162,7 +162,7 @@ class TestRegisterUnixSocketCleanup:
     @requires_unix_socket
     @pytest.mark.asyncio
     async def test_the_socket_named_after_registration_is_removed(
-        self, tmp_path: Path
+        self, short_sock_dir: Path
     ) -> None:
         """A clean shutdown must not leave a socket file behind.
 
@@ -170,7 +170,7 @@ class TestRegisterUnixSocketCleanup:
         fallback, so this is the difference between a clean restart and one that
         looks broken to every internal caller.
         """
-        path = tmp_path / "dash.sock"
+        path = short_sock_dir / "dash.sock"
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(str(path))
         sock.close()
@@ -210,7 +210,6 @@ def _neutralise_outside_process_work(monkeypatch) -> dict[str, Any]:
         "register_builtin_apps": MagicMock(),
         # Rewrites the operator's REAL ~/.kiro/settings/mcp.json — the one step
         # here whose target is outside KIROCREW_HOME.
-        "_migrate_playwright_to_proxy": MagicMock(),
         "cleanup_migrated_builtin": MagicMock(),
         "on_gateway_startup": AsyncMock(),
         "on_gateway_shutdown": AsyncMock(),
@@ -363,16 +362,18 @@ class TestStartDashboardWiring:
         The ``Host`` barrier must run OUTSIDE the audit middleware: aiohttp runs
         middlewares outermost-first, and a rebinding attempt refused inside the
         audit layer would 403 without ever being recorded (which is why
-        ``_audit_denied`` exists at all).
+        ``_audit_denied`` exists at all). The deny-audit boundary must in turn
+        run outside the ``Host`` barrier: that is what makes the recording
+        positional rather than dependent on every deny site calling the helper.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
-            names = [
-                getattr(mw, "__name__", type(mw).__name__) for mw in runner.app.middlewares
-            ]
+            names = [getattr(mw, "__name__", type(mw).__name__) for mw in runner.app.middlewares]
 
         assert "host_validation_middleware" in names
         assert "sel_audit_middleware" in names
         assert names.index("host_validation_middleware") < names.index("sel_audit_middleware")
+        assert "deny_audit_middleware" in names, "the pre-audit deny boundary is not installed"
+        assert names.index("deny_audit_middleware") < names.index("host_validation_middleware")
 
     @pytest.mark.asyncio
     async def test_a_disallowed_host_is_refused_by_the_real_chain(
@@ -409,9 +410,7 @@ class TestStartDashboardWiring:
                 assert resp.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
 
     @pytest.mark.asyncio
-    async def test_lifecycle_hooks_are_registered_by_name(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    async def test_lifecycle_hooks_are_registered_by_name(self, tmp_path, monkeypatch) -> None:
         """Every long-lived subsystem must have a teardown hook.
 
         Selected BY NAME: the lists are appended to as subsystems are added, so a
@@ -465,9 +464,7 @@ class TestStartDashboardWiring:
                 assert resp.status == 403
 
     @pytest.mark.asyncio
-    async def test_a_configured_url_joins_the_csrf_origin_set(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    async def test_a_configured_url_joins_the_csrf_origin_set(self, tmp_path, monkeypatch) -> None:
         """A published URL widens the CSRF allowlist — but only behind token auth.
 
         The widening is guarded by an explicit re-check that the token-auth
@@ -477,36 +474,13 @@ class TestStartDashboardWiring:
         origin unauthenticated.
         """
         url = "http://dash.example.com:5476"
-        async with _dashboard(
-            tmp_path, monkeypatch, dashboard_url=url, local_only=False
-        ) as (runner, _state, _spies):
+        async with _dashboard(tmp_path, monkeypatch, dashboard_url=url, local_only=False) as (
+            runner,
+            _state,
+            _spies,
+        ):
             assert any(getattr(mw, "_is_token_auth", False) for mw in runner.app.middlewares)
             assert url in runner.app["allowed_origins"]
-
-    @pytest.mark.asyncio
-    async def test_the_playwright_migration_never_touches_the_real_settings(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        """The migration is scheduled as a background task, so it must be awaited.
-
-        It rewrites ``~/.kiro/settings/mcp.json`` — the operator's real file,
-        outside ``KIROCREW_HOME`` — so this test's value is proving the stub is
-        what ran. Without the stub the suite would silently edit the developer's
-        machine.
-        """
-        runner, _state, spies = await _start_dashboard(tmp_path, monkeypatch)
-        try:
-            # The migration runs in a task created during startup; yield until
-            # the loop has drained it.
-            for _ in range(50):
-                if spies["_migrate_playwright_to_proxy"].called:
-                    break
-                await asyncio.sleep(0)
-        finally:
-            await runner.cleanup()
-            await _cancel_stray_tasks()
-
-        assert spies["_migrate_playwright_to_proxy"].called
 
     @pytest.mark.asyncio
     async def test_cleanup_stops_the_tunnel_it_never_started(
@@ -527,9 +501,7 @@ class TestStartDashboardWiring:
             lambda: SimpleNamespace(
                 tunnel=provider,
                 telemetry=SimpleNamespace(record_event=lambda *_a, **_k: None),
-                dashboard=SimpleNamespace(
-                    start_services=AsyncMock(), stop_services=AsyncMock()
-                ),
+                dashboard=SimpleNamespace(start_services=AsyncMock(), stop_services=AsyncMock()),
             ),
         )
 
@@ -539,3 +511,71 @@ class TestStartDashboardWiring:
         await _cancel_stray_tasks()
 
         provider.stop.assert_awaited()
+
+    @staticmethod
+    def _tunnel_enabled_context(monkeypatch) -> None:
+        """Force the enable gate open so the tunnel setup call is reached.
+
+        Driven through the context provider rather than by writing
+        ``tunnel.enabled`` into the config, because ``start_dashboard`` ORs the
+        two and the provider arm needs no config-cache handling.
+        """
+        monkeypatch.setattr(
+            srv,
+            "current_context",
+            lambda: SimpleNamespace(
+                tunnel=SimpleNamespace(stop=AsyncMock(), enabled=lambda: True),
+                telemetry=SimpleNamespace(record_event=lambda *_a, **_k: None),
+                dashboard=SimpleNamespace(start_services=AsyncMock(), stop_services=AsyncMock()),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_tunnel_reaches_the_tunnel_gate(self, tmp_path: Path, monkeypatch) -> None:
+        """A ``--no-tunnel`` process must not get a tunnel manager on its state.
+
+        Driven end to end through the REAL ``setup_tunnel`` with the enable gate
+        forced open and token auth irrelevant, because the boot-flag refusal is
+        checked ahead of both. The flag is read from process state rather than
+        passed down here -- ``slack.allowlist`` opens a second door that never
+        reaches this function, so a parameter would have guarded only this one.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(True)
+        try:
+            runner, state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+            try:
+                assert state.tunnel_manager is None
+            finally:
+                await runner.cleanup()
+                await _cancel_stray_tasks()
+        finally:
+            set_publish_disabled(False)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_gateway_still_asks_for_its_tunnel(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Without the flag the gate is asked exactly as before, so a normal
+        install's remote access cannot be taken away by this change.
+
+        Asserted at the call rather than on the returned state: ``setup_tunnel``
+        also returns None for an unrelated reason (no token auth in this harness),
+        so a state-only assertion would pass even if the tunnel were never
+        attempted at all.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(False)
+        spy = AsyncMock(return_value=None)
+        monkeypatch.setattr(srv, "setup_tunnel", spy)
+
+        runner, _state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+        try:
+            spy.assert_awaited_once()
+        finally:
+            await runner.cleanup()
+            await _cancel_stray_tasks()

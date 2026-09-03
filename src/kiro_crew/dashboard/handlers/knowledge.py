@@ -9,14 +9,18 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
+from kiro_crew._sqlite_compat import fts5_segment_for_index, sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
+from kiro_crew.dashboard import part_stream
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
@@ -48,14 +52,16 @@ from kiro_crew.knowledge.ingestion import (
     rebuild_embeddings,
     start_rebuild_job,
 )
-from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
+from kiro_crew.knowledge.store import KnowledgeBundleError
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,77 @@ def _sel_log(tool: str, **kwargs: object) -> None:
         tool_name=f"knowledge.{tool}", outcome=str(kwargs.pop("outcome", "completed")),
         resources=str(kwargs) if kwargs else "",
     )
+
+
+_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
+# The fields import_bundle's redaction loops pass to _redact(); each has to be
+# a string or null before it reaches _redact() -> redact_exfiltration_urls(),
+# whose regex .finditer() raises an unhandled TypeError on anything else.
+_BUNDLE_REDACTED_FIELDS = {
+    "items": ("title", "summary", "content"),
+    "entities": ("name", "description"),
+    "relations": ("relation_type", "description"),
+}
+
+
+def _validate_knowledge_bundle(body: object) -> str | None:
+    """Return an error string if body isn't an importable bundle shape, else None.
+
+    Runs before the redaction loops and the store call so a malformed bundle
+    fails with a clean 400 instead of an unhandled AttributeError/TypeError
+    (non-dict body or entries) or a silently-committed corrupt row (non-JSON
+    sources.properties / entities.aliases, which every reader parses with
+    json.loads()).
+    """
+    if not isinstance(body, dict):
+        return "bundle must be a JSON object"
+    for field in _BUNDLE_LIST_FIELDS:
+        value = body.get(field, [])
+        if not isinstance(value, list):
+            return f"'{field}' must be a list"
+        for entry in value:
+            if not isinstance(entry, dict):
+                return f"'{field}' entries must be objects"
+    for field, keys in _BUNDLE_REDACTED_FIELDS.items():
+        for entry in body.get(field, []):
+            for key in keys:
+                value = entry.get(key)
+                if value is not None and not isinstance(value, str):
+                    return f"'{field}.{key}' must be a string or null"
+    # store.import_bundle() writes these two columns through unparsed (with
+    # '{}'/'[]' defaults when ABSENT), so anything present must already be the
+    # JSON text every reader json.loads() back: readers such as the source
+    # detail handlers parse the raw column with no empty-string guard, and
+    # find_entity() calls .lower() on each parsed alias.  Only absent/null
+    # falls through to the store defaults; a present non-string (1 -> TEXT
+    # "1"), an empty string, or the wrong parsed shape would commit a row
+    # that crashes a later, unrelated read.  json.loads raises RecursionError
+    # (not ValueError) on deeply-nested input, so catch it here too.
+    for src in body.get("sources", []):
+        props = src.get("properties")
+        if props is None:
+            continue
+        if not isinstance(props, str):
+            return "'sources.properties' must be a JSON object string or null"
+        try:
+            parsed = json.loads(props)
+        except (ValueError, RecursionError):
+            return "'sources.properties' must be valid JSON"
+        if not isinstance(parsed, dict):
+            return "'sources.properties' must be a JSON object"
+    for ent in body.get("entities", []):
+        aliases = ent.get("aliases")
+        if aliases is None:
+            continue
+        if not isinstance(aliases, str):
+            return "'entities.aliases' must be a JSON array string or null"
+        try:
+            parsed = json.loads(aliases)
+        except (ValueError, RecursionError):
+            return "'entities.aliases' must be valid JSON"
+        if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
+            return "'entities.aliases' must be a JSON array of strings"
+    return None
 
 
 def _store(request: web.Request):
@@ -417,10 +494,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -499,14 +576,35 @@ async def get_entity_items(request: web.Request) -> web.Response:
     """GET /api/knowledge/entities/by-name/{name}/items -- items containing entity."""
     store = _store(request)
     name = request.match_info["name"]
-    # Search items via FTS5 for the entity name
-    sanitized = name.replace('"', '""')
-    rows = store.db.execute(
+    rows = await asyncio.to_thread(_entity_items_rows, store, name)
+    return web.json_response([store._serialize_item(r) for r in rows])
+
+
+def _entity_items_rows(store, name: str) -> list:
+    """FTS lookup for an entity name. Runs on a worker thread, never the loop.
+
+    Off-loop for two reasons: a legacy database migrates its FTS index on first
+    read (`ensure_fts_index_current`), which is data-scaled, and the query itself
+    is sqlite I/O.
+
+    The name is matched as ONE FTS5 phrase over the segmented text, which is what
+    an entity name is -- a contiguous string, not a bag of words. For a name with
+    no CJK this is byte-identical to quoting the name directly, so a multi-word
+    ASCII entity ("New York") still requires those words adjacent rather than
+    merely both present. For a CJK name the segmentation makes the phrase address
+    the individual characters the index stores, which quoting the whole run
+    cannot.
+    """
+    store.ensure_fts_index_current()
+    segmented = fts5_segment_for_index(name).strip()
+    if not segmented:
+        return []
+    phrase = '"' + segmented.replace('"', '""') + '"'
+    return store.db.execute(
         "SELECT i.* FROM items i JOIN items_fts f ON i.rowid = f.rowid "
         "WHERE items_fts MATCH ? AND i.status = 'active' ORDER BY i.updated_at DESC LIMIT 50",
-        (f'"{sanitized}"',),
+        (phrase,),
     ).fetchall()
-    return web.json_response([store._serialize_item(r) for r in rows])
 
 
 async def get_related_items(request: web.Request) -> web.Response:
@@ -537,18 +635,59 @@ async def get_related_items(request: web.Request) -> web.Response:
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
-    """GET /api/knowledge/graph -- full entity graph (top N by connections)."""
+    """GET /api/knowledge/graph -- full entity graph (top N by connections).
+
+    Optional query params:
+      limit: max nodes (1-200, default 100)
+      source_id: comma-separated source IDs to filter entities by. When set,
+        only entities mentioned in items belonging to those sources are included.
+    """
     store = _store(request)
     try:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
-    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
+    # Source filter: restrict to entities mentioned in items from specific sources
+    source_id_param = request.query.get("source_id", "").strip()
+    if source_id_param:
+        source_ids = [s.strip() for s in source_id_param.split(",") if s.strip()]
+        if not source_ids:
+            return web.json_response({"nodes": [], "edges": []})
+        placeholders = ",".join("?" * len(source_ids))
+        # Find entity IDs mentioned in items belonging to the given sources.
+        # Items belong to a source via items.source_id (ownership) OR via
+        # source_locations.source_id (deduplication — item survives in another
+        # source after a duplicate collapse).
+        rows = await asyncio.to_thread(
+            lambda: store.db.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m "  # noqa: S608
+                f"JOIN items i ON m.item_id = i.id "
+                f"WHERE i.status = 'active' AND ("
+                f"  i.source_id IN ({placeholders})"
+                f"  OR i.id IN ("
+                f"    SELECT sl.item_id FROM source_locations sl"
+                f"    WHERE sl.source_id IN ({placeholders})"
+                f"  )"
+                f")",
+                source_ids + source_ids,
+            ).fetchall()
+        )
+        allowed_entities = {row["entity_id"] for row in rows}
+        if not allowed_entities:
+            return web.json_response({"nodes": [], "edges": []})
+        # Rank allowed entities by degree, take top N
+        nodes_by_degree = sorted(
+            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+        )[:limit]
+    else:
+        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
     nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set]
+             for n in node_set if store.graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
              for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
@@ -586,8 +725,14 @@ async def source_counts(request: web.Request) -> web.Response:
     # holds documents -- which the list view filters out, hiding a source the user
     # cannot then see or delete. The union is over item ids, so a document held both
     # ways counts once per source and never twice.
-    where_sl = [w.replace("source_id", "i.source_id") if "source_id" in w else f"i.{w}"
-                if w != "1=1" else w for w in where]
+    where_sl: list[str] = []
+    for w in where:
+        if "source_id" in w:
+            where_sl.append(w.replace("source_id", "i.source_id"))
+        elif w == "1=1":
+            where_sl.append(w)  # the constant-true clause takes no table alias
+        else:
+            where_sl.append(f"i.{w}")
     sql = (
         f"SELECT COALESCE(NULLIF(sid, ''), '{_NO_SOURCE}') AS sid, "  # noqa: S608
         "COUNT(DISTINCT item_id) AS cnt FROM ("
@@ -703,10 +848,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -967,7 +1112,10 @@ async def sync_source(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    pool = request.app["knowledge_llm_pool"]
+    pool = request.app.get("knowledge_fetch_pool")
+    if pool is None:
+        # Compatibility for minimal callers that predate workload-isolated pools.
+        pool = request.app["knowledge_llm_pool"]
     task = asyncio.create_task(_background_agent_sync(source_id, url, source["name"], store, pipeline, pool))
     app_tasks = request.app.setdefault("_bg_tasks", set())
     app_tasks.add(task)
@@ -1049,10 +1197,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1088,7 +1236,6 @@ async def confirm_source(request: web.Request) -> web.Response:
         _sel_log("source.confirm_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-    props["sync_status"] = "active"
     props.pop("scan_paused", None)
     store.update_source(source_id, properties=props, sync_status="active")
     _sel_log("source.confirm", source_id=source_id)
@@ -1115,12 +1262,9 @@ async def pause_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
     props["scan_paused"] = True
-    # Keep the JSON copy in sync with the column: the watcher's pre-scan skip
-    # reads properties["sync_status"] (it selects `properties`, not the column),
-    # so leaving this stale meant a paused folder was still fully walked and
-    # delete-reconciled every sweep -- only the deeper scan_paused gate in
-    # folder_watcher stopped the ingestion. confirm/resume already do this.
-    props["sync_status"] = "paused"
+    # The watcher's pre-scan skip reads the sync_status COLUMN, so this write is
+    # what stops the sweep from walking and delete-reconciling the whole folder;
+    # the deeper scan_paused gate in folder_watcher stops the ingestion itself.
     store.update_source(source_id, properties=props, sync_status="paused")
     _sel_log("source.pause", source_id=source_id)
     return web.json_response({"status": "paused"})
@@ -1140,7 +1284,6 @@ async def resume_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
     props.pop("scan_paused", None)
-    props["sync_status"] = "active"
     store.update_source(source_id, properties=props, sync_status="active")
     _sel_log("source.resume", source_id=source_id)
     # Trigger scan to pick up remaining files
@@ -1177,7 +1320,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1196,7 +1342,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1221,10 +1370,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1315,7 +1464,24 @@ def _inspect_zip_archive(path: str) -> str | None:
     synchronous zip I/O, so callers MUST run it off the event loop (via
     ``asyncio.to_thread``) — a large/hostile central directory would otherwise
     stall the gateway loop and heartbeat.
+
+    The member cap runs TWICE, deliberately. The shared vet (kiro_crew.zip_vet)
+    reads the archive tail first, so the declared central-directory size — the
+    field ZipFile's construction loop actually reads and allocates from — is
+    bounded BEFORE ZipFile exists. The infolist() pass below then bounds the
+    aggregate declared expansion, which only the parsed records can answer. The
+    rejection reasons are unchanged: an archive that the preflight refuses would
+    have been refused by the count check anyway, just after the allocation.
     """
+    try:
+        vet_zip_inventory(path, max_members=_MAX_INGEST_ARCHIVE_MEMBERS)
+    except ZipInventoryRejected as exc:
+        # Same reasons this function already returns, so the API error body and
+        # the SEL outcome do not change shape: a tail we cannot parse is a bad
+        # archive, an over-cap inventory is too many members.
+        if exc.reason in ("missing_eocd", "truncated_eocd", "unreadable"):
+            return "bad_archive"
+        return "too_many_members"
     try:
         with zipfile.ZipFile(path) as zf:
             infos = zf.infolist()
@@ -1346,39 +1512,32 @@ async def ingest_file(request: web.Request) -> web.Response:
     filename = getattr(field, "filename", None) or "upload"
     suffix = Path(filename).suffix
     ext = suffix.lower()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="kn_")
+    staged = Path(tempfile.gettempdir()) / f"kn_{uuid.uuid4().hex}{suffix}"
     try:
-        total_size = 0
-        # Capture the leading bytes so the claimed extension can be verified
-        # against the file signature; 16 bytes covers every prefix in the
-        # sibling gate (PNG magic is 8, WEBP needs bytes 8:12, zip/PDF fewer).
-        head = bytearray()
-        while True:
-            chunk = await field.read_chunk()  # type: ignore[union-attr]
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > _MAX_INGEST_FILE_SIZE:
-                tmp.close()
-                Path(tmp.name).unlink(missing_ok=True)
-                return web.json_response(
-                    {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"}, status=413)
-            if len(head) < 16:
-                head.extend(chunk[: 16 - len(head)])
-            tmp.write(chunk)
-        tmp.close()
+        # The signature gate (CWE-434) and the byte ceiling are both enforced by
+        # the shared streaming path, which judges the leading bytes while they
+        # are still in memory. That is stricter than this call site used to be:
+        # it wrote the whole file first and only then sniffed, so rejected
+        # content did reach the filesystem. Cleanup on cancellation is the
+        # helper's, not this function's -- see part_stream's docstring.
+        await part_stream.stream_part_to_file(
+            field,  # type: ignore[arg-type]
+            staged,
+            max_bytes=_MAX_INGEST_FILE_SIZE,
+            accepts=lambda head: _content_matches_ext(ext, head),
+        )
+    except part_stream.PartTooLarge:
+        return web.json_response(
+            {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"},
+            status=413,
+        )
+    except part_stream.PartContentMismatch:
+        _sel_log("ingest", filename=filename, outcome="rejected")
+        return web.json_response(
+            {"error": f"file content does not match its type: {ext}"}, status=400
+        )
 
-        # Content-signature gate (CWE-434): the extension is attacker-controlled
-        # and FileReader dispatches to binary parsers (.pdf/.docx) purely by
-        # extension, so verify the magic bytes match the claimed type BEFORE the
-        # file is handed to a parser. Text formats have no reliable signature and
-        # pass through, matching the sibling upload gate in handlers/files.py.
-        if not _content_matches_ext(ext, bytes(head)):
-            Path(tmp.name).unlink(missing_ok=True)
-            _sel_log("ingest", filename=filename, outcome="rejected")
-            return web.json_response(
-                {"error": f"file content does not match its type: {ext}"}, status=400)
-
+    try:
         # Decompression-bomb guard (CWE-770): a valid-signature OOXML/zip can
         # still be a bomb whose members expand unbounded once python-docx / the
         # zip parser opens it. Bound the declared member count and aggregate
@@ -1387,9 +1546,9 @@ async def ingest_file(request: web.Request) -> web.Response:
         # corrupt/lying archive. Run off the event loop so a hostile central
         # directory can't stall the gateway loop/heartbeat.
         if ext in _ZIP_CONTAINER_EXTS:
-            reason = await asyncio.to_thread(_inspect_zip_archive, tmp.name)
+            reason = await asyncio.to_thread(_inspect_zip_archive, str(staged))
             if reason is not None:
-                Path(tmp.name).unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 _sel_log("ingest", filename=filename, outcome="rejected", reason=reason)
                 return web.json_response(
                     {"error": f"{ext} archive rejected ({reason})"}, status=400)
@@ -1419,7 +1578,7 @@ async def ingest_file(request: web.Request) -> web.Response:
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
-        task = asyncio.create_task(_bg_ingest(tmp.name, source_id))
+        task = asyncio.create_task(_bg_ingest(str(staged), source_id))
         app_tasks = request.app.setdefault("_bg_tasks", set())
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
@@ -1428,7 +1587,7 @@ async def ingest_file(request: web.Request) -> web.Response:
         return web.json_response({"source_id": source_id, "status": "processing"})
     except Exception:
         logger.exception("Ingestion failed for %s", filename)
-        Path(tmp.name).unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
         return web.json_response({"error": "internal server error"}, status=500)
 
 
@@ -1469,10 +1628,17 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    shape_error = _validate_knowledge_bundle(body)
+    if shape_error is not None:
+        _sel_log("import", outcome="rejected", reason=shape_error)
+        return web.json_response(
+            {"error": f"malformed bundle: {shape_error}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
     # Redact imported text fields (may contain LLM-derived content from another instance)
     for item in body.get("items", []):
         redacted_title = _redact(item.get("title"))
@@ -1488,7 +1654,48 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
-    result = _store(request).import_bundle(body)
+    try:
+        result = _store(request).import_bundle(body)
+    except KnowledgeBundleError as exc:
+        # The store enforces the JSON-column well-formedness invariant
+        # (sources.properties / entities.aliases) at the writer; surface its
+        # typed rejection as a clean 400.  Unlike the driver errors below,
+        # its message is validator-crafted (the same class as the handler's
+        # own shape errors above), so it is safe to render verbatim.
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": f"malformed bundle: {exc}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except (KeyError, OverflowError, sqlite3.IntegrityError,
+            sqlite3.ProgrammingError, sqlite3.DataError) as exc:
+        # Only failures that genuinely mean a bad bundle earn a 400:
+        # IntegrityError (constraint/FK violations), ProgrammingError and
+        # DataError (bad values reaching the SQL layer), KeyError (missing
+        # required field), and OverflowError (a bundle integer field, e.g.
+        # chunk_index, too large for SQLite's 64-bit INTEGER, raised at bind
+        # time inside the store call -- neither a KeyError nor a
+        # sqlite3.Error, so it needs its own arm).  The exception detail
+        # stays server-side: the dashboard renders ``error`` verbatim, so
+        # raw driver text must not reach the client.
+        logger.warning("Knowledge bundle import rejected: %s", exc)
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": "malformed bundle", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except sqlite3.Error as exc:
+        # Operational store failures -- OperationalError from a locked DB
+        # past busy_timeout or a full disk, and every other sqlite3.Error --
+        # are not the client's fault: a 400 "malformed bundle" for a valid
+        # file sends the user off debugging their export.  Surface them as a
+        # 5xx with a generic body; the detail is logged server-side only.
+        logger.exception("Knowledge bundle import failed in the store")
+        _sel_log("import", outcome="error", reason=str(exc))
+        return web.json_response(
+            {"error": "internal server error", "code": "knowledge_import_failed"},
+            status=500,
+        )
     _sel_log("import", **result)
     return web.json_response(result)
 
@@ -1527,7 +1734,12 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
     degrades gracefully during the rebuild instead of going dark.
     """
     try:
-        processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force)
+        # pace=False: this job exists because a human clicked Rebuild and is
+        # watching its progress bar — the load is expected, so it runs at the
+        # interactive scheduling class with no idling. The watcher self-heal
+        # path stays on the paced default.
+        processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force,
+                                             pace=False)
         store.db.execute(
             "UPDATE ingestion_jobs SET status = 'completed', items_processed = ?, updated_at = ? "
             "WHERE id = ?",
@@ -1567,7 +1779,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body = await request.json() if request.can_read_body else {}
+    body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1738,11 +1953,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),
@@ -1758,16 +1972,51 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def _shutdown_knowledge_pools(app: web.Application) -> None:
+    """Shut down each workload pool once, including the legacy alias."""
+    seen: set[int] = set()
+    for key in (
+        "knowledge_extraction_pool",
+        "knowledge_fetch_pool",
+        "knowledge_llm_pool",
+    ):
+        pool = app.get(key)
+        if pool is None or id(pool) in seen:
+            continue
+        seen.add(id(pool))
+        try:
+            await pool.shutdown()
+        except Exception:
+            logger.exception("Knowledge pool shutdown failed: %s", key)
+
+
 def setup_knowledge_routes(app: web.Application) -> None:
     # Initialize pipeline and sync scheduler if not already set
     if "knowledge_pipeline" not in app:
         store = app["state"].knowledge_store
-        pool = LLMPool()
+        cfg = KiroCrewConfig.load()
+        extraction_pool = LLMPool(
+            pool_size=cfg.knowledge.extraction_pool_size,
+            effort=DEFAULT_EXTRACTION_EFFORT,
+            use_config_pool_size=False,
+        )
+        fetch_pool = LLMPool(
+            pool_size=1,
+            use_config_pool_size=False,
+        )
         embedder = _create_embedder(app)
-        pipeline = IngestionPipeline(store=store, extractor=EntityExtractor(pool=pool),
-                                     chunker=HeadingAwareChunker(), reader=FileReader(),
-                                     embedder=embedder)
-        app["knowledge_llm_pool"] = pool
+        pipeline = IngestionPipeline(
+            store=store,
+            extractor=EntityExtractor(pool=extraction_pool),
+            chunker=HeadingAwareChunker(),
+            reader=FileReader(),
+            embedder=embedder,
+        )
+        app["knowledge_extraction_pool"] = extraction_pool
+        app["knowledge_fetch_pool"] = fetch_pool
+        # Keep the old key as an extraction-only compatibility alias. Production
+        # URL sync uses knowledge_fetch_pool above.
+        app["knowledge_llm_pool"] = extraction_pool
         app["knowledge_embedder"] = embedder
         connectors: dict[str, "BaseConnector"] = {}
         # Local folder connector (always available)
@@ -1843,12 +2092,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
     app.router.add_get("/api/knowledge/search-for-context", search_for_context)
 
     # Pool lifecycle: lazy start on first request, shutdown on app exit
-    async def _shutdown_pool(app: web.Application) -> None:
-        pool = app.get("knowledge_llm_pool")
-        if pool:
-            await pool.shutdown()
-
-    app.on_cleanup.append(_shutdown_pool)
+    app.on_cleanup.append(_shutdown_knowledge_pools)
 
     async def _stop_watcher(app: web.Application) -> None:
         watcher = app.get("knowledge_watcher")

@@ -74,6 +74,8 @@ const api = {
   openTrash: vi.fn(),
   search: vi.fn(),
   changes: vi.fn(),
+  settings: vi.fn(),
+  saveSettings: vi.fn(),
 }
 
 vi.mock('../apps/md-notebook/api', async () => {
@@ -131,13 +133,19 @@ function pending<T>(): Promise<T> {
   return new Promise<T>(() => undefined)
 }
 
-/** A promise whose resolution this test controls, for ordering two reads. */
-function deferred<T>(): { promise: Promise<T>; settle: (value: T) => void } {
+/** A promise whose outcome this test controls, for ordering async operations. */
+function deferred<T>(): {
+  promise: Promise<T>
+  settle: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
   let settle!: (value: T) => void
-  const promise = new Promise<T>(resolve => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolve, rejectPromise) => {
     settle = resolve
+    reject = rejectPromise
   })
-  return { promise, settle }
+  return { promise, settle, reject }
 }
 
 /** An ESTALE rejection, the shape the save guard recognises. */
@@ -257,6 +265,7 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     })
     api.sync.mockResolvedValue({
       result: { pushed: true, pulled: true, committed: [], conflicts: [] },
+      lastSync: Date.now(),
     })
     api.commit.mockResolvedValue({
       result: { pushed: false, pulled: false, committed: [], conflicts: [] },
@@ -264,6 +273,14 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     api.openTrash.mockResolvedValue({ opened: true, empty: false, path: '/home/u/notes/.trash' })
     api.search.mockResolvedValue({ results: [] })
     api.changes.mockResolvedValue({ rev: 0, changed: [], watching: true })
+    // Auto-sync prefs are server-owned now: the defaults the backend reports for a
+    // user who has never touched them.
+    api.settings.mockResolvedValue({
+      settings: { autoSync: false, autoSyncMins: 10, lastSync: {} },
+    })
+    api.saveSettings.mockResolvedValue({
+      settings: { autoSync: false, autoSyncMins: 10, lastSync: {} },
+    })
   })
 
   afterEach(() => {
@@ -277,31 +294,115 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     await screen.findByRole('button', { name: 'One' })
     await openSettings()
 
-    // Autosave ships ON, so the first click is the one that turns it off.
+    // Autosave stays device-local — a local commit is this machine's business —
+    // so it is still a stored preference.
     await userEvent.click(screen.getByRole('switch', { name: 'Autosave to history' }))
     expect(localStorage.getItem('mdnb-auto-commit')).toBe('false')
 
+    // Auto sync is not: the backend runs the sync loop, so the value has to reach
+    // the server rather than this browser's storage. The write carries the FULL
+    // desired state plus a monotonic seq (the server's stale-write guard), so
+    // match on the autoSync intent rather than an exact partial patch.
     await userEvent.click(screen.getByRole('switch', { name: 'Auto sync' }))
-    expect(localStorage.getItem('mdnb-auto-sync')).toBe('true')
+    await waitFor(() =>
+      expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ autoSync: true })),
+    )
+    expect(localStorage.getItem('mdnb-auto-sync')).toBeNull()
   })
 
-  it('clamps the auto-sync interval into its allowed range', async () => {
+  it('clamps the auto-sync interval into its allowed range before saving it', async () => {
+    api.settings.mockResolvedValue({
+      settings: { autoSync: true, autoSyncMins: 10, lastSync: {} },
+    })
+    await mount()
+    await screen.findByRole('button', { name: 'One' })
+    await openSettings()
+    // The interval renders only while auto sync is on, so finding it is also the
+    // proof that the server's settings have been applied to the controls.
+    const interval = (await screen.findByRole('spinbutton', {
+      name: 'Auto sync interval in minutes',
+    })) as HTMLInputElement
+
+    // The field shows the clamped value immediately; the write is debounced,
+    // because onChange fires on every keystroke.
+    fireEvent.change(interval, { target: { value: '45' } })
+    expect(interval.value).toBe('45')
+
+    // Above the ceiling: pinned rather than accepted.
+    fireEvent.change(interval, { target: { value: '99999' } })
+    expect(interval.value).toBe('1440')
+
+    // Zero is not a cadence — it falls back to the default rather than to the
+    // minimum, which would be a one-minute push loop nobody asked for.
+    fireEvent.change(interval, { target: { value: '0' } })
+    expect(interval.value).toBe('10')
+
+    // One PUT, for the value that settled — not one per keystroke, each of which
+    // is an interval the backend would otherwise start syncing on. The write is
+    // full-state + seq, so match the interval rather than an exact partial patch.
+    await waitFor(
+      () =>
+        expect(api.saveSettings).toHaveBeenCalledWith(
+          expect.objectContaining({ autoSyncMins: 10 }),
+        ),
+      { timeout: 3000 },
+    )
+    expect(api.saveSettings).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not re-enable auto sync from a value left in storage by an older build', async () => {
+    // A stale browser pref must never re-authorize unattended push. `autoSync`
+    // gates a background `git push`, and the server (reporting off here) is the
+    // source of truth — the old keys are cleared WITHOUT being read, so a user
+    // who turned auto sync off does not find it back on after upgrading.
     localStorage.setItem('mdnb-auto-sync', 'true')
+    localStorage.setItem('mdnb-auto-sync-mins', '30')
     await mount()
     await screen.findByRole('button', { name: 'One' })
     await openSettings()
 
-    const interval = screen.getByRole('spinbutton', { name: 'Auto sync interval in minutes' })
-    fireEvent.change(interval, { target: { value: '45' } })
-    expect(localStorage.getItem('mdnb-auto-sync-mins')).toBe('45')
+    // No seeding write from the stale value, and the interval control — which
+    // only shows while auto sync is ON — stays absent, proving it was not
+    // re-enabled.
+    expect(api.saveSettings).not.toHaveBeenCalled()
+    expect(
+      screen.queryByRole('spinbutton', { name: 'Auto sync interval in minutes' }),
+    ).toBeNull()
+    // The dead keys are gone so they cannot resurface on a later load.
+    expect(localStorage.getItem('mdnb-auto-sync')).toBeNull()
+    expect(localStorage.getItem('mdnb-auto-sync-mins')).toBeNull()
+  })
 
-    // Above the ceiling: pinned rather than accepted.
-    fireEvent.change(interval, { target: { value: '99999' } })
-    expect(localStorage.getItem('mdnb-auto-sync-mins')).toBe('1440')
+  it('rolls the auto-sync toggle back when the enable is rejected', async () => {
+    api.saveSettings.mockRejectedValue(new Error('settings file is read-only'))
+    await mount()
+    await screen.findByRole('button', { name: 'One' })
+    await openSettings()
 
-    // Zero is not a cadence — it falls back to the default rather than to zero.
-    fireEvent.change(interval, { target: { value: '0' } })
-    expect(localStorage.getItem('mdnb-auto-sync-mins')).toBe('10')
+    await userEvent.click(screen.getByRole('switch', { name: 'Auto sync' }))
+    // The rejection is reported...
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('settings file is read-only')
+    // ...and the control returns to OFF, so the foreground timer it gates is not
+    // left armed against a value the server refused (the interval row disappears).
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('spinbutton', { name: 'Auto sync interval in minutes' }),
+      ).toBeNull(),
+    )
+  })
+
+  it('reports a settings write the backend refused rather than losing it silently', async () => {
+    api.saveSettings.mockRejectedValue(new Error('settings file is read-only'))
+    await mount()
+    await screen.findByRole('button', { name: 'One' })
+    await openSettings()
+
+    // Unlike a device-local pref, this write can be refused — and the editor's own
+    // banner is not on screen while Settings is, so it reports in the section.
+    await userEvent.click(screen.getByRole('switch', { name: 'Auto sync' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('settings file is read-only')
   })
 
   it('records a new manual-sync shortcut without that keystroke also syncing', async () => {
@@ -345,22 +446,34 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(screen.queryByRole('button', { name: 'One' })).toBeNull()
   })
 
-  it('reports a failure to forget a vault', async () => {
-    api.forgetVault.mockRejectedValue(new Error('registry is read-only'))
+  it('reports a failure to forget a vault inline, without closing Settings', async () => {
+    // A failed Remove is reported right next to the confirm buttons rather
+    // than through the shared error banner, which only renders in the
+    // main-editor branch -- invisible while Settings (and its Remove
+    // confirm) is open, and reachable only by closing Settings first, which
+    // a user has no reason to do after clicking "Remove it". The confirm
+    // bar stays up on failure so the user can retry without re-opening the
+    // Remove flow.
+    api.forgetVault.mockRejectedValueOnce(new Error('registry is read-only'))
     await mount()
     await screen.findByRole('button', { name: 'One' })
     await openSettings()
 
     await userEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0])
-    await userEvent.click(await screen.findByRole('button', { name: 'Remove it' }))
-    // The banner lives in the note column, which Settings was covering.
-    await userEvent.click(screen.getByRole('button', { name: 'Close settings' }))
+    const removeItBtn = await screen.findByRole('button', { name: 'Remove it' })
+    await userEvent.click(removeItBtn)
 
-    // Explicit timeout: the alert lands after an async save/sync round-trip,
-    // and the default 1000ms findBy window is a race that only loses under
-    // load -- CI ran this file in 8.5s where it takes milliseconds locally.
-    const alert = await screen.findByRole('alert', { timeout: 5_000 })
+    const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('registry is read-only')
+    // Still in Settings, confirm bar still up, button usable again.
+    expect(screen.getByRole('button', { name: 'Manual sync shortcut' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Remove it' })).not.toBeDisabled()
+
+    // Retrying with a working call succeeds without re-clicking "Remove".
+    api.forgetVault.mockResolvedValueOnce({ ok: true })
+    await userEvent.click(screen.getByRole('button', { name: 'Remove it' }))
+    await waitFor(() => expect(api.forgetVault).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('button', { name: 'Remove it' })).toBeNull()
   })
 
   it('persists a pending edit before forgetting the vault that holds it', async () => {
@@ -406,6 +519,50 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
 
     await waitFor(() => expect(api.setPat).toHaveBeenCalledWith('github_pat_example'))
     expect(await screen.findByRole('status')).toBeTruthy()
+  })
+
+  it('reports a failed token save inline instead of getting stuck busy forever', async () => {
+    // A rejected setPat() must not leave `busy` stuck true (the button
+    // permanently disabled) with neither the success confirmation nor any
+    // error shown -- the failure has to be reported and the button has to
+    // recover.
+    api.setPat.mockRejectedValueOnce(new Error('bad credentials'))
+    await mount()
+    await screen.findByRole('button', { name: 'One' })
+    await openSettings()
+
+    await userEvent.type(
+      screen.getByLabelText('Access token (optional)'),
+      'github_pat_bad',
+    )
+    const saveBtn = screen.getByRole('button', { name: 'Save' })
+    await userEvent.click(saveBtn)
+
+    // Failure is reported, distinctly from the success `status` case above.
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('bad credentials')
+    // The button is usable again -- not stuck disabled by a `busy` that
+    // never got reset.
+    await waitFor(() => expect(saveBtn).not.toBeDisabled())
+  })
+
+  it('reports a failed token clear inline and recovers the Clear button', async () => {
+    api.listVaults.mockResolvedValue({
+      vaults: [aVault(), SECOND_VAULT],
+      hasPat: true,
+      hasGhAuth: false,
+    })
+    api.setPat.mockRejectedValueOnce(new Error('network error'))
+    await mount()
+    await screen.findByRole('button', { name: 'One' })
+    await openSettings()
+
+    const clearBtn = await screen.findByRole('button', { name: 'Clear' })
+    await userEvent.click(clearBtn)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('network error')
+    await waitFor(() => expect(clearBtn).not.toBeDisabled())
   })
 
   it('records a vault dropping out of the Kiro Crew knowledge library', async () => {
@@ -640,17 +797,34 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(api.moveNote).not.toHaveBeenCalled()
   })
 
-  it('refuses to move a note whose pending save was rejected', async () => {
-    await mountDirty()
-    api.saveNote.mockRejectedValueOnce(staleRejection())
-    // Back to the rendered pane so the row action bar is reachable.
-    await userEvent.click(screen.getByRole('button', { name: 'Rendered' }))
-    rowAction('One', 'Rename note')
-    const field = await screen.findByRole('textbox', { name: 'Note name' })
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Renamed{Enter}')
+  it('joins an active debounced save and refuses to move when that save fails', async () => {
+    const save = deferred<{ ok: boolean; mtime: number }>()
+    api.saveNote.mockImplementationOnce(() => save.promise)
+    await mountWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    vi.useFakeTimers()
+    fireEvent.change(rawEditor(), { target: { value: '# Hello\n\nunsaved rename' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
 
-    await waitFor(() => expect(api.saveNote).toHaveBeenCalled())
+    // Rename while the debounce save is still unresolved. This second save
+    // barrier must JOIN the active request instead of issuing a competing save
+    // whose success could hide the first request's failure.
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    rowAction('One', 'Rename note')
+    const field = screen.getByRole('textbox', { name: 'Note name' })
+    fireEvent.change(field, { target: { value: 'Renamed' } })
+    fireEvent.keyDown(field, { key: 'Enter', code: 'Enter' })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      save.reject(staleRejection())
+      await save.promise.catch(() => undefined)
+    })
+    vi.useRealTimers()
+    expect(await screen.findByText('This note changed on disk since you opened it.')).toBeTruthy()
     // Renaming would retarget the editor without ever reconciling its content.
     expect(api.moveNote).not.toHaveBeenCalled()
   })
@@ -812,6 +986,144 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(dirty.defaultPrevented).toBe(true)
   })
 
+  it('flushes a pending autosave once when the page unmounts', async () => {
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'unsaved work' } })
+
+    view.unmount()
+    expect(api.saveNote).toHaveBeenCalledWith('v1', 'One.md', 'unsaved work', 4)
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+
+    // The cancelled debounce must not fire a second, post-unmount save.
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+  })
+
+  it('waits for an active autosave before flushing the final edit on unmount', async () => {
+    const first = deferred<{ ok: boolean; mtime: number }>()
+    const second = deferred<{ ok: boolean; mtime: number }>()
+    const third = deferred<{ ok: boolean; mtime: number }>()
+    api.saveNote
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockImplementationOnce(() => third.promise)
+
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'first edit' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+
+    fireEvent.change(rawEditor(), { target: { value: 'second edit' } })
+    await act(async () => first.settle({ ok: true, mtime: 5 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(2, 'v1', 'One.md', 'second edit', 5)
+
+    fireEvent.change(rawEditor(), { target: { value: 'third edit' } })
+    await act(async () => second.settle({ ok: true, mtime: 6 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(3, 'v1', 'One.md', 'third edit', 6)
+
+    // Change the buffer during the final bounded retry. Teardown must not race
+    // that request with the old mtime; it waits, then saves the latest snapshot.
+    fireEvent.change(rawEditor(), { target: { value: 'final edit' } })
+    view.unmount()
+    expect(api.saveNote).toHaveBeenCalledTimes(3)
+
+    await act(async () => third.settle({ ok: true, mtime: 7 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(4, 'v1', 'One.md', 'final edit', 7)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(4)
+  })
+
+  it('cannot dirty a note whose delete is in flight, so unmount has nothing to resurrect', async () => {
+    // What keeps the unmount flush from writing a note back to disk after the
+    // user deleted it. The flush itself carries a `targetsSameNote` guard, but
+    // the reason that guard is unreachable is THIS invariant, so it is the one
+    // worth pinning: `edit` refuses while the open note's delete is in flight,
+    // so no content is committed and no debounce is ever armed to flush.
+    const del = deferred<{ ok: boolean }>()
+    api.deleteNote.mockImplementationOnce(() => del.promise)
+
+    const view = await mountWithNote()
+    await userEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    // Delete the OPEN note and hold the request open, so the editor stays
+    // mounted for the round trip with `deletingRef` armed.
+    await confirmDelete('One')
+    expect(api.deleteNote).toHaveBeenCalledTimes(1)
+
+    fireEvent.change(rawEditor(), { target: { value: 'typed during the delete' } })
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    // Unmount inside what would have been the debounce window.
+    view.unmount()
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    await act(async () => del.settle({ ok: true }))
+  })
+
+  it('flushes on unmount after a failed save left the buffer dirty', async () => {
+    // A failed save is the one state with no timer and nothing tracked but an
+    // unpersisted edit: `flushSave` clears the debounce on entry and releases its
+    // tracking in `finally`, and only a keystroke re-arms the debounce. Teardown
+    // still has to write, or navigating away after a transient failure loses the
+    // edit exactly as the leaked timer used to.
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'survives a failed save' } })
+
+    api.saveNote.mockRejectedValueOnce(new Error('no space left on device'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    view.unmount()
+    expect(api.saveNote).toHaveBeenNthCalledWith(2, 'v1', 'One.md', 'survives a failed save', 4)
+  })
+
+  it('waits for an in-flight move before flushing, so the edit lands on the new path', async () => {
+    // A move retargets `pathRef` only when its response comes back, so between
+    // request and reply the open note's path names a file the server has already
+    // moved away. Writing there on unmount would send the edit to the old path
+    // and lose it to a swallowed ESTALE, so teardown has to wait for the move
+    // the same way it waits for an in-flight save.
+    const move = deferred<{ ok: boolean; path: string }>()
+    api.moveNote.mockImplementationOnce(() => move.promise)
+
+    const view = await mountWithNote()
+    await userEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    rowAction('One', 'Rename note')
+    const field = await screen.findByRole('textbox', { name: 'Note name' })
+    await userEvent.clear(field)
+    await userEvent.type(field, 'Renamed{Enter}')
+    await waitFor(() => expect(api.moveNote).toHaveBeenCalledWith('v1', 'One.md', 'Renamed.md'))
+
+    // Type while the move is still in flight: `pathRef` still says One.md.
+    fireEvent.change(rawEditor(), { target: { value: 'typed during the move' } })
+    view.unmount()
+    // Nothing may be written to the path the move is vacating.
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    await act(async () => move.settle({ ok: true, path: 'Renamed.md' }))
+    // Once the move retargets `pathRef`, the edit goes to the NEW path. Both
+    // writes below target it: the flush, and then the move's own reopen, which
+    // goes through `openNote` and flushes the outgoing note first. That second
+    // write is relocate's pre-existing behaviour, not something teardown adds --
+    // it carries the same bytes to the same path and the backend refuses it on
+    // mtime. What matters, and what regressed before this fix, is that NEITHER
+    // of them is addressed to the path the move vacated.
+    expect(api.saveNote).toHaveBeenCalledWith('v1', 'Renamed.md', 'typed during the move', 4)
+    expect(api.saveNote).toHaveBeenCalledTimes(2)
+    expect(api.saveNote.mock.calls.every(c => c[1] === 'Renamed.md')).toBe(true)
+  })
+
   // ── panel ─────────────────────────────────────────────────────────────────
 
   it('drags the notes panel wider and remembers the width', async () => {
@@ -934,12 +1246,16 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
 
     // The alert's presence IS the proof the Sync path consumed the rejection:
     // had the debounced autosave consumed it instead, runSync's setError(null)
-    // would have erased the banner before this query could see it. A saveNote
-    // call-count assertion would NOT be a stronger pin — earlier tests in this
-    // file leave real 1000ms debounce timers running past their own teardown,
-    // and one landing here inflates the shared mock's count nondeterministically.
+    // would have erased the banner before this query could see it.
     const alert = await screen.findByRole('alert', { timeout: 5_000 })
     expect(alert.textContent).toContain('no space left on device')
+    // And now the count, which #2964 could not assert: earlier tests in this
+    // file left real 1000ms debounce timers running past their own teardown, and
+    // one landing here inflated the shared mock nondeterministically. The page
+    // cancels that timer on unmount now, so exactly one save reached the mock —
+    // a stronger pin than the alert alone, because it rules out a second call
+    // having consumed the single staged rejection.
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
   })
 
   it('reopens the open note when the change poll reports it was modified', async () => {

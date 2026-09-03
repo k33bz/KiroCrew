@@ -187,6 +187,12 @@ const groupForDisplay = records => {
 /** Repo root — `website/`'s parent, where every git call is rooted. */
 const REPO = fileURLToPath(new URL('../..', import.meta.url))
 
+/**
+ * This checkout's `website/node_modules`. The base bundle is built against it, so it
+ * is also what decides whether a base tree is buildable at all.
+ */
+const NODE_MODULES = join(fileURLToPath(new URL('..', import.meta.url)), 'node_modules')
+
 const argv = process.argv.slice(2)
 const has = f => argv.includes(f)
 const opt = (f, d) => {
@@ -345,6 +351,38 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
     return done({ builtins: [], user_added: [], policy_pinned: [] })
   }
   if (path === '/api/security/posture') return done({ posture: {} })
+  // The speech-to-text panel's model rows and its download line come from here.
+  // The fallback `{}` renders neither, so the surface would be scanned without the
+  // model names, the byte units and the availability sentence that are most of its
+  // localisable copy. A model deliberately marked absent keeps the "not on this
+  // machine yet" line in the frame, which is the one a first-run user reads.
+  if (path === '/api/stt/status') {
+    return done({
+      provider: 'local',
+      available: true,
+      code: '',
+      detail: '',
+      model: 'base',
+      model_present: false,
+      model_bytes: 147951465,
+      engine_loaded: false,
+      models: [
+        { name: 'tiny', size_bytes: 77691713, present: false },
+        { name: 'base', size_bytes: 147951465, present: false },
+        { name: 'small', size_bytes: 487601967, present: false },
+        { name: 'large-v3-turbo', size_bytes: 1624555275, present: false },
+      ],
+      download: { step: 'idle', model: '', downloaded_bytes: 0, total_bytes: 0, error: '' },
+    })
+  }
+  // KnowledgePage treats any resolved value as a stats object. The shared stub's
+  // unknown-path fallback is `[]`, which is truthy: depending on whether its query
+  // settles before the scanner runs, the stats row appears in only one of the HEAD
+  // and base sweeps and creates a false diff. Use the real endpoint shape so both
+  // bundles deterministically expose the same translated row to the scanner.
+  if (path === '/api/knowledge/stats') {
+    return done({ items: 35, entities: 120, relations: 88, sources: 3 })
+  }
   // BUILTIN APP COLLECTION SHAPES. `handleBootRoute`'s fallback answers an
   // unknown path with `[]` (or `{}` for a config-ish name), and for most app
   // endpoints that is fine — the panel renders its empty state, which is exactly
@@ -402,7 +440,7 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
   if (path === '/api/config/stt') {
     return done({
       enabled: false, provider: '0007', model: '', mlx_model: '',
-      available: false, docker_mode: false, models: {}, mlx_models: {},
+      available: false, models: {}, mlx_models: {},
     })
   }
   // APP STORE + APP DETAIL. `handleBootRoute`'s fallback answers `/api/apps` and
@@ -569,6 +607,34 @@ function resolveBaseScope() {
   if (!renderable.length) {
     return { run: false, reason: `no renderable file changed vs ${sha.slice(0, 8)} (${changed.length} file(s) in diff)` }
   }
+
+  // The base bundle is built against HEAD's `node_modules` (see `buildBaseBundle`),
+  // so a branch that REMOVES a frontend dependency the base still imports leaves the
+  // base tree unbuildable — and the failure lands on code that is not in the diff.
+  // Skip rather than die: policing the base's dependency set is explicitly not this
+  // gate's job, and exiting 2 here fails a branch for tidying a dependency up.
+  //
+  // Read from the base commit instead of the exported tree, so this costs one
+  // `git show` rather than an archive that is about to be thrown away.
+  let baseDeps = {}
+  try {
+    const basePkg = JSON.parse(git(['show', `${sha}:website/package.json`]))
+    baseDeps = { ...(basePkg.dependencies || {}), ...(basePkg.devDependencies || {}) }
+  } catch {
+    // A base with no readable manifest is the pre-existing `buildBaseBundle` failure
+    // mode, not this one; leave it to report there.
+  }
+  const missing = Object.keys(baseDeps).filter(
+    name => !existsSync(join(NODE_MODULES, ...name.split('/'), 'package.json')),
+  )
+  if (missing.length) {
+    return {
+      run: false,
+      fallback: true,
+      reason: `base tree ${sha.slice(0, 8)} needs ${missing.join(', ')}, which this branch's `
+        + 'lockfile removes, and the base bundle builds against this branch\'s node_modules',
+    }
+  }
   return { run: true, sha, changed: renderable.length }
 }
 
@@ -636,7 +702,7 @@ function buildBaseBundle(sha) {
   // a stock Windows dev box and takes the whole gate down with exit 2. A junction
   // needs no privilege. It requires an absolute target, which this already is.
   symlinkSync(
-    join(fileURLToPath(new URL('..', import.meta.url)), 'node_modules'),
+    NODE_MODULES,
     join(baseWeb, 'node_modules'),
     process.platform === 'win32' ? 'junction' : 'dir',
   )

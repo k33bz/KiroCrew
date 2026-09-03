@@ -2,10 +2,12 @@ import { useState, useRef, useEffect, memo } from 'react'
 import { AnimatePresence, motion, useMotionValue, useSpring } from 'framer-motion'
 import { Hourglass, ChevronUp, X, Zap, Pencil, Check, Bot, Loader2, ArrowUp, ArrowDown } from 'lucide-react'
 import type { ChatMessage } from '../types'
+import { useImeGuard } from '../hooks/useImeGuard'
 
 import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
  *  would silently lose a finished agent's result) and rendering each as a
@@ -64,7 +66,14 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
   if (count <= 0) return null
   return (
     <div
-      className="mx-auto w-full px-5"
+      // `relative z-[2]` clears the transcript's bottom mask. That mask is
+      // `z-[1]` and deliberately overshoots COMPOSER_MASK_OVERSHOOT_PX BELOW the
+      // scrollport edge to sit flush against the composer box — an overshoot
+      // sized for an EMPTY composer status stack. This bar is the first thing in
+      // that stack, so at auto z-index the mask's opaque tail painted over its
+      // top 10px: top border, both top corners and the first line's ascenders
+      // were shaved, which reads as the card being clipped by the UI.
+      className="relative z-[2] mx-auto w-full px-4"
       style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
       data-testid="subagent-delivery-progress"
     >
@@ -98,6 +107,7 @@ function EditInput({ initial, onCommit, onCancel }: {
   onCancel: () => void
 }) {
   const ref = useRef<HTMLInputElement>(null)
+  const ime = useImeGuard()
   const [value, setValue] = useState(initial)
   // Guard so blur and an explicit save/Enter don't both fire onCommit.
   const committedRef = useRef(false)
@@ -123,14 +133,16 @@ function EditInput({ initial, onCommit, onCancel }: {
         onClick={e => e.stopPropagation()}
         onKeyDown={e => {
           e.stopPropagation()
-          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit() }
-          else if (e.key === 'Escape') { e.preventDefault(); cancel() }
+          if (e.key === 'Enter' && !e.shiftKey) {
+            // The commit's own emptiness check stays in commit().
+            if (ime.claimEnter(e)) commit()
+          } else if (e.key === 'Escape') { e.preventDefault(); ime.reset(); cancel() }
         }}
-        onBlur={commit}
-        className="flex-1 min-w-0 bg-white/20 text-warn-fg placeholder:text-warn-fg/50 rounded px-1.5 py-0.5 text-[13px] outline-none border border-white/30 focus:border-white/60"
+        {...ime.bindComposition({ onBlur: commit })}
+        className="flex-1 min-w-0 bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] outline-none border border-[var(--border)] focus-visible:border-[var(--accent)]"
         aria-label={i18nT('components.queueStack.edit_queued_message')}
       />
-      <button className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors text-white"
+      <button className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)]"
         title={i18nT('components.queueStack.save')} aria-label={i18nT('components.queueStack.save_edit')}
         // mousedown commits before the input's blur can fire with the same value.
         onMouseDown={e => { e.preventDefault(); e.stopPropagation() }}
@@ -162,6 +174,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  of overlapping it. */
   fuseBelow?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)
   const expanded = _expanded && messages.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -222,7 +235,14 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
   }
 
   return (
-    <div className="px-5 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
+    // `zIndex: 2` clears the transcript's bottom mask (`z-[1]`), whose
+    // COMPOSER_MASK_OVERSHOOT_PX tail reaches below the scrollport edge on the
+    // premise that the composer's own gap is what sits there. When this stack is
+    // the first thing under the transcript the tail lands on the front card
+    // instead and shaved its top border and corners. Still far below the
+    // composer's own `z-10`, so the collapsed card's -OVERLAP fuse keeps sliding
+    // UNDER the input box rather than over it.
+    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 2 }}>
       <motion.div
         className="relative cursor-pointer"
         animate={{ height: targetHeight }}
@@ -324,7 +344,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       {onReorder && expanded && messages.length > 1 && (
                         <>
                           <button
-                            className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                            className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
                             title={i18nT('components.queueStack.run_sooner')}
                             aria-label={i18nT('components.queueStack.run_sooner')}
                             disabled={i === 0}
@@ -333,7 +353,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                             <ArrowDown size={13} />
                           </button>
                           <button
-                            className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                            className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
                             title={i18nT('components.queueStack.run_later')}
                             aria-label={i18nT('components.queueStack.run_later')}
                             disabled={i === messages.length - 1}
@@ -345,7 +365,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onEdit && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.edit_queued_message')}
                           aria-label={i18nT('components.queueStack.edit_queued_message')}
                           disabled={isPending}
@@ -356,7 +376,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onInterrupt && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)] disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.interrupt_current_turn_and_send_this_now')}
                           aria-label={i18nT('components.queueStack.send_now')}
                           disabled={isPending}
@@ -367,7 +387,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onCancel && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.cancel_and_move_back_to_input')}
                           aria-label={i18nT('components.queueStack.cancel_queued_message')}
                           disabled={isPending}

@@ -12,11 +12,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
+from installer_test_helpers import run_bounded
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "packaging" / "signing" / "cli-manifest.py"
@@ -27,6 +29,38 @@ VERSION = "1.2.3"
 CHANNEL = "stable"
 WHEEL_NAME = f"kirocrew-{VERSION}-py3-none-any.whl"
 CDN_BASE = "https://fixtures.invalid"
+
+
+def _find_openssl() -> str | None:
+    direct = shutil.which("openssl")
+    if direct:
+        return direct
+    if os.name != "nt":
+        return None
+
+    git = shutil.which("git")
+    candidates: list[Path] = []
+    if git:
+        candidates.append(Path(git).resolve().parents[1] / "usr" / "bin" / "openssl.exe")
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "Git" / "usr" / "bin" / "openssl.exe")
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _openssl_on_path():
+    """Expose Git for Windows' OpenSSL to Python helpers and installer shells."""
+    openssl = _find_openssl()
+    if openssl is None:
+        pytest.skip("OpenSSL is not available")
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(Path(openssl).parent) + os.pathsep + old_path
+    try:
+        yield
+    finally:
+        os.environ["PATH"] = old_path
 
 
 @dataclass(frozen=True)
@@ -94,9 +128,7 @@ def _run_helper(
 
 def _write_canonical_json(path: Path, value: dict[str, object]) -> None:
     path.write_bytes(
-        (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
-            "ascii"
-        )
+        (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     )
 
 
@@ -107,12 +139,14 @@ def _build_manifest(
     *,
     channel: str = CHANNEL,
     artifact_base: str = CDN_BASE,
+    min_version: str = "",
 ) -> Path:
     payload = root / "payload.json"
     signature = root / "signature.bin"
     manifest = root / "cli-manifest.json"
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     wheel_url = f"{artifact_base.rstrip('/')}/cli/{channel}/{VERSION}/{WHEEL_NAME}"
+    extra_args = ("--min-version", min_version) if min_version else ()
     _run_helper(
         "payload",
         "--channel",
@@ -127,6 +161,7 @@ def _build_manifest(
         ">=3.10",
         "--pub-date",
         "2026-08-01T00:00:00Z",
+        *extra_args,
         "--public-key",
         str(key.public),
         "--output",
@@ -195,6 +230,80 @@ def test_helper_builds_a_canonical_independently_verifiable_manifest(
         text=True,
     )
     assert verified.returncode == 0, verified.stderr
+
+
+def test_optional_min_version_is_signed_and_round_trips(
+    tmp_path: Path, test_key: SigningKey
+) -> None:
+    """The forced-update floor rides INSIDE the signed payload: a manifest built
+    with one carries it, the signature covers it (tampering it invalidates the
+    envelope), and `verify` accepts the result."""
+    wheel = tmp_path / WHEEL_NAME
+    wheel.write_bytes(b"signed wheel bytes")
+    manifest_path = _build_manifest(tmp_path, test_key, wheel, min_version="1.2.0")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["min_version"] == "1.2.0"
+
+    verified = _run_helper(
+        "verify",
+        "--manifest",
+        str(manifest_path),
+        "--public-key",
+        str(test_key.public),
+        "--expected-channel",
+        CHANNEL,
+        "--artifact-base",
+        CDN_BASE,
+    )
+    assert verified.returncode == 0, verified.stderr
+
+    # Flip the floor after signing: the canonical payload changes, so the
+    # existing signature must no longer verify.
+    manifest["min_version"] = "0.0.1"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    tampered = _run_helper(
+        "verify",
+        "--manifest",
+        str(manifest_path),
+        "--public-key",
+        str(test_key.public),
+        "--expected-channel",
+        CHANNEL,
+        "--artifact-base",
+        CDN_BASE,
+        check=False,
+    )
+    assert tampered.returncode != 0
+
+
+def test_manifest_without_min_version_omits_the_field(tmp_path: Path, test_key: SigningKey) -> None:
+    """No floor means NO field — the canonical bytes must stay identical to the
+    pre-floor manifest format, or every no-floor release would re-sign
+    differently and break byte-identical publish retries."""
+    wheel = tmp_path / WHEEL_NAME
+    wheel.write_bytes(b"signed wheel bytes")
+    manifest_path = _build_manifest(tmp_path, test_key, wheel)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "min_version" not in manifest
+
+
+@pytest.mark.parametrize("bad", ["1.2.0rc1", "v1.2.0", "abc", "1.2.0-insider.1"])
+def test_min_version_must_be_a_bare_release(tmp_path: Path, test_key: SigningKey, bad: str) -> None:
+    wheel = tmp_path / WHEEL_NAME
+    wheel.write_bytes(b"signed wheel bytes")
+    with pytest.raises(subprocess.CalledProcessError):
+        _build_manifest(tmp_path, test_key, wheel, min_version=bad)
+
+
+def test_min_version_above_the_manifest_version_is_refused(
+    tmp_path: Path, test_key: SigningKey
+) -> None:
+    """A floor the manifest's own version cannot satisfy would force an update
+    loop the feed can never resolve — always a publisher typo."""
+    wheel = tmp_path / WHEEL_NAME
+    wheel.write_bytes(b"signed wheel bytes")
+    with pytest.raises(subprocess.CalledProcessError):
+        _build_manifest(tmp_path, test_key, wheel, min_version="9.9.9")
 
 
 def test_helper_refuses_to_assemble_a_tampered_payload(
@@ -322,6 +431,21 @@ esac
     )
     curl.chmod(0o755)
     pipx.chmod(0o755)
+
+    # cli.sh resolves an interpreter off PATH, and a bare host PATH hands it
+    # whatever version-manager shim is installed. Those shims resolve their tool
+    # installs under HOME, which this harness repoints at an empty temp dir, so
+    # a shim wedges instead of answering and the probe ladder stalls. Shadow
+    # EVERY candidate in cli.sh's ladder, not just the running version: the
+    # ladder tries python3.12 first, so on a 3.10 or 3.11 host that entry still
+    # reaches a host shim -- and a stock macOS has no `timeout` to bound it. The
+    # names are aliases rather than version claims; the probe only asserts
+    # >=3.10, which the interpreter running these tests satisfies. It must stay
+    # a REAL interpreter: cli.sh uses $PY for the signature and digest
+    # verification under test, so a stub would make those assertions vacuous.
+    for _name in ("python3.13", "python3.12", "python3.11", "python3.10", "python3"):
+        (tools / _name).symlink_to(sys.executable)
+
     return tools, curl_marker, install_marker
 
 
@@ -358,15 +482,68 @@ def _run_installer(
             "FAKE_INSTALL_MARKER": str(install_marker),
         }
     )
-    result = subprocess.run(
-        ["sh", str(script), "--cdn", CDN_BASE, *args],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
+    result = run_bounded(["sh", str(script), "--cdn", CDN_BASE, *args], env)
     return result, curl_marker, install_marker
+
+
+def test_the_harness_shadows_every_interpreter_the_installer_probes(
+    tmp_path: Path,
+) -> None:
+    """No ladder entry may fall through to a host interpreter.
+
+    Shadowing only the running python3.X leaves cli.sh's first candidate
+    (python3.12) resolving to whatever the host has, which on a version-manager
+    host is a shim that wedges -- and a stock macOS has no ``timeout`` to bound
+    the probe. Read the ladder out of cli.sh so it cannot drift from this.
+    """
+    if os.name == "nt":
+        # The shadowing is symlink-based and Windows gates symlink creation on
+        # privilege, so this asserts a POSIX-only property. Every other caller
+        # of _write_fake_tools already skips Windows before reaching it.
+        pytest.skip("cli.sh and its PATH shadowing are POSIX-only")
+    tools, _curl_marker, _install_marker = _write_fake_tools(tmp_path / "run")
+
+    ladder = re.search(r"for _c in ([^;]+); do", INSTALLER.read_text())
+    assert ladder, "cli.sh no longer has a recognizable interpreter ladder"
+
+    candidates = [c for c in ladder.group(1).split() if c.startswith("python")]
+    assert candidates, "no interpreter candidates parsed out of cli.sh's ladder"
+
+    unshadowed = [c for c in candidates if not (tools / c).exists()]
+    assert not unshadowed, f"host interpreters reachable from the harness: {unshadowed}"
+
+
+def test_a_wedged_grandchild_does_not_outlive_the_bounded_run(tmp_path: Path) -> None:
+    """The timeout path must reap the whole tree, not just the shell it spawned.
+
+    Without the process-group kill a wedged grandchild is reparented to init and
+    keeps burning a core until someone notices by hand.
+    """
+    if os.name == "nt":
+        pytest.skip("process groups are POSIX-only")
+    pidfile = tmp_path / "grandchild.pid"
+    script = tmp_path / "spawn.sh"
+    script.write_text(
+        """#!/bin/sh
+# Detach a grandchild that outlives its parent shell, which is how a wedged
+# interpreter shim under `sh` behaves.
+sh -c 'echo $$ > "$1"; exec sleep 300' _ "$1" &
+wait
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_bounded(["sh", str(script), str(pidfile)], os.environ.copy(), 5.0)
+    pid = int(pidfile.read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"grandchild {pid} survived the bounded run")
 
 
 @pytest.mark.parametrize("pinned", [False, True])
@@ -389,6 +566,26 @@ def test_installer_verifies_signature_and_digest_before_installing(
     assert install_marker.exists()
     assert "Verified signed manifest." in result.stdout
     assert "Verified SHA-256." in result.stdout
+
+
+def test_installer_accepts_a_manifest_carrying_a_min_version_floor(
+    tmp_path: Path, test_key: SigningKey
+) -> None:
+    """A breaking release's feed carries the optional signed ``min_version``
+    floor — and the installer is exactly the tool an out-of-date install runs
+    to satisfy it, so refusing such a manifest would strand every client the
+    floor exists to move."""
+    wheel = tmp_path / WHEEL_NAME
+    wheel.write_bytes(b"verified wheel")
+    manifest = _build_manifest(tmp_path, test_key, wheel, min_version="1.2.0")
+    cdn = _stage_cdn(tmp_path, manifest, wheel)
+    script = _patched_installer(tmp_path, test_key)
+
+    result, _curl_marker, install_marker = _run_installer(script, tmp_path / "run", cdn)
+
+    assert result.returncode == 0, result.stderr
+    assert install_marker.exists()
+    assert "Verified signed manifest." in result.stdout
 
 
 @pytest.mark.parametrize("pinned", [False, True])
@@ -589,9 +786,7 @@ def test_kms_signer_requires_matching_non_exportable_key_and_verifies_output(
                 "PublicKey": base64.b64encode(public_der).decode("ascii"),
             }
         if args[:2] == ["kms", "sign"]:
-            return {
-                "Signature": base64.b64encode(signature.read_bytes()).decode("ascii")
-            }
+            return {"Signature": base64.b64encode(signature.read_bytes()).decode("ascii")}
         raise AssertionError(f"unexpected AWS CLI arguments: {args}")
 
     monkeypatch.setattr(helper, "_run_aws_json", fake_aws_json)
@@ -712,9 +907,7 @@ def test_verify_refuses_a_valid_manifest_from_another_artifact_host(
 ) -> None:
     wheel = tmp_path / WHEEL_NAME
     wheel.write_bytes(b"wrong-host-wheel")
-    manifest = _build_manifest(
-        tmp_path, test_key, wheel, artifact_base="https://attacker.invalid"
-    )
+    manifest = _build_manifest(tmp_path, test_key, wheel, artifact_base="https://attacker.invalid")
 
     refused = _verify_manifest(manifest, test_key)
 
@@ -738,9 +931,7 @@ def test_installer_publish_refuses_an_unconfigured_trust_root() -> None:
     names = [step.get("name") for step in steps]
 
     guard = next(
-        step
-        for step in steps
-        if step.get("name") == "Refuse to publish an unconfigured trust root"
+        step for step in steps if step.get("name") == "Refuse to publish an unconfigured trust root"
     )
     assert "CLI_MANIFEST_KEY_ID" in guard["run"]
     assert "UNCONFIGURED" in guard["run"]
@@ -781,11 +972,17 @@ def test_installer_publish_refuses_an_unconfigured_trust_root() -> None:
 def test_publish_workflow_writes_immutable_manifest_before_signed_feed() -> None:
     run = _workflow_step("Publish wheel and signed channel manifest")["run"]
     immutable = 'put_immutable "${PREFIX}/cli-manifest.json" "$MANIFEST_PATH"'
-    feed = 'aws s3 cp "$MANIFEST_PATH" "s3://${BUCKET}/feed/${CHANNEL}/latest-cli.json"'
+    # The feed write targets ${FEED_KEY} (feed/<channel>/latest-cli.json),
+    # and sits behind the monotonicity guard's advance verdict -- but its
+    # ORDER relative to the immutable manifest put is unchanged: the pointer
+    # may only ever name a manifest that is already live.
+    feed_key = 'FEED_KEY="feed/${CHANNEL}/latest-cli.json"'
+    feed = 'aws s3 cp "$MANIFEST_PATH" "s3://${BUCKET}/${FEED_KEY}"'
 
     assert immutable in run
+    assert feed_key in run
     assert feed in run
-    assert run.index(immutable) < run.index(feed)
+    assert run.index(immutable) < run.index(feed_key) < run.index(feed)
     assert "cat > /tmp/latest-cli.json" not in run
     assert "--cache-control no-cache" in run
 
@@ -811,9 +1008,14 @@ def test_publish_workflow_gates_all_artifact_work_before_side_effects() -> None:
         "Checkout manifest verifier contract",
         "Download wheel artifact",
         "Locate wheel and compute checksum",
-        "Attest wheel provenance",
     ):
         assert _workflow_step(name)["if"] == complete_config
+
+    promote = "${{ env.HAS_PUBLISH_ROLE && env.HAS_MANIFEST_KEY && inputs.promote }}"
+    fresh_build = "${{ env.HAS_PUBLISH_ROLE && env.HAS_MANIFEST_KEY && !inputs.promote }}"
+    assert _workflow_step("Verify immutable promotion bundle")["if"] == promote
+    assert _workflow_step("Attest wheel provenance")["if"] == fresh_build
+    assert _workflow_step("Verify promoted wheel provenance")["if"] == promote
 
 
 def test_installer_fetches_authenticated_urls_without_redirects() -> None:

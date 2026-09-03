@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -70,16 +71,30 @@ class SyncScheduler:
         props["consecutive_failures"] = failures
         updates = {"properties": props}
         if failures >= MAX_FAILURES:
-            props["sync_status"] = "error"
+            # The column is the single source of truth: the dashboard, the
+            # watcher's pre-scan skip and sync_all below all read it.
+            updates["sync_status"] = "error"
             logger.warning("Source %s reached %d failures, marking as error", source_id, failures)
         self.store.update_source(source_id, **updates)
 
     async def sync_all(self) -> list[dict]:
-        rows = self.store.db.execute("SELECT id, properties FROM sources").fetchall()
+        # Off the loop: this is a background coroutine and a contended sqlite
+        # read holds it for as long as busy_timeout.
+        rows = await asyncio.to_thread(
+            lambda: self.store.db.execute("SELECT id, sync_status FROM sources").fetchall())
         results = []
         for row in rows:
-            props = json.loads(row["properties"] or "{}")
-            if props.get("sync_status") == "error":
+            # An errored source stays quiesced instead of being retried every
+            # sweep. A row errored before the column existed carries the state in
+            # its properties blob only, which cannot be ordered against the
+            # column, so it is not promoted: such a row is polled like any other
+            # source until an attempt actually FAILS, and that first failure has
+            # _record_failure -- whose failure count the row already carries --
+            # write the column, after which it quiesces here like the rest. A
+            # poll that finds nothing to fetch costs what every healthy source's
+            # poll costs; promoting the blob value instead would let a state no
+            # writer has touched since overrule the column.
+            if row["sync_status"] == "error":
                 continue
             results.append(await self.sync_source(row["id"]))
         return results

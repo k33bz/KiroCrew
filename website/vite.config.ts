@@ -19,6 +19,16 @@ import {
   TAILWIND_RUNTIME_PATH,
   TAILWIND_RUNTIME_SRC,
 } from './src/lib/vendorPaths'
+import { precompressPlugin } from './scripts/precompress.mjs'
+import {
+  parseBrandingConfig,
+  applyBrandingToHtml,
+  SHELL_OVERLAY_ALLOWLIST,
+  verifyOverlayBytes,
+} from './scripts/lib/editionShell.mjs'
+
+/** Shape produced by parseBrandingConfig (editionShell.mjs is untyped .mjs). */
+type EditionBranding = { title?: string; themeColor?: string }
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const backendPort = process.env.KIROCREW_PORT || 5476
@@ -124,6 +134,15 @@ function vendorRuntimePlugin(): Plugin {
         const hit = RUNTIMES.find((r) => r.servePath === url)
         if (!hit) return next()
         res.setHeader('Content-Type', 'text/javascript; charset=utf-8')
+        // The consumers of these two files are sandboxed srcdoc iframes — null
+        // origin — whose <script> tags load with crossorigin="anonymous", which
+        // makes this header MANDATORY (without it the load hard-fails at the
+        // CORS layer and dev-mode widgets/sketches render unstyled). Vite's own
+        // cors default cannot supply it: since Vite 6.2 the default is a
+        // localhost-origin allowlist that `Origin: null` does not match. Scoped
+        // to exactly these two public runtime files, mirroring the gateway's
+        // /vendor/-only grant in production.
+        res.setHeader('Access-Control-Allow-Origin', '*')
         res.end(readFileSync(hit.src))
       })
     },
@@ -251,9 +270,104 @@ function editionExtensionPlugin(): Plugin {
         'Unset KIROCREW_EDITION_DIR for a stock build.\n'
     )
   }
+  // Pre-boot shell branding, resolved eagerly like the composition root so a
+  // malformed branding.json fails the build at startup, not mid-bundle. The
+  // eager read also means a dev server restart is needed after editing
+  // branding.json — consistent with how the composition root itself resolves.
+  // Optional: an edition without one keeps the stock title/theme-color.
+  let branding: EditionBranding = {}
+  let overlayFiles: string[] = []
+  if (editionEntry) {
+    const abs = path.dirname(editionEntry)
+    const brandingPath = path.join(abs, 'branding.json')
+    if (existsSync(brandingPath)) {
+      try {
+        branding = parseBrandingConfig(readFileSync(brandingPath, 'utf-8'))
+      } catch (e: unknown) {
+        throw new Error(`[kirocrew-edition] ${brandingPath}: ${(e as Error).message}`)
+      }
+    }
+    // Only allowlisted shell assets overlay the stock public/ copies; anything
+    // else in the edition's public/ fails the build (fail-loud beats a file
+    // that looks deployed but never ships). Deliberately flat: a subdirectory
+    // is rejected like any other stray entry, so the allowlist stays a list of
+    // exact filenames rather than a path-matching scheme. OS junk dotfiles
+    // (.DS_Store and friends) are skipped, not rejected — the OS creates them
+    // behind the author's back, so failing on them would be noise, not safety.
+    const publicDir = path.join(abs, 'public')
+    if (existsSync(publicDir)) {
+      const entries = readdirSync(publicDir, { withFileTypes: true }).filter(
+        (d) => !d.name.startsWith('.')
+      )
+      const strays = entries.filter(
+        (d) => !d.isFile() || !SHELL_OVERLAY_ALLOWLIST.includes(d.name)
+      )
+      if (strays.length > 0) {
+        throw new Error(
+          `[kirocrew-edition] ${publicDir} contains entries outside the shell-overlay allowlist ` +
+            `(${SHELL_OVERLAY_ALLOWLIST.join(', ')}), or non-files: ` +
+            `${strays.map((d) => d.name).join(', ')}. ` +
+            'The allowlist is what keeps an edition from overwriting index.html, sw.js, or vendor/*.'
+        )
+      }
+      overlayFiles = entries.map((d) => d.name)
+    }
+  }
   return {
     name: 'kirocrew-edition-extension',
     enforce: 'pre',
+    // Patch the pre-boot shell (<title>, <meta name="theme-color">) from the
+    // edition's branding.json. registerThemeBranding() can only retitle the tab
+    // after React mounts; this covers what the browser shows before that (and
+    // what a PWA install dialog samples). order:'pre' runs before Vite's own
+    // HTML transform reprints the tags.
+    transformIndexHtml: {
+      order: 'pre',
+      handler(html: string, ctx: { path: string }) {
+        if (!branding.title && !branding.themeColor) return html
+        // Multi-page build: app panels (src/apps/*/panel.html) come through
+        // this hook too. The pre-boot shell is the root index.html only.
+        if (ctx.path !== '/index.html') return html
+        return applyBrandingToHtml(html, branding)
+      },
+    },
+    // Overlay the allowlisted shell assets (PWA manifest + icons) edition-wins.
+    // Emitted through the bundler so the files are visible to other plugins,
+    // rather than copied over dist after the fact. An emitted asset with a
+    // pinned fileName takes precedence over the same-named publicDir copy
+    // (verified against this config on Vite 8 / Rolldown; the negative case —
+    // publicDir winning — would surface immediately as stock bytes in dist).
+    // Build-only by nature of generateBundle: the dev server keeps serving the
+    // stock public/ files, which the seam docs call out as a known limitation.
+    generateBundle() {
+      for (const file of overlayFiles) {
+        this.emitFile({
+          type: 'asset',
+          fileName: file,
+          source: readFileSync(path.join(path.dirname(editionEntry as string), 'public', file)),
+        })
+      }
+    },
+    // Enforce the emitFile-over-publicDir precedence generateBundle relies on.
+    // The overlay above assumes an emitted asset with a pinned fileName wins
+    // over the same-named publicDir copy; that is empirical (Vite 8 / Rolldown),
+    // not a documented bundler contract. writeBundle runs AFTER the bundle is
+    // written to disk, so it sees what actually landed: byte-compare each
+    // overlaid dist file against its edition source and fail loud on a mismatch
+    // or a missing file. A future bundler upgrade that flips the precedence
+    // would silently ship stock icons/manifest on a green build — and edition
+    // builds run downstream, outside this repo's CI, so this check is the only
+    // thing that would catch it. No-op for stock builds (overlayFiles is empty).
+    writeBundle(options) {
+      if (overlayFiles.length === 0) return
+      verifyOverlayBytes({
+        distDir: options.dir ?? path.resolve('dist'),
+        editionPublicDir: path.join(path.dirname(editionEntry as string), 'public'),
+        overlayFiles,
+        readFile: readFileSync,
+        join: path.join,
+      })
+    },
     config() {
       if (editionDir) {
         // Let vite's dev server serve/resolve files from outside the project
@@ -392,7 +506,7 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -452,6 +566,25 @@ export default defineConfig({
           disableJavaScriptFileLoading: true,
           disableJavaScriptEvaluation: true,
           disableCSSFileLoading: true,
+          // Resolve a declined resource load as a silent success instead of
+          // rejecting with a NotSupportedError. happy-dom runs the load
+          // asynchronously on DOM insertion, so that rejection is orphaned —
+          // it escapes the test that inserted the node and vitest counts it as
+          // a run-level unhandled error, failing the whole shard even when every
+          // assertion passed. We assert the serialized DOM, never the sandboxed
+          // widget runtime, so a no-op success preserves the contract under test.
+          handleDisabledFileLoadingAsSuccess: true,
+          // Never follow a link or form navigation over the network. An
+          // un-intercepted `<a href>` click — e.g. an artifact anchor a test
+          // clicks with no onArtifactOpen handler — otherwise makes happy-dom
+          // dial the document origin for real; that fetch outlives the test and
+          // its ECONNREFUSED lands after msw teardown as another orphaned
+          // rejection. Disabling navigation still falls back to setting the URL
+          // (no dial), so tests that read location after a click keep working.
+          navigation: {
+            disableMainFrameNavigation: true,
+            disableChildFrameNavigation: true,
+          },
         },
       },
     },
@@ -469,8 +602,29 @@ export default defineConfig({
     // ceiling that fails a genuine leak loudly instead of dragging the host down.
     // (Vitest 4 pool rework: these are top-level, not poolOptions; minWorkers
     // was removed — only maxWorkers has effect.)
-    maxWorkers: 4,
-    execArgv: ['--max-old-space-size=4096'],
+    //
+    // 3, not 2: `ubuntu-latest` has 4 vCPU (this workflow's own backend job
+    // documents "4 cores via -n auto"), so 2 left half of every shard's runner
+    // idle. 3 is exactly what vitest itself would pick there when uncapped
+    // (`max(availableParallelism - 1, 1)` in run mode), leaving a core for the
+    // main process — so this raises throughput without oversubscribing, and the
+    // cap still protects the high-core fleet the paragraph above is about.
+    //
+    // MEASURED on 6 of the heaviest files with --coverage, same input each time:
+    //   maxWorkers 2 -> 106.7s, peak 2001 MB total
+    //   maxWorkers 3 ->  81.2s, peak 2674 MB total   <- chosen
+    //   maxWorkers 4 ->  83.3s, peak 3475 MB total
+    // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
+    // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
+    maxWorkers: 3,
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for
@@ -550,10 +704,13 @@ export default defineConfig({
     // window in which a NEW oversized chunk could slip in undetected is as
     // small as physically possible. TRADEOFF (accept knowingly): this is a
     // single global knob, so it cannot distinguish "known-large" from "new
-    // regression" — a new chunk up to ~3.81MB would not warn. That residual gap
-    // is unavoidable without per-chunk limits (unsupported by Vite); the honest
-    // alternatives — leaving the limit at 500KB (a permanent false-positive that
-    // trains reviewers to ignore it) or splitting Monaco's monolithic core (not
+    // regression" — a new chunk up to ~3.81MB would not warn HERE. That residual
+    // gap is covered in CI by the per-chunk gate (scripts/check-bundle-size.mjs,
+    // run against the analyze-mode build): explicit ceilings for the known-large
+    // chunks, a 500KB default for everything else. This knob stays anyway as the
+    // only signal a plain local `npm run build` prints; the honest local
+    // alternatives — a 500KB limit (a permanent false-positive that trains
+    // developers to ignore it) or splitting Monaco's monolithic core (not
     // feasible) — are worse. Lower this the moment `editor.main`/`index` shrink;
     // do NOT raise it without first splitting the chunk that forced the raise.
     chunkSizeWarningLimit: 3810,
@@ -602,6 +759,16 @@ export default defineConfig({
           if (/[\\/]node_modules[\\/](d3|d3-[^\\/]+|internmap|delaunator|robust-predicates)[\\/]/.test(id)) {
             return 'vendor-d3'
           }
+          // ForceAtlas2 + Louvain are physics-only: KnowledgeGraph defers both
+          // with `import('graphology-layout-forceatlas2')` / `.../worker` and
+          // `import('graphology-communities-louvain')`, reached only when physics
+          // is toggled on or the one-shot mount layout runs. Route them to their
+          // OWN lazy chunk ahead of the broad graphology rule below, so the eager
+          // vendor-graph chunk (sigma + core graphology, loaded for every graph
+          // view) does not carry code the default physics-off view never touches.
+          if (/[\\/]node_modules[\\/](graphology-layout-forceatlas2|graphology-communities-louvain)[\\/]/.test(id)) {
+            return 'vendor-graph-physics'
+          }
           // Graph/network visualization stack (vis-network, vis-data, sigma,
           // graphology, cytoscape) — large and only used by graph views.
           if (/[\\/]node_modules[\\/](vis-network|vis-data|vis-util|sigma|graphology|graphology-[^\\/]+|cytoscape)[\\/]/.test(id)) {
@@ -611,6 +778,17 @@ export default defineConfig({
           // remark/rehype/unified pipeline).
           if (/[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/.test(id)) {
             return 'vendor-markdown'
+          }
+          // The YAML document parser, reached only by the skill editor's
+          // frontmatter round-trip (`SkillForm.tsx`). Bucketed like every other
+          // vendor library here because the App chunk is meant to hold FIRST-PARTY
+          // code -- its budget comment in scripts/check-bundle-size.mjs says as
+          // much -- and it is the ceiling that ordinary feature PRs trip. Measured
+          // 93.7 KB raw / 29 KB gzip, far under the gate's 500 KB default, so it
+          // needs no CHUNK_BUDGETS entry of its own. The leading separator keeps
+          // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
+          if (/[\\/]node_modules[\\/]yaml[\\/]/.test(id)) {
+            return 'vendor-yaml'
           }
         },
       },

@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { join } from 'node:path'
+import { readSource } from './readSource'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { OverflowMenu, breadcrumbSegments } from '../components/MarkdownPanel'
 import { api } from '../api/client'
+import { i18nT } from '../i18n/t'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -12,6 +15,27 @@ vi.mock('../api/client', () => ({
     createArtifact: vi.fn(),
     revealPath: vi.fn(),
   },
+  // revealOrOpen branches its failure wording on `err instanceof ApiError`, so
+  // the mock must export a real class — a bare object would make `instanceof`
+  // throw before the alert fires.
+  ApiError: class ApiError extends Error {
+    status: number
+    authRequired: boolean
+    constructor(status: number, message: string, _body = '', authRequired = false) {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.authRequired = authRequired
+    }
+  },
+}))
+
+// The overflow's Open/Reveal entries gate on directLocal (a remote session
+// cannot usefully drive Finder on the gateway). Default to a local session so
+// the inventory/label assertions see them; the remote case is its own test.
+const brandingEnv = vi.hoisted(() => ({ directLocal: true }))
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
 }))
 
 const writeText = vi.fn()
@@ -24,6 +48,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 
 beforeEach(() => {
   writeText.mockReset()
+  brandingEnv.directLocal = true
   queryClient.clear()
   // happy-dom's navigator.clipboard is getter-only; defineProperty replaces it.
   Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
@@ -102,20 +127,66 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
   })
 
-  it('tells the user the path was copied when the host has no desktop', async () => {
+  // A remote/tunneled session cannot usefully open Finder on the gateway, so
+  // the two desktop hand-off entries are gated on directLocal — matching the
+  // shared FilePathMenu, which self-gates on the same flag. The clipboard and
+  // download fallbacks stay.
+  it('hides both desktop hand-off entries on a remote session (directLocal false)', () => {
+    brandingEnv.directLocal = false
+    openMenu()
+    expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.getByText('Copy path')).toBeInTheDocument()
+    expect(screen.getByText('Copy content')).toBeInTheDocument()
+  })
+
+  /**
+   * The reveal entry names the GATEWAY's file manager: `/api/reveal` shells out
+   * there, so a dashboard opened from a Mac against a Linux gateway must not say
+   * Finder. `'gateway'` is the sentinel a non-owner dashboard user gets and must
+   * never be read as a platform we can name.
+   */
+  it.each([
+    ['darwin', 'Open in Finder'],
+    ['win32', 'Open in File Explorer'],
+    ['gateway', 'Show in file manager'],
+    ['linux', 'Show in file manager'],
+  ])('names the reveal entry for a %s gateway host', (platform, label) => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform })
+    openMenu()
+    expect(screen.getByText(label)).toBeInTheDocument()
+    fireEvent.click(screen.getByText(label))
+    expect(api.revealPath).toHaveBeenCalledExactlyOnceWith('/tmp/hello.txt', 'reveal')
+  })
+
+  it('never offers two spellings of the same reveal entry at once', () => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform: 'darwin' })
+    openMenu()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open in File Explorer')).not.toBeInTheDocument()
+  })
+
+  // The copy-fallback confirmation is centralized in api.revealPath itself
+  // (client.ts), right next to its copyToClipboard call, so every call site —
+  // including this panel — is covered without a local alert. Asserting no
+  // local alert here guards against double-notifying once the panel resolves
+  // through the (mocked) real client.
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
     vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true, copy: '/tmp/hello.txt' })
     openMenu()
     fireEvent.click(screen.getByText('Show in file manager'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(
-      'Path copied to clipboard (no desktop available)',
-    ))
+    await waitFor(() => expect(api.revealPath).toHaveBeenCalled())
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('surfaces the server message when the reveal is refused', async () => {
+  it('shows the shared i18n failure message when the reveal is refused', async () => {
+    // The overflow funnels reveal failures through the shared FilePathMenu path,
+    // which shows a neutral catalog string rather than leaking the raw server
+    // message (which could name an internal path or reason).
     vi.mocked(api).revealPath = vi.fn().mockRejectedValue(new Error('access denied'))
     openMenu()
     fireEvent.click(screen.getByText('Open with default app'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('access denied'))
+    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(i18nT('components.filePathMenu.reveal_failed')))
   })
 })
 
@@ -220,6 +291,43 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
     expect(screen.queryByText('Full screen')).not.toBeInTheDocument()
   })
 
+  /* Re-homed from the old Files tab, which had its own add-to-library control
+   * on each file row. That tab now lists links only, so this guard lives here —
+   * the file editor is the remaining way a plain file enters the library, and
+   * the failure it prevents is silent, permanent data loss. */
+  it('refuses to add a truncated read instead of persisting the prefix', async () => {
+    // /api/file-read caps very large files and says so in a header. Promoting
+    // that body would store the PREFIX as though it were the whole document,
+    // and a disposable file is COPIED, so the original is not referenced.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'X-Truncated': 'true' }),
+      text: () => Promise.resolve('the first 512 KB only'),
+    }) as never
+    render(<OverflowMenu filePath="/tmp/huge.txt" content={'prefix'} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+    fireEvent.click(await screen.findByText('Add to artifacts'))
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled())
+    expect(api.createArtifact).not.toHaveBeenCalled()
+  })
+
+  it('adds a complete read, so the refusal above is the header and not a dead path', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers(),
+      text: () => Promise.resolve('the whole file'),
+    }) as never
+    render(<OverflowMenu filePath="/tmp/small.txt" content={'the whole file'} />, { wrapper })
+    fireEvent.click(screen.getAllByRole('button')[0])
+    fireEvent.click(await screen.findByText('Add to artifacts'))
+
+    await waitFor(() => expect(api.createArtifact).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(api.createArtifact).mock.calls[0][0]).toMatchObject({
+      content: 'the whole file', source_path: '/tmp/small.txt',
+    })
+  })
+
   it('renders the already-in-library row as a non-actionable status, not a menu item', async () => {
     stubKnowledge({ enabled: true, alreadyAdded: true })
     render(<OverflowMenu filePath="/tmp/notes.md" content="x" />, { wrapper })
@@ -293,5 +401,63 @@ describe('breadcrumbSegments', () => {
   it('handles a bare filename as a single file segment', () => {
     const crumbs = breadcrumbSegments('/README.md')
     expect(crumbs).toEqual([{ seg: 'README.md', path: '/README.md', isFile: true }])
+  })
+})
+
+/**
+ * The line-reveal effect must declare its dependencies, and the editor handle
+ * it waits on must be state rather than a ref.
+ *
+ * This is a source-level guard on purpose. A dependency-less effect re-runs on
+ * every render, and the nonce guard inside this one makes those extra runs
+ * idempotent — so the defect has no rendered symptom to assert against, only a
+ * cost that grows with every unrelated re-render of the panel. What IS
+ * statically visible is the shape: the dependency array, the state-backed
+ * handle that re-runs the effect on the commit that mounts the editor (a ref
+ * attaches without a render and would strand a reveal requested before the
+ * editor exists), and the latest-value ref that keeps the host's inline
+ * `onRevealConsumed` arrow out of the dependency array.
+ */
+describe('MarkdownPanel line-reveal effect', () => {
+  // Read through `readSource`, which normalizes line endings to LF. This block
+  // asserts on the SOURCE TEXT with `$`-anchored patterns; `website/.gitattributes`
+  // now pins `*.tsx eol=lf` so a Windows checkout no longer carries the CRLF that
+  // used to defeat those anchors, and this read stays defensive for a working tree
+  // that predates that attribute or carries an unusual git config.
+  const src = readSource(join(__dirname, '..', 'components', 'MarkdownPanel.tsx'))
+
+  /** The reveal `useEffect` call, from `useEffect(` through its closing line.
+   *  Only the effect's own closer sits at two-space indentation. */
+  const effect = (() => {
+    const anchor = src.indexOf('lastRevealNonce.current === revealLine.nonce')
+    expect(anchor).toBeGreaterThan(-1)
+    const open = src.lastIndexOf('useEffect(', anchor)
+    const closerLine = src.indexOf('\n  }', anchor)
+    return src.slice(open, src.indexOf('\n', closerLine + 1))
+  })()
+
+  it('declares a dependency array', () => {
+    expect(effect).toMatch(/\}, \[[^\]]*\]\)$/)
+  })
+
+  it('depends on the reveal target, the source-mode predicate and the editor handle', () => {
+    const deps = (effect.match(/\}, \[([^\]]*)\]\)$/)?.[1] ?? '').split(',').map(d => d.trim())
+    expect(deps).toEqual(expect.arrayContaining(['revealLine', 'revealTargetsSource', 'revealEditor']))
+  })
+
+  it('keeps the nonce guard, which is what makes a repeat reveal need a new nonce', () => {
+    expect(effect).toContain('lastRevealNonce.current === revealLine.nonce')
+    expect(effect).toContain('lastRevealNonce.current = revealLine.nonce')
+  })
+
+  it('waits on a state-backed handle so a late editor mount still reveals', () => {
+    expect(src).toContain('const [revealEditor, setRevealEditor] = useState<PierreEditorHandle | null>(null)')
+    expect(src).not.toMatch(/editorRef=\{revealEditorRef\}/)
+    expect(src).toMatch(/editorRef=\{setRevealEditor\}/)
+  })
+
+  it('reads the host callback through a ref instead of depending on it', () => {
+    expect(effect).toContain('onRevealConsumedRef.current?.()')
+    expect(effect).not.toMatch(/\bonRevealConsumed\?\.\(\)/)
   })
 })

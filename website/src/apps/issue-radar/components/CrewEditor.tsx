@@ -57,6 +57,7 @@ import CrewGhost, { djb2, ghostVariantCount } from './CrewGhost'
 import { issueRadarApi, type Crew, type CrewPatch, type CrewSpec } from '../api'
 import { repoScopeKey } from '../lib/links'
 import { useIssueRadar } from '../context'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 
 /** Backstop wake, in seconds. A CONSTANT, not state: see the file header. */
 const BACKSTOP_WAKE_SECONDS = 120
@@ -215,7 +216,6 @@ function Field({
           caller passes either the custom `Input` or a `children` expression it
           cannot look inside. `label-has-associated-control`, the rule that
           replaced this deprecated one, is satisfied and stays on. */}
-      {/* eslint-disable-next-line jsx-a11y/label-has-for */}
       <label htmlFor={id} className="block">
         <span className="mb-1.5 block text-[13px] font-semibold text-text">{label}</span>
         {children}
@@ -272,6 +272,7 @@ export interface CrewEditorProps {
 }
 
 export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
+  const ime = useImeGuard()
   const { t } = useTranslation()
   const { active } = useIssueRadar()
   const scopeKey = repoScopeKey(active)
@@ -663,7 +664,6 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
               {/* The label wraps only the INPUT, not the Roll button beside it:
                   an interactive descendant of a label is a second thing to click
                   in one hit area. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for -- nested + htmlFor→id both hold; the deprecated rule cannot see through the custom `Input`. */}
               <label htmlFor="crew-editor-name" className="min-w-0 flex-1">
                 <span className="mb-1.5 block text-[13px] font-semibold text-text">
                   {t('apps.issueRadar.views.crews.editor.name_label')}
@@ -811,18 +811,11 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
                     className="w-40 py-1 font-mono text-[12px]"
                     value={newLabel}
                     onChange={e => setNewLabel(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault()
-                        commitNewLabel()
-                      }
-                      // Escape is NOT handled here: Radix's DismissableLayer
-                      // listens on `document` with `{ capture: true }`, so it has
-                      // already decided to dismiss by the time a bubble-phase
-                      // handler on this input runs — `stopPropagation` here would
-                      // read like a guard and close the whole form anyway. The
-                      // interception lives on `DialogContent`'s `onEscapeKeyDown`.
-                    }}
+                    // Escape is NOT handled by us beyond the binding's latch
+                    // reset: Radix's DismissableLayer listens on `document` with
+                    // `{ capture: true }`, so it has already decided to dismiss
+                    // by the time a bubble-phase handler on this input runs.
+                    {...ime.bindEnter({ onEnter: commitNewLabel })}
                   />
                   <IconButton
                     aria-label={t('apps.issueRadar.views.crews.editor.labels_add_commit')}

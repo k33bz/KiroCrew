@@ -26,7 +26,6 @@ its own and is a pure, side-effect-light helper library.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.mcp_apps_render import MAX_SPOOL_BYTES, SPOOL_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ def write_spool(payload: dict) -> str:
         # Fail loud — a record must never exist without owner-only
         # protection; the interception caller's failure-safe path delivers
         # the original tool result with no app render.
-        platform_compat.restrict_to_owner(directory)
+        platform_compat.restrict_dir_to_owner(directory)
 
     spool_id = uuid.uuid4().hex
     record = {
@@ -165,28 +165,20 @@ def write_spool(payload: dict) -> str:
             f"mcp-apps spool record {len(data)} bytes exceeds cap {MAX_SPOOL_BYTES}"
         )
     path = directory / f"{spool_id}.json"
-    # O_CREAT|O_EXCL would be ideal, but uuid4 collision is negligible and
-    # O_TRUNC keeps this idempotent on the (impossible) reuse. Mode honours
-    # umask so chmod after to guarantee 0600.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:  # pragma: no cover
-        logger.debug("could not chmod spool file %s to 0600", path, exc_info=True)
-    if not platform_compat.IS_POSIX:  # pragma: no cover — exercised on Windows CI
-        # POSIX mode bits above are meaningless on Windows — apply the
-        # owner-only DACL (repo rule for secret-bearing files). Fail closed:
-        # if the lockdown cannot be established, remove the record rather
-        # than leave a readable capability token behind, then propagate so
-        # the interception failure-safe path delivers the original result.
-        try:
-            platform_compat.restrict_to_owner(path)
-        except OSError:
-            with contextlib.suppress(OSError):
-                path.unlink()
-            raise
+    # Lockdown-before-content + atomic publish: ``restrict_to_owner=True``
+    # applies the owner-only DACL (and 0o600 on POSIX) to the temp file BEFORE
+    # any byte of the record — whose filename and callback_secret are live
+    # capability tokens — reaches it. The previous hand-rolled ``os.open`` at
+    # the final path published the content first and applied the Windows DACL
+    # only afterwards, leaving it readable under the inherited ACL for the
+    # write window (issue #5285). Fail closed is now structural: every failure
+    # (lockdown, write, rename) happens before the final path is touched, so
+    # an unprotected record never exists there and no unlink is needed; the
+    # raised OSError propagates so the interception caller's failure-safe path
+    # delivers the original tool result with no app render. uuid4 collision is
+    # negligible, and the atomic replace keeps this idempotent on the
+    # (impossible) reuse.
+    atomic_write(path, data, restrict_to_owner=True)
     return spool_id
 
 
@@ -236,6 +228,115 @@ class WithheldTools(NamedTuple):
         return bool(self.declared or self.unreadable)
 
 
+#: The audiences SEP-1865 defines for ``_meta.ui.visibility``.
+AUDIENCE_MODEL = "model"
+AUDIENCE_APP = "app"
+
+
+class VisibilityVerdict(NamedTuple):
+    """How :func:`visibility_allows` read a tool's ``_meta.ui.visibility``."""
+
+    #: True when this audience may see/call the tool.
+    allowed: bool
+    #: True when the server DID set ``visibility`` but this host could not parse
+    #: it. Distinguishes "the server said no" from "we could not tell", which
+    #: the caller logs differently.
+    unreadable: bool
+
+
+def visibility_allows(tool: Any, audience: str) -> VisibilityVerdict:
+    """Decide whether ``audience`` may reach ``tool`` per its declared visibility.
+
+    ONE parser for BOTH directions — the agent's ``tools/list`` (audience
+    ``"model"``) and an app's ``tools/call`` (audience ``"app"``). They were
+    separate implementations with *opposite* defaults, and the app-side one
+    denied on absence while claiming the spec required it. The spec says the
+    opposite, so the two are now the same function and cannot drift again.
+
+    How each shape of ``visibility`` is read:
+
+    ==========================  ==============================================
+    ``visibility``              Verdict
+    ==========================  ==============================================
+    absent                      ALLOW — spec default is ``["model", "app"]``
+    ``["model", "app"]``        ALLOW for both
+    ``["app"]``                 ALLOW app, DENY model
+    ``["model"]``               ALLOW model, DENY app
+    ``[]``                      DENY both — an explicit empty audience list
+    ``"app"`` (bare string)     read as ``["app"]``
+    present, uninterpretable    DENY both, flagged ``unreadable``
+    ``_meta``/``ui`` = ``null``  ALLOW — a null container is an unset optional
+    ``_meta``/``ui`` not a dict  DENY both, flagged ``unreadable``
+    ==========================  ==============================================
+
+    Only ABSENCE gets the permissive default, and absence is distinguished from
+    malformation at EVERY level, not just the leaf:
+
+    * ``_meta`` missing, or present-and-a-dict with no ``ui`` key, or ``ui``
+      present-and-a-dict with no ``visibility`` key → genuine absence → allow.
+    * ``_meta`` or ``ui`` explicitly ``null`` → also absence. A JSON ``null`` is
+      how serializers spell an unset optional object, and it cannot conceal a
+      declaration, so the reason non-dict containers deny does not apply.
+    * ``_meta`` or ``ui`` present as some OTHER non-dict → the container that
+      would hold the declaration is unreadable, so a visibility may well be in
+      there and we cannot see it → deny, flagged ``unreadable``.
+    * ``visibility`` present but unparseable → deny, flagged ``unreadable``.
+
+    Absence is tested by key presence rather than by value, so an explicit
+    ``"visibility": null`` is a declaration this host cannot read rather than an
+    omission — ``.get()`` cannot tell those apart.
+
+    KNOWN DIVERGENCE, pre-existing and deliberately unchanged here: the C#
+    reference SDK documents ``null`` and ``[]`` on ``visibility`` ITSELF as
+    "visible to both the model and the app by default". This host denies both
+    for those two shapes, as it did before this function existed. The SEP text
+    grants the default to an OMITTED field, and an explicitly empty audience
+    list reads as a deliberate exclusion, so the conservative reading is kept
+    rather than widened as a side effect of an unrelated fix. Worth settling
+    separately — it is a conformance question, not an oversight.
+
+    Bare strings are coerced rather than lumped in with the unreadable values,
+    because the realistic typo for this field is a scalar instead of a
+    one-element list; blanket-denying every malformed value would hide a tool
+    whose author wrote ``"model"`` meaning to expose it.
+
+    Anything present-but-unreadable denies both audiences: it is an attempt to
+    restrict the tool that this host cannot honor, and the errors are not
+    symmetric. Over-denying is loud (the name is logged, the tool is simply
+    absent) while under-denying silently lets a tool run without readable
+    authorization metadata.
+    """
+    if not isinstance(tool, dict):
+        return VisibilityVerdict(False, False)
+    if "_meta" not in tool:
+        # SEP-1865: ``visibility`` defaults to ``["model", "app"]`` when omitted.
+        return VisibilityVerdict(True, False)
+    meta = tool["_meta"]
+    # An explicit ``null`` CONTAINER is absence, not malformation. JSON
+    # serializers routinely emit ``"_meta": null`` for an unset optional
+    # object, and the reason non-dict containers deny — a declaration could be
+    # hiding in there — does not apply to ``null``, which cannot hold one.
+    # Denying it would drop every tool from such a server.
+    if meta is None:
+        return VisibilityVerdict(True, False)
+    if not isinstance(meta, dict):
+        return VisibilityVerdict(False, True)
+    if "ui" not in meta:
+        return VisibilityVerdict(True, False)
+    ui = meta["ui"]
+    if ui is None:
+        return VisibilityVerdict(True, False)
+    if not isinstance(ui, dict):
+        return VisibilityVerdict(False, True)
+    if "visibility" not in ui:
+        return VisibilityVerdict(True, False)
+    raw = ui["visibility"]
+    vis = [raw] if isinstance(raw, str) else raw
+    if not isinstance(vis, list):
+        return VisibilityVerdict(False, True)
+    return VisibilityVerdict(audience in vis, False)
+
+
 def strip_model_hidden_tools(result: dict) -> WithheldTools:
     """Remove tools the agent may not see from a ``tools/list`` result IN PLACE.
 
@@ -244,33 +345,8 @@ def strip_model_hidden_tools(result: dict) -> WithheldTools:
     names split by cause, so the caller can log an unreadable declaration more
     loudly than a well-formed one.
 
-    How each shape of ``visibility`` is read:
-
-    ==========================  ==========================================
-    ``visibility``              Verdict
-    ==========================  ==========================================
-    absent                      KEEP — spec default is ``["model", "app"]``
-    ``["model", ...]``          KEEP
-    ``["app"]`` / ``[]``        DROP — explicit list without "model"
-    ``"model"`` (bare string)   KEEP — read as ``["model"]``
-    ``"app"`` (bare string)     DROP — read as ``["app"]``
-    present, uninterpretable    DROP
-    ==========================  ==========================================
-
-    Only ABSENCE gets the permissive default. A present-but-unreadable value is
-    an attempt to restrict the tool that this host cannot parse, and the two
-    errors are not symmetric: an over-drop is loud (the name is logged and the
-    tool simply does not appear) while a leak silently hands the model a tool
-    the server withheld, which it may then execute.
-
-    Bare strings are coerced rather than lumped in with the unreadable values,
-    because the realistic typo for this field is a scalar instead of a
-    one-element list — and blanket-dropping every malformed value would discard
-    a tool whose author wrote ``"model"`` meaning to expose it.
-
-    Note this is the OPPOSITE default from the app-call direction in
-    :mod:`kiro_crew.mcp_gateway.app_call`, which denies unless ``"app"`` is
-    explicitly present.
+    Every shape of ``visibility`` is read by :func:`visibility_allows`, which
+    the app-call direction shares — see that docstring for the full table.
     """
     tools = result.get("tools")
     if not isinstance(tools, list):
@@ -282,25 +358,13 @@ def strip_model_hidden_tools(result: dict) -> WithheldTools:
         if not isinstance(tool, dict):
             kept.append(tool)
             continue
-        meta = tool.get("_meta")
-        ui = meta.get("ui") if isinstance(meta, dict) else None
-        # Absence is the ONLY permissive case, so it is tested by key presence
-        # rather than by value — an explicit ``"visibility": null`` is a
-        # declaration this host cannot read, not an omission.
-        if not isinstance(ui, dict) or "visibility" not in ui:
+        verdict = visibility_allows(tool, AUDIENCE_MODEL)
+        if verdict.allowed:
             kept.append(tool)
             continue
-        raw = ui["visibility"]
-        vis = [raw] if isinstance(raw, str) else raw
-        if isinstance(vis, list):
-            if "model" in vis:
-                kept.append(tool)
-                continue
-            bucket = declared
-        else:
-            bucket = unreadable
         name = tool.get("name")
-        bucket.append(name if isinstance(name, str) else "<unnamed>")
+        label = name if isinstance(name, str) else "<unnamed>"
+        (unreadable if verdict.unreadable else declared).append(label)
     withheld = WithheldTools(declared, unreadable)
     if withheld:
         result["tools"] = kept
@@ -346,8 +410,16 @@ def extract_declared_ui_uris(result: dict) -> dict[str, str]:
 
 
 def append_marker(result: dict, spool_id: str) -> dict:
-    """Return a copy of a ``tools/call`` result with the spool marker appended
+    """Return a copy of a ``tools/call`` result with the spool marker PREPENDED
     to its FIRST text content item (or a new text item when none exists).
+
+    The marker sits at offset 0 of the first text block so it survives the
+    downstream ACP per-part 4000-char truncation in
+    ``acp/_dispatch.py::_build_tool_result_event`` before the dashboard marker
+    detector (``mcp_apps_render.find_marker``) runs; an end-appended marker on a
+    long first block (real cases run to tens of thousands of chars) is sliced
+    off and the app never mounts. Both consumers (``find_marker`` search,
+    ``strip_marker`` sub) are position-agnostic, so leading the block is safe.
 
     Copy discipline mirrors ``backend._strip_caller_meta``: the input ``result``
     and every nested container on the mutated path are copied, never mutated in
@@ -368,10 +440,14 @@ def append_marker(result: dict, spool_id: str) -> dict:
         None,
     )
     if text_idx is None:
-        content.append({"type": "text", "text": marker})
+        # No text item exists, so create one at offset 0 to match the prepend
+        # framing: a lone new item is already the earliest content, but leading
+        # it keeps the "marker at the front" invariant true regardless of what
+        # else lands in ``content`` later.
+        content.insert(0, {"type": "text", "text": marker})
     else:
         item = dict(content[text_idx])
-        item["text"] = f"{item['text']} {marker}"
+        item["text"] = f"{marker} {item['text']}"
         content[text_idx] = item
     out["content"] = content
     return out
@@ -414,6 +490,16 @@ def sweep_spool(max_age_hours: float = 24.0) -> int:
         try:
             if not sidecar.with_suffix(".json").exists() and sidecar.stat().st_mtime < cutoff:
                 sidecar.unlink()
+        except OSError:
+            continue
+    # Orphaned atomic_write temps. write_spool's atomic_write cleans its temp
+    # up on every exception, so one can only survive a hard kill (SIGKILL,
+    # power loss) mid-write — but this directory's whole point is bounded
+    # lifetime and nothing else reaps it, so age them out with the records.
+    for temp in directory.glob("*.tmp"):
+        try:
+            if temp.stat().st_mtime < cutoff:
+                temp.unlink()
         except OSError:
             continue
     return removed

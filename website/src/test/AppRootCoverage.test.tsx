@@ -14,7 +14,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
-import { setUpdateProgress } from '../store/dashboardSlice'
+import { setUpdateProgress, sseConnected, sseDisconnected } from '../store/dashboardSlice'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
@@ -79,7 +79,15 @@ import App from '../App'
 import { api } from '../api/client'
 
 /** Status payload the shell diffs `mc-last-version` against. */
-const STATUS = { uptime: '1h', sessions: 0, messages: 0, version: '0.4.0', update_available: true }
+// `update_can_apply` is what licenses the in-app "Update Now" path: availability
+// says a newer build EXISTS, capability says this install can replace its own
+// bytes from here. Only a git checkout can (`POST /api/update` is fetch + reset),
+// and these suites drive exactly that path — a wheel or desktop install is offered
+// the installer command instead, covered by App.changelogModalApply.test.tsx.
+const STATUS = {
+  uptime: '1h', sessions: 0, messages: 0, version: '0.4.0',
+  update_available: true, update_can_apply: true,
+}
 
 /** A two-release changelog: only the 0.4.0 section is newer than 0.3.0. */
 const CHANGELOG = '## [0.4.0]\n- adds the resource capsule\n\n## [0.3.0]\n- older entry line\n'
@@ -152,6 +160,50 @@ describe('App — version-change changelog gate', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull())
   })
+
+  it('shows nothing when the running build is ahead of every section', async () => {
+    // The reported bug. `main` is bumped a minor ahead of the released line and
+    // a release's notes are written when it ships, so between releases the
+    // newest section in the file is OLDER than the running build: a 0.6.0 build
+    // opened a modal titled `v0.6.0` whose body was headed `[0.4.0]` and offered
+    // to update to it. There is nothing to say here, so nothing is said.
+    vi.mocked(api.status).mockResolvedValue({ ...STATUS, version: '0.6.0' } as never)
+    localStorage.setItem('mc-last-version', '0.5.0')
+    renderWithProviders(<App />, { route: '/chat' })
+
+    await screen.findByTestId('dashboard-shell')
+    // The baseline still advances, so the check does not re-run every load.
+    await waitFor(() => expect(localStorage.getItem('mc-last-version')).toBe('0.6.0'))
+    expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull()
+  })
+
+  it('keeps an unversioned heading out of the section above it', async () => {
+    // Any level-2 heading ends the preceding section, matching the renderer.
+    // Keying only on `## [` left this body inside 0.4.0's notes.
+    vi.mocked(api.changelog).mockResolvedValue({
+      content: '## [0.4.0]\n- adds the resource capsule\n\n## Notes\n- housekeeping prose\n',
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/housekeeping prose/)).toBeNull()
+  })
+
+  it('delivers the notes when no further update is pending', async () => {
+    // The state right after a successful update is "current", and the body used
+    // to be gated on an update being available -- so the one moment the modal
+    // exists for replaced its notes with "You're on the latest version".
+    vi.mocked(api.status).mockResolvedValue({
+      ...STATUS, update_available: false, update_can_apply: false,
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).getByText("You're on the latest version")).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: 'Update Now' })).toBeNull()
+  })
 })
 
 describe('App — changelog modal controls', () => {
@@ -221,6 +273,32 @@ describe('App — update progress overlay', () => {
     expect(screen.getByText('Rebuilding package')).toBeInTheDocument()
     expect(screen.getByText('Restarting server')).toBeInTheDocument()
     expect(screen.getByText('0s')).toBeInTheDocument()
+  })
+
+  it('names the restart when the socket drops mid-update', async () => {
+    // The restart step kills the socket BY DESIGN (the gateway execs itself)
+    // and progress events stop with it. Before this state existed the overlay
+    // froze on the last step with its idle waiting copy — indistinguishable
+    // from a hang. Disconnected-while-updating must say the gateway is
+    // restarting and that reconnection is in progress.
+    const { store } = await startUpdate()
+    await screen.findByText('Updating Kiro Crew…')
+
+    act(() => { store.dispatch(setUpdateProgress({ step: 'restarting', detail: 'Restarting server…' })) })
+    expect(screen.getByText('Page will reconnect when ready…')).toBeInTheDocument()
+
+    act(() => { store.dispatch(sseDisconnected()) })
+    const note = screen.getByTestId('update-reconnecting')
+    expect(note.textContent).toContain('Gateway is restarting — reconnecting…')
+    // The idle copy stands down: both lines together would say "waiting" and
+    // "dialing" about the same moment.
+    expect(screen.queryByText('Page will reconnect when ready…')).toBeNull()
+
+    // Reconnected (the gateway is back, the reload latch takes it from here):
+    // the transient line yields back to the idle copy.
+    act(() => { store.dispatch(sseConnected()) })
+    expect(screen.queryByTestId('update-reconnecting')).toBeNull()
+    expect(screen.getByText('Page will reconnect when ready…')).toBeInTheDocument()
   })
 
 })
@@ -297,13 +375,12 @@ describe('App — system metrics segment', () => {
 })
 
 describe('App — Kiro credits modal', () => {
-  const usageWithBonus = (startUrl: string) => ({
+  const usageWithBonus = (startUrl: string, accountType = 'Social') => ({
     usage: {
       credits_used: 8000, credits_plan: 10000, credits_overage: 0,
-      bonus_limit: 2000, bonus_used: 500, bonus_label: 'Welcome credits',
-      bonus_expires_label: 'expires 2026-09-01',
+      bonus_credits: [{ name: 'Welcome credits', used: 500, total: 2000, days_left: 19 }],
       plan: 'KIRO POWER', resets: '2026-09-01', overage_rate: '0.04', cost_usd: 1.5,
-      account_type: 'Social', email: 'builder@example.com', start_url: startUrl,
+      account_type: accountType, email: 'builder@example.com', start_url: startUrl,
     },
   })
 
@@ -313,27 +390,29 @@ describe('App — Kiro credits modal', () => {
     vi.mocked(api.sessionsUsage).mockResolvedValue(usageWithBonus('https://example.awsapps.com/start') as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    fireEvent.click(await screen.findByRole('button', { name: /^Kiro credits:/ }))
+    fireEvent.click(await screen.findByTitle(/Kiro credit usage/))
     const dialog = await screen.findByRole('dialog')
-    expect(within(dialog).getByText('Breakdown')).toBeInTheDocument()
-    expect(within(dialog).getByText('Welcome credits')).toBeInTheDocument()
-    expect(within(dialog).getByText('expires 2026-09-01')).toBeInTheDocument()
+    // Plan pool: the progressbar tracks the plan only, not bonus grants.
     expect(within(dialog).getByText('KIRO POWER')).toBeInTheDocument()
-    expect(within(dialog).getByText('Resets 2026-09-01')).toBeInTheDocument()
-    // Bonus present, so the total is pooled and labelled as a total.
-    expect(within(dialog).getByText('8,500')).toBeInTheDocument()
-    expect(within(dialog).getByText('/ 12,000 credits total')).toBeInTheDocument()
-    expect(within(dialog).getByText('$1.50 USD')).toBeInTheDocument()
-    expect(within(dialog).getByText('Signed in with Social login · example.awsapps.com')).toBeInTheDocument()
+    expect(within(dialog).getByText('8,000')).toBeInTheDocument()
+    expect(within(dialog).getByText(/\/\s*10,000\s*credits/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/Resets\s*Sep 1/)).toBeInTheDocument()
+    // Bonus pool: its own section with per-grant balance and expiry.
+    expect(within(dialog).getByText('Bonus credits')).toBeInTheDocument()
+    expect(within(dialog).getByText('Welcome credits')).toBeInTheDocument()
+    expect(within(dialog).getByText('Remaining credit balance: 1,500')).toBeInTheDocument()
+    expect(within(dialog).getByText('Days until expiration: 19')).toBeInTheDocument()
+    expect(within(dialog).getByText('$1.50')).toBeInTheDocument()
+    expect(within(dialog).getByText('Signed in with Social login')).toBeInTheDocument()
   })
 
   it('drops the issuer host when the start URL will not parse', async () => {
-    vi.mocked(api.sessionsUsage).mockResolvedValue(usageWithBonus('not-a-url') as never)
+    vi.mocked(api.sessionsUsage).mockResolvedValue(usageWithBonus('not-a-url', 'IamIdentityCenter') as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    fireEvent.click(await screen.findByRole('button', { name: /^Kiro credits:/ }))
+    fireEvent.click(await screen.findByTitle(/Kiro credit usage/))
     const dialog = await screen.findByRole('dialog')
-    expect(within(dialog).getByText('Signed in with Social login')).toBeInTheDocument()
+    expect(within(dialog).getByText('Signed in with IAM Identity Center')).toBeInTheDocument()
   })
 })
 
@@ -398,6 +477,24 @@ describe('App — Electron bridges', () => {
     // Protocol-relative targets are refused by construction, so the route holds.
     act(() => navigateFromMenu?.('//example.com/steal'))
     expect(screen.getByTestId('logs-page')).toBeInTheDocument()
+  })
+
+  it('a session deep link SELECTS the session, not just the route', async () => {
+    // The Crew Companion's "Open session" CTA arrives on this same channel. A
+    // bare navigate would be enough only from another page: ChatPage reads `?sid`
+    // while it MOUNTS, so from an already-open /chat the window would come
+    // forward with the previous session still on screen — the notification would
+    // appear to have opened nothing, which is the bug the CTA is meant to fix.
+    let navigateFromMain: ((path: string) => void) | undefined
+    setElectronBridge({ onNavigate: cb => { navigateFromMain = cb; return () => { navigateFromMain = undefined } } })
+    const { store } = renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByTestId('chat-page')
+    expect(store.getState().chat.activeSlot).not.toBe('chat-2-200')
+
+    act(() => navigateFromMain?.('/chat?sid=chat-2-200'))
+
+    expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    expect(screen.getByTestId('chat-page')).toBeInTheDocument()
   })
 })
 

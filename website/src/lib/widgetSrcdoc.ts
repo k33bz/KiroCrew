@@ -99,6 +99,21 @@ const HEIGHT_REPORT_SHRINK_MS = 200
  * reproduces the blank-widget symptom the indicator exists to prevent. */
 const OVERLAY_HANG_BACKSTOP_MS = 15000
 
+/** Event fired inside the iframe when the Tailwind runtime <script> fails to
+ * load (network refusal, PNA/CORS block, packaging gap). The loading overlay's
+ * reveal script listens for it and uncovers the widget immediately — a
+ * degraded-but-visible widget beats a blank box sitting on the hang backstop,
+ * regardless of why the runtime failed. */
+const TW_ERROR_EVENT = 'mc-tw-error'
+
+/** Inline onerror body for the runtime <script> tag. Sets a flag (for a reveal
+ * script that starts AFTER the failure already fired) and dispatches
+ * TW_ERROR_EVENT (for one already listening). Static trusted string — never
+ * carries LLM/user content; single-quoted so it embeds in a double-quoted
+ * HTML attribute. */
+const TW_ERROR_INLINE_HANDLER =
+  `window.__mcTwError=1;window.dispatchEvent(new Event('${TW_ERROR_EVENT}'))`
+
 /** Body of the height-reporter script. Defined as a string literal — the only
  * interpolation is the two numeric tuning constants above (never LLM/user
  * content; the LLM `html` never reaches here). Set as a script element via
@@ -110,7 +125,10 @@ const OVERLAY_HANG_BACKSTOP_MS = 15000
  * growth eagerly, and defers/cancels shrinks. The net effect is that a
  * continuously animating widget (lava lamp, starry night) reports its height
  * once and then stops posting, instead of feeding a per-frame resize loop back
- * to the parent. */
+ * to the parent. The one deliberate exception is the window `load` re-report
+ * below: quietness must never extend across a load event the parent can
+ * observe, because parent surfaces treat post-load silence as the frame no
+ * longer showing this document. */
 const HEIGHT_REPORTER_BODY = `(function(){
   var EPS = ${HEIGHT_REPORT_EPSILON_PX};
   var SHRINK_MS = ${HEIGHT_REPORT_SHRINK_MS};
@@ -118,6 +136,7 @@ const HEIGHT_REPORTER_BODY = `(function(){
   var shrinkTimer = null;
   var rafId = 0;
   var raf = window.requestAnimationFrame || function(cb){ return setTimeout(cb, 16); };
+  var unraf = window.cancelAnimationFrame || clearTimeout;
   function send(h){
     lastSent = h;
     parent.postMessage({type:'mc-widget-height', height:h}, '*');
@@ -160,11 +179,35 @@ const HEIGHT_REPORTER_BODY = `(function(){
   function schedule(){
     // Coalesce a burst of ResizeObserver callbacks (an animation can fire many
     // per frame) into a single measurement per frame.
-    if (rafId) return;
+    //
+    // Cancel-and-reschedule rather than an early return on a pending handle:
+    // requestAnimationFrame may return a handle whose callback never runs (a
+    // frame queued for a page the browser then puts in the back/forward cache is
+    // dropped), and latching on such a handle would stop this widget's height
+    // tracking permanently. Same defect and same fix as CliPanel's theme
+    // scheduler. NOTE this block lives inside a template literal, so it must
+    // carry neither a backtick nor a dollar-brace interpolation opener -- both
+    // terminate the literal, and the resulting parse error points here rather
+    // than at the string, which is why this warning is worth the two lines.
+    if (rafId) unraf(rafId);
     rafId = raf(evaluate);
   }
   new ResizeObserver(schedule).observe(document.body);
-  window.addEventListener('load', function(){ setTimeout(schedule, 100); });
+  window.addEventListener('load', function(){
+    // Re-report UNCONDITIONALLY after load, bypassing the deadband. The parent
+    // surface re-arms its silence window on EVERY iframe load event (an engine
+    // renavigation onto a spent single-use url fires load with no reporter
+    // behind it, and silence within the grace window is its only signal -- see
+    // DOC_REPORT_GRACE_MS in ArtifactBody). A first measurement that raced
+    // ahead of the load event -- layout settles before images and fonts finish
+    // -- would otherwise be the LAST post this document ever makes: the parent
+    // discards it at load, the deadband swallows this re-check because the
+    // height is unchanged, and three seconds later a healthy, rendering
+    // document is flagged as no longer showing. Resetting lastSent routes the
+    // scheduled measurement through the first-measurement path, so every load
+    // the parent can observe is followed by a report.
+    setTimeout(function(){ lastSent = -1; schedule(); }, 100);
+  });
   schedule();
   document.addEventListener('click', function(e){
  // NOTE: this isTrusted check runs INSIDE the sandboxed iframe
@@ -461,9 +504,15 @@ const COMMENT_BRIDGE_BODY = `(function(){
 
 function buildThemeCss(vars: Record<string, string>, mode: 'dark' | 'light'): string {
   const rootBody = Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';')
+  // No readable vars means no theme to apply, and inventing one is worse than
+  // the browser's own defaults — a guard pins that this path emits no `:root`.
   if (!rootBody) return ''
   return (
     `:root{${rootBody};color-scheme:${mode}}` +
+    // On the root element as well as the body: background propagates from html
+    // to the canvas, so an LLM body that sets its own background still paints
+    // over a themed base instead of over white.
+    `html{background:var(--bg)}` +
     `body{background:var(--bg);color:var(--text)}`
   )
 }
@@ -579,16 +628,32 @@ export function buildSrcdoc({
   tailwindCfg.textContent = TAILWIND_V4_DIRECTIVES
   head.appendChild(tailwindCfg)
 
-  // Same-origin Tailwind v4 browser runtime (replaces public cdn.tailwindcss.com).
-  const tailwind = doc.createElement('script')
-  tailwind.setAttribute('src', scriptOrigin + TAILWIND_RUNTIME_PATH)
-  head.appendChild(tailwind)
-
-  // <style> with base body styles + theme vars
+  // <style> with base body styles + theme vars.
+  //
+  // This MUST precede the Tailwind runtime <script src> below. A classic script
+  // in <head> blocks parsing of everything after it, so with the style behind it
+  // the document has no background and no `color-scheme` until that script has
+  // been fetched and executed — and the browser paints its default WHITE canvas
+  // for that whole window. On a phone over a slow link that reads as a white
+  // flash on every artifact and widget open. Inline CSS costs no fetch, so
+  // putting it first makes the first paint already themed.
   const style = doc.createElement('style')
   const themeCss = buildThemeCss(themeVars, mode)
   style.textContent = themeCss ? `${BASE_BODY_CSS} ${themeCss}` : BASE_BODY_CSS
   head.appendChild(style)
+
+  // Same-origin Tailwind v4 browser runtime (replaces public cdn.tailwindcss.com).
+  // NOTE: we insert a placeholder <meta> instead of a live <script> element and
+  // substitute it in the final serialized HTML. happy-dom eagerly fetches
+  // <script src> URLs when the element is connected to a document
+  // (HTMLScriptElement.[connectedToDocument]), which causes ECONNREFUSED in test
+  // environments that lack a running dev server. Using a non-fetching placeholder
+  // avoids the network dial entirely — the iframe's browser loads the script from
+  // the serialized HTML string, never from a live DOM node in our process.
+  const tailwindPlaceholder = doc.createElement('meta')
+  tailwindPlaceholder.setAttribute('name', 'x-script-placeholder')
+  tailwindPlaceholder.setAttribute('data-src', scriptOrigin + TAILWIND_RUNTIME_PATH)
+  head.appendChild(tailwindPlaceholder)
 
   // Loading overlay: shown while Tailwind JIT compiles, hidden once ready or
   // after a timeout. Only injected when showLoadingOverlay is set.
@@ -655,6 +720,12 @@ export function buildSrcdoc({
       function hide(){el.classList.add('mc-hidden');setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el)},400);}
       var done=false;
       function finish(){if(done)return;done=true;hide();}
+      // Runtime load failure: uncover immediately (degraded-but-visible beats
+      // a blank box). The flag covers a failure that fired before this script
+      // ran — the runtime is a HEAD script, so its error task can precede any
+      // body script — and the listener covers one that fires after.
+      if(window.__mcTwError){finish();return;}
+      window.addEventListener('${TW_ERROR_EVENT}',finish);
       setTimeout(finish,${OVERLAY_HANG_BACKSTOP_MS});
       var obs=new MutationObserver(function(muts){
         for(var i=0;i<muts.length;i++){
@@ -697,7 +768,35 @@ export function buildSrcdoc({
   // contains only the static DOCTYPE prefix and the *serialized* DOM tree
   // (which has already had LLM content adopted as typed DOM nodes), so no
   // raw LLM string is interpolated into HTML.
-  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  //
+  // Post-serialization: replace the SINGLE trusted placeholder with the real
+  // <script> tag. No `g` flag — only the one placeholder we inserted into
+  // <head> is replaced. Model-authored content lives in <body> and cannot
+  // inject a matching placeholder because: (1) it is adopted via
+  // createContextualFragment (typed DOM), not string interpolation, and
+  // (2) attribute serialization HTML-escapes quotes, so a model byte sequence
+  // cannot produce the exact `name="x-script-placeholder"` attribute pair.
+  // The non-global replace is a defense-in-depth backstop for that invariant.
+  //
+  // The emitted tag carries two attributes tied to Chrome's Private Network
+  // Access policy (the sandboxed iframe is a null-origin, NON-secure context,
+  // and on the default deployment this src is a loopback address — a
+  // more-private address space):
+  //   - crossorigin="anonymous" routes the load through CORS, the only mode
+  //     that can carry the gateway's Access-Control-Allow-Origin /
+  //     PNA-preflight approval (see _apply_security_headers + the /vendor
+  //     OPTIONS handler in dashboard/server.py).
+  //   - onerror sets the failure flag + fires TW_ERROR_EVENT so the loading
+  //     overlay uncovers the widget IMMEDIATELY instead of sitting on the
+  //     15s hang backstop. An inline handler (not a listener added by a later
+  //     script) is deliberate: a head script's error task can run before any
+  //     body script executes, so only the element's own handler is free of
+  //     that ordering hazard. Static trusted string — no LLM content.
+  const serialized = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  return serialized.replace(
+    /<meta name="x-script-placeholder" data-src="([^"]*)">/,
+    (_match, src) => `<script src="${src}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"></script>`,
+  )
 }
 
 /** SSR fallback for environments without a DOM. Used only by unit tests
@@ -723,8 +822,11 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
     `<meta http-equiv="Content-Security-Policy" content="${cspFor('')}">` +
     `<style type="text/tailwindcss">${TAILWIND_V4_DIRECTIVES}</style>` +
-    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
+    // Theme style precedes the runtime <script src> for the same reason as the
+    // DOM path: a head script blocks parsing, so a style behind it leaves the
+    // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
+    `<script src="${TAILWIND_RUNTIME_PATH}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"><\/script>` +
     `</head><body class="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
     reporter +

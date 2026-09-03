@@ -5,7 +5,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -718,6 +718,151 @@ class TestAcpWorker:
         assert unregistered == [100]
 
 
+def _mock_effort_client(
+    levels: list[str], *, supports: bool = True, claude: bool = False
+) -> AsyncMock:
+    client = AsyncMock()
+    client.is_ready = True
+    client._pid = None
+    client._is_claude = claude
+    client.is_process_alive = lambda: True
+    client.supports_config_option = MagicMock(return_value=supports)
+    client.get_valid_effort_levels = MagicMock(return_value=levels)
+    client.send_command = AsyncMock()
+    client.set_config_option = AsyncMock()
+    return client
+
+
+class TestAcpWorkerEffort:
+    @pytest.mark.asyncio
+    async def test_applies_kiro_effort_after_ready_before_use(self, tmp_path):
+        client = _mock_effort_client(["low", "medium", "high"])
+        events: list[str] = []
+        client.ensure_ready.side_effect = lambda: events.append("ready")
+        client.send_command.side_effect = lambda *_args, **_kwargs: events.append("set")
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        assert events == ["ready", "set"]
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        client.set_config_option.assert_not_awaited()
+        assert worker._effective_effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_applies_claude_effort_via_config_option(self, tmp_path):
+        client = _mock_effort_client(["low", "medium", "high"], claude=True)
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.set_config_option.assert_awaited_once_with("effort", "high")
+        client.send_command.assert_not_awaited()
+        assert worker._effective_effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_reapplies_effort_after_respawn(self, tmp_path):
+        first = _mock_effort_client(["low", "medium", "high"])
+        second = _mock_effort_client(["low", "medium", "high"])
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+            await worker.start()
+
+        first.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        second.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+
+    @pytest.mark.asyncio
+    async def test_downgrades_to_highest_supported_lower_level(self, tmp_path, caplog):
+        client = _mock_effort_client(["low", "medium"])
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "medium"})
+        assert worker._effective_effort == "medium"
+        assert "downgraded" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_uses_provider_default_when_claude_effort_is_unsupported(
+        self, tmp_path, caplog
+    ):
+        client = _mock_effort_client([], supports=False, claude=True)
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.set_config_option.assert_not_awaited()
+        client.send_command.assert_not_awaited()
+        assert worker._effective_effort is None
+        assert "unsupported" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_uses_provider_default_when_kiro_effort_command_fails(
+        self, tmp_path, caplog
+    ):
+        client = _mock_effort_client(["low", "medium", "high"])
+        client.send_command.side_effect = RuntimeError("effort command rejected")
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        assert worker._effective_effort is None
+        assert "could not apply effort=high" in caplog.text
+
+
+class TestLLMPoolEffort:
+    @pytest.mark.asyncio
+    async def test_passes_effort_to_acp_worker(self):
+        pool = LLMPool(pool_size=1, effort="high")
+        pool._provider_type = "acp"
+        pool._sandbox_mode = "auto"
+        fake_worker = AsyncMock()
+        with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
+            result = await pool._create_worker()
+
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high")
+        assert result is fake_worker
+
+    @pytest.mark.asyncio
+    async def test_default_pool_does_not_pass_effort(self):
+        pool = LLMPool(pool_size=1)
+        pool._provider_type = "acp"
+        pool._sandbox_mode = "auto"
+        fake_worker = AsyncMock()
+        with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
+            await pool._create_worker()
+
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None)
+
+    @pytest.mark.asyncio
+    async def test_fetch_sized_pool_ignores_extraction_size_config(self):
+        pool = LLMPool(pool_size=1, use_config_pool_size=False)
+        created: list[FakeWorker] = []
+
+        async def _mock_create():
+            worker = FakeWorker()
+            created.append(worker)
+            return worker
+
+        pool._create_worker = _mock_create  # type: ignore[assignment]
+        with patch(
+            "kiro_crew.knowledge.llm_pool._read_config",
+            return_value={"knowledge": {"extraction_pool_size": 3}},
+        ):
+            await pool.start()
+
+        assert pool._pool_size == 1
+        assert len(created) == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests: CCWorker (mocked subprocess)
 # ---------------------------------------------------------------------------
@@ -1148,3 +1293,153 @@ class TestWorkerConversationRecycle:
         client.last_prompt_stats.context_pct = 63.5
         worker._client = client
         assert worker.context_pct() == 63.5
+
+
+class _ReapProbe:
+    """A PIPE-stdio child double that records how it is reaped.
+
+    Mirrors the pin ``test_source_providers`` uses for the same class. A killed
+    child blocked writing into a full pipe -- or a surviving descendant still
+    holding the pipes open -- makes a bare ``await proc.wait()`` hang the caller
+    forever, so the bounded reap must drain via ``communicate()`` and never touch
+    ``wait()``.
+    """
+
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.returncode: "int | None" = None
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self.communicate_calls = 0
+
+    async def communicate(self):
+        self.communicate_calls += 1
+        self.returncode = -9
+        return b"", b""
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        return -9
+
+
+def _patch_tree_kill(monkeypatch, sink):
+    """Fake pid + patched tree kill so no test can reach a real killpg.
+
+    Both the async helper (used by ``kill_and_reap``) and the legacy sync entry
+    point are patched, so the pin stays safe even when run against unmodified
+    code that never calls either.
+    """
+    from kiro_crew import platform_compat
+
+    async def _fake_tree(pid, sig):
+        sink.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(platform_compat, "kill_process_tree_async", _fake_tree)
+    monkeypatch.setattr(
+        platform_compat, "kill_process_tree", lambda *a, **k: sink.append(a)
+    )
+    # The child must not look like it shares this process's group, or
+    # kill_and_reap correctly skips the tree kill.
+    monkeypatch.setattr(platform_compat, "IS_POSIX", True, raising=False)
+    monkeypatch.setattr(
+        platform_compat.os, "getpgid", lambda pid: 999_000 + pid, raising=False
+    )
+
+
+class TestCCWorkerReapsTheProcessTree:
+    """``claude -p`` forks helpers, so a pid-scoped kill re-parents them to init.
+
+    ``spine/agent_runner.py``'s ``_terminate_group`` already records this for the
+    same argv ("agents kept costing money after Stop"), and
+    ``apps/registry.py``'s ``_communicate_with_timeout`` states the rule that a
+    caller MUST spawn with ``start_new_session`` for the group signal to land.
+    These pin both halves: without the spawn flag the child shares the gateway's
+    group and ``kill_and_reap`` deliberately skips its tree kill, so the flag is
+    load-bearing rather than cosmetic.
+    """
+
+    @pytest.mark.asyncio
+    async def test_spawn_requests_its_own_session(self):
+        from kiro_crew import platform_compat
+
+        captured: "dict[str, object]" = {}
+
+        async def _fake_spawn(*argv, **kwargs):
+            captured.update(kwargs)
+            return _ReapProbe()
+
+        worker = CCWorker()
+        worker._claude_bin = "/usr/bin/true"
+        # `**k` is required, not defensive: _spawn reaches wrap_argv through
+        # sandbox.wrap_argv_async, which forwards its sandbox options (always at
+        # least `mode`) into the `_prepare` seam. A positional-only stub raises
+        # TypeError from inside wrap_argv_async instead of exercising the spawn.
+        with patch("kiro_crew.knowledge.llm_pool.wrap_argv", lambda cmd, **k: (cmd, None)), \
+             patch("kiro_crew.knowledge.llm_pool.cgroup_scope_argv", lambda argv: argv), \
+             patch(
+                 "kiro_crew.knowledge.llm_pool.create_subprocess_limited",
+                 _fake_spawn,
+             ):
+            await worker._spawn()
+            worker._reader_task.cancel()
+
+        # Both halves of the platform_compat recipe, asserted the way
+        # test_source_providers does: the POSIX flag is IS_POSIX (not an
+        # unconditional True -- on Windows setsid does not exist and the value is
+        # legitimately False), and the Windows flag is what makes the child tree
+        # `taskkill /T`-reapable there. Asserting membership separately keeps this
+        # load-bearing on Windows too, where `is IS_POSIX` alone would also be
+        # satisfied by the kwarg being absent.
+        assert "start_new_session" in captured and "creationflags" in captured, (
+            "the worker must be spawned with process-group isolation, or its forked "
+            "helpers are unreachable as a tree and get re-parented to init on cleanup"
+        )
+        assert captured["start_new_session"] is platform_compat.IS_POSIX
+        assert captured["creationflags"] == platform_compat.CREATE_NEW_PROCESS_GROUP
+
+    @pytest.mark.asyncio
+    async def test_shutdown_reaps_the_tree_via_communicate_not_wait(self, monkeypatch):
+        tree_kills: "list[tuple]" = []
+        _patch_tree_kill(monkeypatch, tree_kills)
+
+        worker = CCWorker()
+        proc = _ReapProbe()
+        worker._proc = proc
+
+        await worker.shutdown()
+
+        assert tree_kills and tree_kills[0][0] == proc.pid
+        assert proc.communicate_calls == 1
+        assert proc.wait_calls == 0
+        assert worker._proc is None
+
+    @pytest.mark.asyncio
+    async def test_reset_conversation_reaps_the_stale_tree(self, monkeypatch):
+        tree_kills: "list[tuple]" = []
+        _patch_tree_kill(monkeypatch, tree_kills)
+
+        worker = CCWorker()
+        old = _ReapProbe(pid=5150)
+        worker._proc = old
+
+        replacement = _ReapProbe(pid=5151)
+
+        async def _fake_respawn():
+            worker._proc = replacement
+            worker._event_queue = asyncio.Queue()
+
+        monkeypatch.setattr(worker, "_spawn", _fake_respawn)
+
+        await worker.reset_conversation()
+
+        assert tree_kills and tree_kills[0][0] == old.pid, (
+            "the stale worker's whole tree must be reaped on recycle"
+        )
+        assert old.communicate_calls == 1
+        assert old.wait_calls == 0
+        assert replacement.kill_calls == 0
+        assert worker.calls_since_reset == 0

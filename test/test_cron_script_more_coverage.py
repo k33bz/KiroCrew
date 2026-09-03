@@ -60,9 +60,13 @@ class _FakeStdout:
 
     def __init__(self, lines) -> None:
         self._lines = list(lines)
+        self.closed = False
 
     def readline(self) -> str:
         return self._lines.pop(0) if self._lines else ""
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _EndlessStdout:
@@ -92,6 +96,10 @@ class _FakeProc:
     ) -> None:
         self.stdin = _FakeStdin()
         self.stdout: object = _FakeStdout(out_lines)
+        # subprocess.Popen.__init__ assigns all three unconditionally (None when
+        # the stream was not piped), so the stand-in has to define stderr too —
+        # the post-kill drain closes both read pipes.
+        self.stderr: object = _FakeStdout(())
         self.pid = pid
         self.returncode = returncode
         self.terminate_calls = 0
@@ -605,10 +613,13 @@ class TestScriptContextAudit:
 @pytest.fixture
 def mcp_spawn(monkeypatch):
     """Patch the spawn chain so McpToolClient never starts a real process."""
-    monkeypatch.setattr(cron_script, "_resolve_mcp_server", lambda name: ("srv-bin", "--stdio"))
+    # _resolve_mcp_server returns (argv, spec_env) — the per-server env block is
+    # forwarded to the spawned server, so the mock must supply both halves.
+    monkeypatch.setattr(
+        cron_script, "_resolve_mcp_server", lambda name: (("srv-bin", "--stdio"), {})
+    )
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
-    monkeypatch.setattr(cron_script, "resource_limit_preexec", lambda: None)
     state = SimpleNamespace(proc=None, popen_exc=None, calls=[])
 
     def _popen(argv, **kw):
@@ -617,7 +628,7 @@ def mcp_spawn(monkeypatch):
             raise state.popen_exc
         return state.proc
 
-    monkeypatch.setattr(cron_script.subprocess, "Popen", _popen)
+    monkeypatch.setattr(cron_script, "popen_limited", _popen)
     return state
 
 
@@ -863,7 +874,7 @@ class TestResolveMcpServer:
         )
         monkeypatch.setattr(cron_script, "kiro_agents_dir", lambda: agents)
 
-        assert _resolve_mcp_server("core") == ("node", "srv.js")
+        assert _resolve_mcp_server("core") == (("node", "srv.js"), {})
 
     def test_absent_server_entry_returns_none(self, tmp_path, monkeypatch):
         agents = tmp_path / "agents"
@@ -875,7 +886,7 @@ class TestResolveMcpServer:
 
         assert _resolve_mcp_server("server-b") is None
 
-    def test_argless_spec_yields_a_single_element_tuple(self, tmp_path, monkeypatch):
+    def test_argless_spec_yields_a_single_element_argv(self, tmp_path, monkeypatch):
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "kirocrew.json").write_text(
@@ -883,7 +894,7 @@ class TestResolveMcpServer:
         )
         monkeypatch.setattr(cron_script, "kiro_agents_dir", lambda: agents)
 
-        assert _resolve_mcp_server("bare") == ("srv-bin",)
+        assert _resolve_mcp_server("bare") == (("srv-bin",), {})
 
 
 # ── path + secret resolution ──
@@ -918,13 +929,29 @@ class TestPathAndSecretResolution:
 
     def test_internal_secret_prefers_the_environment(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "env-secret")
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda: "file-secret")
-        assert _resolve_internal_secret() == "env-secret"
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        assert _resolve_internal_secret(5476) == "env-secret"
 
     def test_internal_secret_falls_back_to_the_local_secret_file(self, monkeypatch):
         monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda: "file-secret")
-        assert _resolve_internal_secret() == "file-secret"
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        assert _resolve_internal_secret(5476) == "file-secret"
+
+    def test_internal_secret_reads_the_port_it_is_given(self, monkeypatch):
+        # The credential is only valid for the gateway it belongs to, and the caller
+        # resolves the dial port ONCE and passes it here, so the same port reaches
+        # both the credential read and the child env -- a mid-startup --port auto
+        # bind cannot split them into a mismatched pair that 403s the callback.
+        monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
+        seen = {}
+
+        def _fake_read(port):
+            seen["port"] = port
+            return "file-secret"
+
+        monkeypatch.setattr(cron_script, "read_local_secret", _fake_read)
+        assert _resolve_internal_secret(7811) == "file-secret"
+        assert seen["port"] == 7811
 
 
 # ── run_script_sandboxed ──
@@ -940,8 +967,7 @@ def script_run(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
-    monkeypatch.setattr(cron_script, "resource_limit_preexec", lambda: None)
-    monkeypatch.setattr(cron_script, "_resolve_internal_secret", lambda: "unit-secret")
+    monkeypatch.setattr(cron_script, "_resolve_internal_secret", lambda port: "unit-secret")
     restricted: list[str] = []
     monkeypatch.setattr(
         cron_script.platform_compat, "restrict_to_owner", restricted.append
@@ -957,11 +983,34 @@ def script_run(monkeypatch, tmp_path):
         state.secret_seen = Path(state.env["_KIROCREW_SECRET_FILE"]).read_text()
         return state.proc
 
-    monkeypatch.setattr(cron_script.subprocess, "Popen", _popen)
+    monkeypatch.setattr(cron_script, "popen_limited", _popen)
     return state
 
 
 class TestRunScriptSandboxed:
+    def test_the_dial_port_is_resolved_exactly_once(self, script_run, monkeypatch):
+        # The credential write and the child's _KIROCREW_DIAL_PORT must come from
+        # ONE resolution. Two calls are a TOCTOU: a --port auto gateway binding
+        # between them would pair a credential with the wrong port and 403 the
+        # callback. So run_script_sandboxed must call _resolve_dial_port once and
+        # thread the value through, not resolve independently at each use.
+        calls = []
+        real = cron_script._resolve_dial_port
+
+        def _counting():
+            calls.append(1)
+            return real()
+
+        monkeypatch.setattr(cron_script, "_resolve_dial_port", _counting)
+        # Do NOT stub _resolve_internal_secret here (the fixture does): we want the
+        # real credential path so a second internal resolution would be counted.
+        monkeypatch.setattr(cron_script, "_resolve_internal_secret", lambda port: "s")
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-once")
+
+        assert len(calls) == 1, f"_resolve_dial_port called {len(calls)} times, expected 1"
+
     def test_ok_result_and_temp_file_cleanup(self, script_run):
         script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
 
@@ -1096,7 +1145,6 @@ class TestShellIsPosixStrict:
     def _no_real_sandbox(self, monkeypatch):
         monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
         monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
-        monkeypatch.setattr(cron_script, "resource_limit_preexec", lambda: None)
 
     def test_literal_output_is_accepted_and_memoized(self, monkeypatch):
         calls: list[list[str]] = []
@@ -1105,7 +1153,7 @@ class TestShellIsPosixStrict:
             calls.append(list(argv))
             return SimpleNamespace(returncode=0, stdout="x.{a,a}\n", stderr="")
 
-        monkeypatch.setattr(cron_script.subprocess, "run", _run)
+        monkeypatch.setattr(cron_script, "run_limited", _run)
 
         assert _shell_is_posix_strict("/bin/sh") is True
         assert _shell_is_posix_strict("/bin/sh") is True  # cache hit, no second spawn
@@ -1114,16 +1162,16 @@ class TestShellIsPosixStrict:
 
     def test_expanding_shell_is_rejected(self, monkeypatch):
         monkeypatch.setattr(
-            cron_script.subprocess,
-            "run",
+            cron_script,
+            "run_limited",
             lambda argv, **kw: SimpleNamespace(returncode=0, stdout="x.a x.a\n", stderr=""),
         )
         assert _shell_is_posix_strict("/bin/sh") is False
 
     def test_nonzero_probe_exit_is_rejected(self, monkeypatch):
         monkeypatch.setattr(
-            cron_script.subprocess,
-            "run",
+            cron_script,
+            "run_limited",
             lambda argv, **kw: SimpleNamespace(returncode=1, stdout="x.{a,a}", stderr=""),
         )
         assert _shell_is_posix_strict("/bin/sh") is False
@@ -1140,7 +1188,7 @@ class TestShellIsPosixStrict:
         def _run(argv, **kw):
             raise exc
 
-        monkeypatch.setattr(cron_script.subprocess, "run", _run)
+        monkeypatch.setattr(cron_script, "run_limited", _run)
         assert _shell_is_posix_strict("/bin/sh") is False
 
     def test_sandbox_profile_is_unlinked_even_when_gone(self, monkeypatch, tmp_path):
@@ -1150,8 +1198,8 @@ class TestShellIsPosixStrict:
             cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup))
         )
         monkeypatch.setattr(
-            cron_script.subprocess,
-            "run",
+            cron_script,
+            "run_limited",
             lambda argv, **kw: SimpleNamespace(returncode=0, stdout="x.{a,a}", stderr=""),
         )
 
@@ -1171,7 +1219,6 @@ def command_run(monkeypatch):
     monkeypatch.setattr(cron_script, "_resolve_command_shell", lambda: "/bin/sh")
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
-    monkeypatch.setattr(cron_script, "resource_limit_preexec", lambda: None)
     state = SimpleNamespace(proc=None, argv=[], env={})
 
     def _popen(argv, **kw):
@@ -1179,7 +1226,7 @@ def command_run(monkeypatch):
         state.env = dict(kw.get("env") or {})
         return state.proc
 
-    monkeypatch.setattr(cron_script.subprocess, "Popen", _popen)
+    monkeypatch.setattr(cron_script, "popen_limited", _popen)
     return state
 
 
@@ -1261,7 +1308,7 @@ class TestRunCommandSandboxed:
         def _popen(argv, **kw):
             raise OSError("fork failed")
 
-        monkeypatch.setattr(cron_script.subprocess, "Popen", _popen)
+        monkeypatch.setattr(cron_script, "popen_limited", _popen)
 
         result = run_command_sandboxed("echo hi")
 

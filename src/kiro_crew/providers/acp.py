@@ -23,11 +23,26 @@ from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
-    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+    ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_SESSION_SHARING,
     EVENT_COMPACTION_STATUS,
+    PROVIDER_LABEL_CLAUDE,
+    PROVIDER_LABEL_CODEX,
+    PROVIDER_LABEL_DEFAULT,
+    PROVIDER_LABEL_KAS,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
 )
+from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -42,6 +57,8 @@ from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
     LLMProvider,
+    SessionMcpReport,
+    resolve_billing_stats,
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 
@@ -97,7 +114,38 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
     atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
 
 
-def _write_tool_search_overlay(work_dir: Path, enabled: bool) -> None:
+#: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
+#: ``AgentConfig.tool_search_min_pct`` / ``tool_search_min_tokens``; a test pins
+#: the two spellings together (config cannot import this module — it would be a
+#: circular import).
+TOOL_SEARCH_DEFAULT_MIN_PCT = 5
+TOOL_SEARCH_DEFAULT_MIN_TOKENS = 50_000
+
+
+def _clamp_min_pct(value: object) -> int:
+    """Coerce a configured percentage into 0..100, falling back to the default."""
+    try:
+        pct = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return TOOL_SEARCH_DEFAULT_MIN_PCT
+    return max(0, min(100, pct))
+
+
+def _clamp_min_tokens(value: object) -> int:
+    """Coerce a configured token count to >= 0, falling back to the default."""
+    try:
+        tokens = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return TOOL_SEARCH_DEFAULT_MIN_TOKENS
+    return max(0, tokens)
+
+
+def _write_tool_search_overlay(
+    work_dir: Path,
+    enabled: bool,
+    min_pct: object = TOOL_SEARCH_DEFAULT_MIN_PCT,
+    min_tokens: object = TOOL_SEARCH_DEFAULT_MIN_TOKENS,
+) -> None:
     """Write kiro Tool Search settings into the workspace cli.json overlay.
 
     Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME per-session overlay
@@ -107,13 +155,22 @@ def _write_tool_search_overlay(work_dir: Path, enabled: bool) -> None:
 
     Tool Search (https://kiro.dev/docs/cli/mcp/tool-search/) loads MCP tool
     specs on demand ("search-and-call") instead of sending every spec each
-    turn. When *enabled* we also zero ``minPct``/``minTokens`` so deferral is
-    always active whenever MCP tools are present — KiroCrew sessions always
-    carry several MCP servers (well past kiro's default 50k-token trigger), but
-    zeroing guarantees the search-and-call behavior rather than relying on the
-    spec size crossing a threshold. The flag is written deterministically for
-    BOTH true and false so the KiroCrew toggle stays authoritative regardless
-    of any value in the user's global kiro settings.
+    turn. Deferral costs a round-trip: a deferred tool's spec is absent from the
+    model's tool list, so the first direct call fails and the model has to load
+    it with ``tool_search`` before retrying. That trade only pays once the specs
+    are actually large, which is what *min_pct* (percent of the context window)
+    and *min_tokens* express — kiro-cli activates deferral when EITHER is
+    exceeded. Both are configurable (``agent.tool_search_min_pct`` /
+    ``tool_search_min_tokens``) and default to kiro-cli's own thresholds; a
+    small install therefore keeps its full tool specs and never pays the
+    round-trip, while a heavy one still defers. Setting both to 0 restores
+    unconditional deferral.
+
+    The flag is written deterministically for BOTH true and false so the
+    Kiro Crew toggle stays authoritative regardless of any value in the user's
+    global kiro settings, and the thresholds are written EXPLICITLY rather than
+    omitted — an earlier build forced them to 0, and leaving that behind would
+    silently keep deferral unconditional on an already-configured machine.
 
     Merge-safe and idempotent — preserves the effort ``chat.modelDefaults`` keys
     and any other settings already present. kiro cli.json uses flat dotted keys
@@ -131,13 +188,11 @@ def _write_tool_search_overlay(work_dir: Path, enabled: bool) -> None:
         existing = {}
     existing["toolSearch.enabled"] = bool(enabled)
     if enabled:
-        # Force always-on deferral regardless of tool-spec size.
-        existing["toolSearch.minPct"] = 0
-        existing["toolSearch.minTokens"] = 0
+        existing["toolSearch.minPct"] = _clamp_min_pct(min_pct)
+        existing["toolSearch.minTokens"] = _clamp_min_tokens(min_tokens)
     else:
-        # Drop the forced-on thresholds when disabling so we don't leave zeroed
-        # thresholds behind that would silently force-activate Tool Search if a
-        # later build flips the global default on.
+        # Drop the thresholds when disabling so nothing is left behind that
+        # would take effect if a later build flips the global default on.
         existing.pop("toolSearch.minPct", None)
         existing.pop("toolSearch.minTokens", None)
     atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
@@ -241,11 +296,22 @@ class AcpProvider(LLMProvider):
         effort_per_model: dict[str, str] | None = None,
         effort_defaults: object = None,
         tool_search: bool | None = None,
+        tool_search_min_pct: object = None,
+        tool_search_min_tokens: object = None,
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        crew_agent: str | None = None,
     ) -> None:
+        # An unrecognized backend would pass every ``_is_<backend>`` check and
+        # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
+        # error. Fail at construction instead.
+        if acp_backend not in ACP_BACKENDS_KNOWN:
+            raise ValueError(
+                f"Unknown acp_backend {acp_backend!r}; "
+                f"expected one of {sorted(ACP_BACKENDS_KNOWN)}"
+            )
         kwargs: dict[str, Any] = {
             "work_dir": work_dir,
             "model": model,
@@ -265,6 +331,17 @@ class AcpProvider(LLMProvider):
         if agent:
             kwargs["agent"] = agent
         self._client = AcpClient(**kwargs)
+        # Consumer opt-in for the low-fidelity child permission downgrade
+        # (see child_fidelity_aware property). Set by fidelity-aware
+        # consumers (dashboard chat) BEFORE startup; re-applied when
+        # _start_kiro_runtime_impl swaps in the real AcpSessionProvider.
+        self._child_fidelity_aware: bool = False
+        # Canonical Kiro Crew identity (a cfg.agents key), resolved by the
+        # factory at provider-creation time — ``agent`` above is the bound kiro
+        # template, a different namespace. Threaded into the kiro-shared
+        # runtime so per-agent watchdog windows key off the crew, never off a
+        # cross-namespace name match.
+        self._crew_agent: str = crew_agent or ""
         # F2 load-recovery: set True by _start_kiro_runtime_impl when a resume
         # falls back to a FRESH native session (the prior session's lock never
         # cleared). Signals SessionManager.get_or_create to replay KiroCrew's
@@ -285,7 +362,17 @@ class AcpProvider(LLMProvider):
         # True/False = write the kiro settings overlay deterministically so the
         # KiroCrew toggle is authoritative over any global kiro setting.
         self._tool_search = tool_search
-        if not self.is_claude_backend:
+        # None = caller expressed no preference; fall back to kiro-cli's own
+        # activation thresholds rather than inventing a product-specific one.
+        self._tool_search_min_pct = (
+            TOOL_SEARCH_DEFAULT_MIN_PCT if tool_search_min_pct is None else tool_search_min_pct
+        )
+        self._tool_search_min_tokens = (
+            TOOL_SEARCH_DEFAULT_MIN_TOKENS
+            if tool_search_min_tokens is None
+            else tool_search_min_tokens
+        )
+        if self.is_acp_runtime_backend:
             # Recover overlay-persisted levels (server-restart resilience) and
             # write the overlay BEFORE the first spawn so kiro-cli reads it on
             # session/new. Caller-provided overrides win — only fill gaps.
@@ -301,6 +388,29 @@ class AcpProvider(LLMProvider):
     def client(self) -> AcpClient:
         """Expose underlying client for backward compat (e.g. is_ready check)."""
         return self._client
+
+    @property
+    def child_fidelity_aware(self) -> bool:
+        """See AcpSessionHandle.child_fidelity_aware.
+
+        Stored on the provider AND forwarded to the live inner client:
+        for the kiro backend ``self._client`` starts as a placeholder
+        AcpClient and is REPLACED with an AcpSessionProvider at runtime
+        startup (_start_kiro_runtime_impl), so a flag set only on the
+        inner client before startup would be lost with the placeholder.
+        The stored value is re-applied at replacement time.
+        """
+        return self._child_fidelity_aware
+
+    @child_fidelity_aware.setter
+    def child_fidelity_aware(self, value: bool) -> None:
+        self._child_fidelity_aware = bool(value)
+        inner = getattr(self, "_client", None)
+        if inner is not None and hasattr(inner, "child_fidelity_aware"):
+            try:
+                inner.child_fidelity_aware = bool(value)
+            except Exception:  # pragma: no cover - read-only shapes
+                pass
 
     @property
     def served_model(self) -> str:
@@ -342,19 +452,95 @@ class AcpProvider(LLMProvider):
 
     @property
     def is_claude_backend(self) -> bool:
-        """True when this ACP provider talks to claude-agent-acp (vs kiro-cli)."""
-        return self._client.backend == ACP_BACKEND_CLAUDE
+        """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).
+
+        The comparison lives in ``agent_sdk.backend_identity`` so this property,
+        ``session._is_claude_backend`` and ``provider_label`` cannot drift about
+        what "the claude backend" means. Reading ``self._client.backend`` stays
+        here because only this class knows where its own backend string lives.
+        """
+        return is_claude_backend_name(self._client.backend)
+
+    @property
+    def is_codex_backend(self) -> bool:
+        """True when this ACP provider talks to codex-acp (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_CODEX
+
+    @property
+    def is_kas_backend(self) -> bool:
+        """True when this ACP provider talks to KAS (kiro-agent)."""
+        return self._client.backend == ACP_BACKEND_KAS
+
+    @property
+    def is_kiro_backend(self) -> bool:
+        """True when this ACP provider talks to kiro-cli.
+
+        Stated positively so call sites that mean "kiro" say so, rather than
+        inferring it from ``not is_claude_backend`` — an inference that silently
+        captures every future backend.
+        """
+        return self._client.backend == ACP_BACKEND_KIRO
+
+    @property
+    def is_acp_runtime_backend(self) -> bool:
+        """True when this provider is served by AcpRuntime (kiro-cli or KAS).
+
+        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5). Names
+        the "kiro or kas" set positively so the shared-runtime start path, the
+        cli.json overlay recovery, and the skip-live-effort branch stop being
+        spelled ``not is_claude_backend`` — which would hand the kiro-family
+        path to every harness added later. The claude AcpClient is deliberately
+        not a member: it runs one process per session and shares no runtime.
+        """
+        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
 
     @property
     def is_session_sharing_eligible(self) -> bool:
         """True when this provider can host multiplexed subagent sessions.
 
-        Session sharing requires the kiro-cli backend (which supports N
-        concurrent sessions per process via AcpRuntime demux). The Claude
-        Code backend uses AcpClient (one process per session) and is never
-        eligible, so subagents fall back to the legacy per-process path.
+        Session sharing requires a backend whose single process serves N
+        concurrent sessions via AcpRuntime demux, so it is granted by membership
+        in ``ACP_BACKENDS_SESSION_SHARING`` (harness-parity H6) rather than by
+        ``not is_claude_backend``. The Claude Code backend uses AcpClient (one
+        process per session) and is not a member, so subagents fall back to the
+        legacy per-process path — and neither does any harness added later,
+        until someone adds it deliberately.
         """
-        return not self.is_claude_backend
+        return self._client.backend in ACP_BACKENDS_SESSION_SHARING
+
+    @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when a manual ``/compact`` cannot be served, else ``None``.
+
+        Answered from ``ACP_BACKENDS_COMPACT`` membership (harness-parity H6):
+        kiro-cli answers the ``/compact`` prompt with
+        ``_kiro.dev/compaction/status`` and claude-agent-acp compacts natively
+        in-prompt, while KAS treats the prompt as ordinary text and never emits
+        a status — its ``summarization_*`` frames fire only for KAS-initiated
+        auto-summarization — so an ungated dispatch strands
+        ``wait_for_compaction()`` for the full ``COMPACT_WAIT_TIMEOUT_SECS``
+        (#7800). Read off the backend STRING, not the ``is_*_backend``
+        properties, matching ``provider_label``'s MagicMock caution; a
+        non-``str`` value answers ``None`` so a spec'd double never reads as a
+        refusal. The empty string is ``ACP_BACKEND_KIRO`` (a member), so a
+        non-``None`` answer is always a non-empty backend id.
+        """
+        backend = getattr(self._client, "backend", ACP_BACKEND_KIRO)
+        if not isinstance(backend, str) or backend in ACP_BACKENDS_COMPACT:
+            return None
+        return backend
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child signs in from kiro-cli's own store.
+
+        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        H5/H14). Declaring it here is what lets the session layer ask the
+        question through the ABC instead of probing private attributes, so an
+        adapted provider is classified by its own declaration rather than by
+        whichever internal shape it happens to expose.
+        """
+        return self._client.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
 
     async def _start_kiro_runtime(self) -> None:
         """Spawn an AcpRuntime + session; time the kiro cold-start split.
@@ -573,6 +759,8 @@ class AcpProvider(LLMProvider):
             mcp_gateway_overlay=mcp_gateway_overlay,
             mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
             mcp_gateway_socket=mcp_gateway_socket,
+            acp_backend=self._client.backend,
+            crew_agent=self._crew_agent,
         )
         _t_spawn = time.monotonic()
         try:
@@ -608,8 +796,17 @@ class AcpProvider(LLMProvider):
             handle = None
             resumed = False
             if resume_sid:
-                session_file = kiro_sessions_dir() / f"{resume_sid}.json"
-                if session_file.exists():
+                if self.is_kas_backend:
+                    # KAS locates the transcript itself from sessionId, and in
+                    # remote-session mode there are no local files to stat at
+                    # all. Attempt the load and let failure fall through to a
+                    # fresh session/new with history replay.
+                    session_file = None
+                    should_load = True
+                else:
+                    session_file = kiro_sessions_dir() / f"{resume_sid}.json"
+                    should_load = session_file.exists()
+                if should_load:
                     # F2 load-recovery: retry past a stale "active in another
                     # process" lock (Phase 1); on persistent failure fall through
                     # to a fresh session/new below WITH KiroCrew history replay
@@ -621,7 +818,7 @@ class AcpProvider(LLMProvider):
                     try:
                         handle = await self._load_session_with_retry(
                             runtime,
-                            str(session_file),
+                            str(session_file) if session_file else "",
                             resume_sid,
                             work_dir,
                             agent,
@@ -638,7 +835,6 @@ class AcpProvider(LLMProvider):
             meta["resumed"] = resumed
 
             _t_sess = time.monotonic()
-            _ran_session_new = handle is None
 
             if handle is None:
                 # ── Fix B: respawn if runtime died during resume attempt ──
@@ -663,6 +859,8 @@ class AcpProvider(LLMProvider):
                         mcp_gateway_overlay=mcp_gateway_overlay,
                         mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
                         mcp_gateway_socket=mcp_gateway_socket,
+                        acp_backend=self._client.backend,
+                        crew_agent=self._crew_agent,
                     )
                     try:
                         await runtime.spawn()
@@ -679,12 +877,14 @@ class AcpProvider(LLMProvider):
                     if runtime.saw_not_logged_in():
                         raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
                     raise
-            # session/new + MCP-toolset/system-prompt load done. Only recorded
-            # when create_session actually ran: a successful resume skips that
-            # block entirely, and reporting a near-zero session_new for it would
-            # understate the phase's real distribution.
-            if _ran_session_new:
-                phases["session_new"] = (time.monotonic() - _t_sess) * 1000.0
+                finally:
+                    # In a finally, mirroring session_load: a start that BLEW its
+                    # budget is the one whose duration matters most, and recording
+                    # it only after the try left startup telemetry with no row for
+                    # any failed start. Guarded by the enclosing ``handle is None``,
+                    # so a successful resume never reports a near-zero session_new
+                    # that would understate the phase's real distribution.
+                    phases["session_new"] = (time.monotonic() - _t_sess) * 1000.0
 
             # Apply the configured model override (mirrors AcpClient handshake).
             # DEFAULT_MODEL ("auto") means "let kiro-cli pick per agent config".
@@ -725,6 +925,13 @@ class AcpProvider(LLMProvider):
             provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
             if resumed:
                 provider.resumed = True
+            # Re-apply the consumer's fidelity opt-in: it was set on THIS
+            # provider (possibly landing on the placeholder client, now
+            # discarded) before startup — without this, the dashboard's
+            # opt-in never reaches the handle and its child permission
+            # requests are fail-closed instead of shown as a card.
+            if self._child_fidelity_aware:
+                provider.child_fidelity_aware = True
             self._client = provider  # type: ignore[assignment]
         except BaseException:
             # No provider owns the runtime yet — kill it so a failed session
@@ -753,6 +960,14 @@ class AcpProvider(LLMProvider):
         Claude list) rather than a hardcoded set.
         """
         return self._client.available_models()
+
+    def mcp_session_report(self) -> SessionMcpReport:
+        """This session's MCP registration report, kept on the inner client.
+
+        The dedicated transport owns one client per session, so its report IS the
+        session's. The shared runtime answers the same call from its handle.
+        """
+        return self._client.mcp_session_report()
 
     def get_valid_effort_levels(self) -> list[str]:
         """Effort levels the backend reported for the CURRENT model, in ACP order.
@@ -784,11 +999,19 @@ class AcpProvider(LLMProvider):
     def _apply_effort_overlay(self) -> None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
 
-        No-op for the claude backend (it uses live set_config_option) and when
-        the model is not effort-capable or no level resolves. Called before
-        every (re)spawn so resume/restart keeps the same level.
+        Written only for the harnesses that READ it
+        (``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` — the kiro family takes effort from
+        this file at spawn); adapter harnesses use a live set_config_option push
+        instead. Also a no-op when the model is not effort-capable or no level
+        resolves. Called before every (re)spawn so resume/restart keeps the same
+        level.
+
+        Membership rather than "not claude": the companion clear
+        (``_clear_cli_overlay_effort`` in :meth:`change_effort`) is already
+        membership-gated, so a negation here writes an overlay for a harness the
+        clear will never reach — a stale file left in the user's workspace.
         """
-        if self.is_claude_backend:
+        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -803,24 +1026,43 @@ class AcpProvider(LLMProvider):
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        No-op for the claude backend (Tool Search is a kiro-cli feature) and
-        when no toggle value was supplied (``self._tool_search is None``).
-        Called before every (re)spawn so resume/restart keeps the same setting.
+        Tool Search is a kiro-cli feature read from this file at spawn, so the
+        write is scoped to the harnesses that read it; a no-op as well when no
+        toggle value was supplied (``self._tool_search is None``). Called before
+        every (re)spawn so resume/restart keeps the same setting.
         """
-        if self.is_claude_backend or self._tool_search is None:
+        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+            return
+        if self._tool_search is None:
             return
         try:
-            _write_tool_search_overlay(self._client._work_dir, self._tool_search)
-            logger.debug(
-                "ACP MCP Tool Search overlay applied: enabled=%s (%s)",
+            _write_tool_search_overlay(
+                self._client._work_dir,
                 self._tool_search,
+                self._tool_search_min_pct,
+                self._tool_search_min_tokens,
+            )
+            # The interpolated values are a bool and two integer thresholds, plus a
+            # path. Semgrep matches on the word "tokens" in the message string, not
+            # on the arguments; the setting names are kept verbatim so the log line
+            # greps against the kiro settings it writes.
+            logger.debug(  # nosemgrep: python-logger-credential-disclosure
+                "ACP MCP Tool Search overlay applied: enabled=%s minPct=%s minTokens=%s (%s)",
+                self._tool_search,
+                self._tool_search_min_pct,
+                self._tool_search_min_tokens,
                 self._client._work_dir / ".kiro" / "settings" / "cli.json",
             )
         except Exception:
             logger.warning("ACP tool-search overlay write failed", exc_info=True)
 
-    async def _set_claude_effort(self, level: str) -> None:
-        """Push an effort level to the claude backend, stepping down on reject.
+    async def _set_effort_config_option(self, level: str) -> None:
+        """Push an effort level over ``session/set_config_option``, stepping down
+        on reject.
+
+        Named for the CHANNEL, not a harness: every member of
+        ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` arrives here, and the
+        adapter-behaviour notes below are what that channel does in practice.
 
         claude-agent-acp validates the value against the *current model's*
         ``supportedEffortLevels`` and throws ``Invalid value for config option
@@ -839,7 +1081,7 @@ class AcpProvider(LLMProvider):
         spam errors and trigger a session reset on every turn.
         """
         if not self._client.supports_config_option("effort"):
-            logger.debug("claude-agent-acp exposes no 'effort' config option; skipping effort push")
+            logger.debug("adapter exposes no 'effort' config option; skipping effort push")
             return
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
@@ -879,21 +1121,34 @@ class AcpProvider(LLMProvider):
     async def change_effort(self, level: str) -> bool:
         """Change effort live for the current model. Returns True on success.
 
-        Persists the slot override and (kiro) rewrites the overlay so a later
-        respawn keeps the level, then pushes the change to the running session:
-        kiro via the ``/effort`` slash command, claude via
-        ``session/set_config_option``. Returns False when the current model
-        does not support effort.
+        Persists the slot override and (kiro family) rewrites the overlay so a
+        later respawn keeps the level, then pushes the change to the running
+        session: the ``/effort`` slash command for
+        ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``, ``session/set_config_option`` for
+        ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION``. Returns False when the current
+        model does not support effort, or when this harness is in neither set and
+        so has no effort channel at all.
         """
         model = self._client._model
         if not model_supports_effort(model):
             logger.info("change_effort skipped — model %s does not support effort", model)
             return False
-        # Older claude-agent-acp builds advertise no 'effort' config option;
-        # attempting to push would fail with 'Unknown config option' and reset
-        # the session. Report unsupported so the dashboard leaves the UI as-is.
-        if self.is_claude_backend and not self._client.supports_config_option("effort"):
-            logger.info("change_effort skipped — claude-agent-acp build exposes no 'effort' option")
+        via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+        via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+        if not (via_config_option or via_slash_command):
+            # Both channels are opt-in, so a harness in neither has to be reported
+            # unsupported here. Guessing one would push into a verb the adapter
+            # does not implement and reset the session on a -32601.
+            logger.info(
+                "change_effort skipped — backend %r implements no effort channel",
+                self._client.backend,
+            )
+            return False
+        # An adapter build may advertise no 'effort' config option; attempting to
+        # push would fail with 'Unknown config option' and reset the session.
+        # Report unsupported so the dashboard leaves the UI as-is.
+        if via_config_option and not self._client.supports_config_option("effort"):
+            logger.info("change_effort skipped — adapter build exposes no 'effort' option")
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
         # can report levels beyond the canonical five (effort.py), and those are
@@ -913,15 +1168,15 @@ class AcpProvider(LLMProvider):
         self._effort_per_model[model] = level
         self._apply_effort_overlay()
         try:
-            if self.is_claude_backend:
-                await self._set_claude_effort(level)
+            if via_config_option:
+                await self._set_effort_config_option(level)
             else:
                 await self._client.send_command("/effort", args={"level": level})
         except Exception:
             # Roll back to the prior state before propagating to the caller.
             if _prev is None:
                 self._effort_per_model.pop(model, None)
-                if not self.is_claude_backend:
+                if self.is_acp_runtime_backend:
                     _clear_cli_overlay_effort(self._client._work_dir, model)
             else:
                 self._effort_per_model[model] = _prev
@@ -934,7 +1189,11 @@ class AcpProvider(LLMProvider):
             "ACP effort live-changed: model=%s effort=%s backend=%s",
             model,
             level,
-            "claude" if self.is_claude_backend else "kiro",
+            # Log the harness by its policy-facing name: ACP_BACKEND_KIRO is the
+            # empty string, so the raw value would read as a missing field, and a
+            # two-way "claude or kiro" label would name the wrong harness for
+            # every backend added after it.
+            POLICY_ID_BY_BACKEND.get(self._client.backend, self._client.backend),
         )
         return True
 
@@ -945,10 +1204,11 @@ class AcpProvider(LLMProvider):
         falls back to its own default.
 
         Returns True ONLY when a concrete default was applied LIVE to the
-        running session (kiro with a resolvable workspace default). Returns
-        False — signalling the caller to reset the session so a cold start
-        re-resolves the true default — in the cases that cannot be reset live:
-        - claude-agent-acp has no "reset to default" config value (there is no
+        running session (kiro family with a resolvable workspace default).
+        Returns False — signalling the caller to reset the session so a cold
+        start re-resolves the true default — in the cases that cannot be reset
+        live:
+        - the config-option channel has no "reset to default" value (there is no
           level to push; only a respawn drops the override), and
         - kiro with no workspace default (the model's built-in default is only
           re-applied on respawn once the overlay is cleared).
@@ -959,11 +1219,17 @@ class AcpProvider(LLMProvider):
         if not model_supports_effort(model):
             return False
         self._effort_per_model.pop(model, None)
-        if self.is_claude_backend:
-            # No live "reset to default" — caller must reset the session.
-            logger.info("ACP effort cleared (claude); session reset needed for default")
+        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+            # No live "reset to default" — caller must reset the session. Scoped
+            # by membership so a harness that reads neither the overlay nor the
+            # slash command is not sent down the kiro path below, which would
+            # write an overlay it ignores and then push a verb it lacks.
+            logger.info(
+                "ACP effort cleared (%s); session reset needed for default",
+                POLICY_ID_BY_BACKEND.get(self._client.backend, self._client.backend),
+            )
             return False
-        # kiro: clear/rewrite the overlay so a respawn doesn't re-apply it.
+        # kiro family: clear/rewrite the overlay so a respawn doesn't re-apply it.
         level = self._resolve_effort()  # workspace default, or None
         if level:
             self._apply_effort_overlay()
@@ -982,7 +1248,7 @@ class AcpProvider(LLMProvider):
         self._apply_effort_overlay()
         self._apply_tool_search_overlay()
 
-        if not self.is_claude_backend:
+        if self.is_acp_runtime_backend:
             # ── Kiro unified path: AcpRuntime + AcpSessionHandle ──
             # Spawn a runtime, create/resume a session, wrap in
             # AcpSessionProvider. One process hosts parent + all subagent
@@ -1005,13 +1271,13 @@ class AcpProvider(LLMProvider):
         must not break session start. The kiro backend already gets effort
         from the cli.json overlay at spawn, so this is a no-op there.
         """
-        if not self.is_claude_backend:
+        if self.is_acp_runtime_backend:
             return
         level = self._resolve_effort()
         if not level:
             return
         try:
-            await self._set_claude_effort(level)
+            await self._set_effort_config_option(level)
             logger.info("CC initial effort applied: model=%s effort=%s", self._client._model, level)
         except Exception:
             logger.warning(
@@ -1038,13 +1304,36 @@ class AcpProvider(LLMProvider):
             request_id=e.request_id,
             options=e.options,
             tool_input=e.tool_input,
+            tool_input_redacted=e.tool_input_redacted,
             tool_output=e.tool_output,
             tool_final=e.tool_final,
             usage=e.usage,
             raw_tool_params=e.raw_tool_params,
+            # PROVENANCE flags for the child-fidelity gate. Dropping these
+            # zeroes them to their False defaults, which flips
+            # child_low_fidelity to True for EVERY child permission event that
+            # crosses this provider — the full-fidelity half of the feature
+            # (mode-parity auto-approval, unannotated card) would be inert on
+            # the primary interactive surface. Same trap for
+            # mcp_identity_trusted: dropping it revokes the verified-identity
+            # half (child_mcp_identity_trusted) for every crossing event.
+            raw_params_trusted=e.raw_params_trusted,
+            shell_classified=e.shell_classified,
+            mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,
             oauth_url=e.oauth_url,
             subagents=e.subagents,
+            # Compaction provenance. Dropping either one zeroes it to False and
+            # silently disarms a consumer guard on the PRIMARY interactive
+            # surface: without ``synthesized`` the dashboard treats the terminal
+            # manufactured at turn end as a mid-turn segment boundary and clears
+            # the answer a backend produced after compacting, and without
+            # ``control_notice`` it counts the adapter's "Compacting..." notice
+            # as the turn's reply, which shadows the post-compaction
+            # continuation and leaves the request unanswered.
+            synthesized=e.synthesized,
+            control_notice=e.control_notice,
+            runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
             is_shell=e.is_shell,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
@@ -1062,15 +1351,18 @@ class AcpProvider(LLMProvider):
             yield self._to_llm_event(e)
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
-        # claude-agent-acp does not implement the kiro-only
-        # _kiro.dev/commands/execute method — route slash commands through
-        # session/prompt, which the claude backend interprets natively for its
-        # SDK-supported commands (/compact, /help, /model, /context, …).
-        # Commands the SDK doesn't recognise (kiro-only ones like /agent,
-        # /experiment, /hooks) flow through as conversational prompt text;
-        # this is a softer failure mode than the previous -32601
-        # "Method not found" hard error.
-        if self.is_claude_backend:
+        # _kiro.dev/commands/execute is a kiro extension, so only
+        # ACP_BACKENDS_KIRO_SLASH_COMMANDS members can be sent it. Everyone else
+        # routes through session/prompt, which an adapter interprets natively for
+        # the commands its SDK supports (/compact, /help, /model, /context, …).
+        # Commands it doesn't recognise (kiro-only ones like /agent, /experiment,
+        # /hooks) flow through as conversational prompt text — a softer failure
+        # mode than a -32601 "Method not found" on the whole call.
+        #
+        # Membership rather than "not claude": the RPC is the narrow capability
+        # here, so a harness added later must opt in to it, not inherit it and
+        # hard-error on every slash command a user types.
+        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             async for e in self._client.stream_events(command):
                 yield self._to_llm_event(e)
             return
@@ -1094,6 +1386,21 @@ class AcpProvider(LLMProvider):
 
     def context_used_tokens(self) -> int:
         return self._client.last_prompt_stats.context_used_tokens
+
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        Forwards the inner client's own DECLARATION rather than reading an
+        attribute off it: this provider wraps whichever client the backend
+        installs (a raw ``AcpClient`` for claude / pre-startup, an
+        ``AcpSessionProvider`` after kiro startup replaces the placeholder), and
+        forwarding the capability is what keeps the wrapper from re-introducing
+        the attribute-name dependency the accounting path just shed. Resolved
+        through the shared helper so this forward cannot diverge from the reader
+        it feeds, and per call because the placeholder client is replaced at
+        runtime startup.
+        """
+        return resolve_billing_stats(getattr(self, "_client", None))
 
     async def compact(self, context: str = "") -> None:
         """Trigger native /compact with optional context-preserving prompt."""
@@ -1166,6 +1473,11 @@ class AcpProvider(LLMProvider):
         return await self._client.steer(message)
 
     @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the inner client's last steer (0.0 if never)."""
+        return float(getattr(self._client, "last_steer_monotonic", 0.0) or 0.0)
+
+    @property
     def supports_steer(self) -> bool:
         """True when the inner client supports mid-turn steer."""
         return bool(getattr(self._client, "supports_steer", False))
@@ -1198,9 +1510,9 @@ class AcpProvider(LLMProvider):
         ``start()``), which issues a fresh ``session/new`` on the already-running
         process, skipping subprocess spawn + the ``initialize`` handshake. This is
         the primitive a warm session pool uses to reuse one worker across
-        independent tasks without leaking context between them. The dormant
-        claude-backend seam would delegate to its own client-side reset the same
-        way (the fork's ``AcpClient`` does not ship it — hence the type ignore).
+        independent tasks without leaking context between them. The claude backend
+        would delegate to its own client-side reset the same way (its ``AcpClient``
+        does not ship one — hence the type ignore).
         """
         await self._client.new_conversation()  # type: ignore[attr-defined]
 
@@ -1285,3 +1597,37 @@ def is_claude_backend(provider: Any) -> bool:
     property without an isinstance gate.
     """
     return isinstance(provider, AcpProvider) and provider.is_claude_backend
+
+
+def provider_label(provider: Any) -> str:
+    """Backend identity key for *provider*.
+
+    This key indexes three things, so all producers must agree on it:
+    resume compatibility (``detect_provider_switch``), the value persisted in
+    the session map, and session-file cleanup routing.
+
+    Resolved from the client's backend STRING rather than the ``is_*_backend``
+    properties, matching ``session._is_claude_backend``. A ``MagicMock(spec=...)``
+    constrains attribute names but not their values, so reading a property would
+    make every spec'd provider in the test suite look like every backend at once.
+
+    Both shapes a runtime-backed session can arrive in are accepted: an
+    ``AcpProvider`` whose ``client`` was swapped for an ``AcpSessionProvider``
+    once startup completed, and a bare ``AcpSessionProvider`` handed out for a
+    shared subagent session. Missing either one persists a KAS session under
+    the kiro label, and the map then prunes its id for want of a kiro
+    transcript.
+    """
+    if isinstance(provider, AcpSessionProvider):
+        backend = provider.backend
+    elif isinstance(provider, AcpProvider):
+        backend = getattr(getattr(provider, "client", None), "backend", "")
+    else:
+        return PROVIDER_LABEL_DEFAULT
+    if is_claude_backend_name(backend):
+        return PROVIDER_LABEL_CLAUDE
+    if backend == ACP_BACKEND_KAS:
+        return PROVIDER_LABEL_KAS
+    if backend == ACP_BACKEND_CODEX:
+        return PROVIDER_LABEL_CODEX
+    return PROVIDER_LABEL_DEFAULT

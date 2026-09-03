@@ -228,11 +228,13 @@ def test_restore_recent_sessions_does_not_broadcast_either(tmp_path, monkeypatch
 
 
 def test_rehydrate_does_not_broadcast_replayed_messages(tmp_path, monkeypatch) -> None:
-    """_broadcast_chat_message ships content verbatim.
+    """Replayed history must not be broadcast even though content is now redacted.
 
+    _broadcast_chat_message redacts non-user *content* (parity with
+    _prepare_messages, #1713) but deliberately not *meta* — so replaying history
+    through it would still push unredacted meta straight to connected clients.
     This helper also runs for on-demand cold-slot rehydrates, i.e. while clients
-    are connected — so replaying history through it would push unredacted content
-    straight to them.
+    are connected.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     state = _make_state(tmp_path / "sessions")
@@ -417,7 +419,8 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
     """Every real provider's consent URL must survive `_prepare_messages`.
 
     This is the test whose absence let a real regression through. The repo already
-    had `test/oauth_url_corpus.py` pinning that `_oauth_url_contains_credential`
+    had `test/oauth_url_corpus.py` pinning that the OAuth banner gate (now
+    `security.oauth_url_contains_credential`)
     never rejects a real provider URL — but nothing routed that corpus through the
     DISPLAY gate, and this PR newly called `_redact_meta_for_role` from
     `_prepare_messages`.
@@ -432,6 +435,8 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
     """
     from oauth_url_corpus import LEGIT_OAUTH_URLS
 
+    from kiro_crew.dashboard.chat_utils import gateway_generation
+
     assert LEGIT_OAUTH_URLS, "precondition: the corpus is non-empty"
     blanked = []
     for provider, url in LEGIT_OAUTH_URLS:
@@ -441,7 +446,17 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
                     "role": "mcp_oauth",
                     "content": "authorize",
                     "cls": "msg msg-info",
-                    "meta": {"server_name": "acme", "oauth_url": url},
+                    # Stamped with the LIVE generation, which is what a banner the
+                    # user can still act on always carries: `_emit_mcp_oauth_request`
+                    # is the only producer of these rows and it always stamps. An
+                    # unstamped row means a dead flow and is withdrawn on purpose
+                    # (issue #7654) -- pinned by the next test, so this one keeps
+                    # measuring what it was written to measure: the redaction gate.
+                    "meta": {
+                        "server_name": "acme",
+                        "oauth_url": url,
+                        "gen": gateway_generation(),
+                    },
                 }
             ],
             False,
@@ -452,6 +467,32 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
         "the emit path blanked a legitimate consent URL — the Authorize banner "
         f"would silently vanish for: {blanked}"
     )
+
+
+def test_a_legitimate_url_from_a_dead_generation_is_withdrawn() -> None:
+    """The other side of the corpus test: a real URL is no longer a live one.
+
+    A banner carrying no generation stamp was persisted by an earlier build, so the
+    process that owned its loopback listener and PKCE verifier is gone. The URL is
+    still a perfectly well-formed provider URL — that is exactly why the scheme and
+    credential gates cannot catch it, and why the liveness gate has to (issue #7654).
+    """
+    from oauth_url_corpus import LEGIT_OAUTH_URLS
+
+    _, url = LEGIT_OAUTH_URLS[0]
+    out = _prepare_messages(
+        [
+            {
+                "role": "mcp_oauth",
+                "content": "authorize",
+                "cls": "msg msg-info",
+                "meta": {"server_name": "acme", "oauth_url": url},
+            }
+        ],
+        False,
+    )
+    assert out[0]["meta"]["expired"] is True
+    assert not out[0]["meta"].get("oauth_url"), "a dead flow still offered its link"
 
 
 def test_oauth_url_gate_still_blocks_a_tampered_url() -> None:
@@ -483,7 +524,7 @@ def test_oauth_completion_preserves_a_legitimate_url() -> None:
     banner for 8 of the 9 providers in test/oauth_url_corpus.py.
 
     The lesson worth keeping: a shared helper cannot be judged safe from one call
-    site. The gate now matches `_oauth_url_contains_credential` for every caller.
+    site. The gate now matches `security.oauth_url_contains_credential` for every caller.
     """
     from kiro_crew.dashboard.chat_runner import _mark_mcp_oauth_completed
     from kiro_crew.dashboard.state import _ChatSlot
@@ -515,3 +556,45 @@ def test_oauth_completion_preserves_a_legitimate_url() -> None:
     meta = sent[0]["payload"]["meta"]
     assert meta.get("oauth_url") == legit, "a legitimate consent URL was blanked"
     assert meta.get("completed") is True
+
+
+# ── 7. WS broadcast redaction parity with the HTTP history path (#1713) ──────
+#
+# _prepare_messages (HTTP history) redacts non-user content at display time;
+# _broadcast_chat_message (live WS push) used to ship the same row verbatim, so
+# one chat row left the backend in two different byte forms depending on which
+# consumer received it. These pin the parity on both sides of the role gate.
+
+
+def test_ws_broadcast_redacts_assistant_content(tmp_path, monkeypatch) -> None:
+    """An assistant row carrying a credential comes out redacted on the WS path."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    sent: list[dict] = []
+    monkeypatch.setattr(state, "_broadcast", lambda payload: sent.append(payload))
+
+    state._broadcast_chat_message(
+        "chat-1-wsred", {"role": "assistant", "content": f"key {SECRET}", "ts": "1"}
+    )
+
+    assert len(sent) == 1, "precondition: exactly one payload was broadcast"
+    assert SECRET not in sent[0]["content"], "WS payload leaked an unredacted credential"
+    assert sent[0]["role"] == "assistant"
+
+
+def test_ws_broadcast_leaves_user_content_raw(tmp_path, monkeypatch) -> None:
+    """A user row is left alone — the same carve-out as _prepare_messages.
+
+    The user typed it and is the only one who sees it back; redacting it here
+    would diverge from the HTTP path in the other direction.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    sent: list[dict] = []
+    monkeypatch.setattr(state, "_broadcast", lambda payload: sent.append(payload))
+
+    text = f"my note contains {SECRET}"
+    state._broadcast_chat_message("chat-1-wsraw", {"role": "user", "content": text, "ts": "1"})
+
+    assert len(sent) == 1, "precondition: exactly one payload was broadcast"
+    assert sent[0]["content"] == text, "user-authored content must survive verbatim"

@@ -365,6 +365,10 @@ class TestSanitizedPath:
         assert resolved[0] == str(real)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="uid 0 has no meaning on Windows")
+    @pytest.mark.skipif(
+        os.path.exists("/usr/bin") and os.stat("/usr/bin").st_uid != 0,
+        reason="system directories not root-owned on this host",
+    )
     def test_a_system_directory_is_trusted_without_any_config(self):
         # `/usr/bin` must work out of the box or the tier ships dead. Deliberately
         # NOT `/usr/local/bin`: CI runners hand that to the build user, so asserting
@@ -1035,6 +1039,7 @@ class TestProbeWithoutASandbox:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="probes are POSIX-only")
 @_NEEDS_SANDBOX
+@pytest.mark.xdist_group("sandbox_probe")
 class TestRunProbe:
     """The real subprocess path, driven with stock POSIX utilities rather than a
     CLI that may not be installed on the runner."""
@@ -1117,31 +1122,60 @@ class TestRunProbe:
         assert out.strip() == "[]"
 
     @pytest.mark.asyncio
-    async def test_the_environment_is_an_allowlist_not_a_filtered_inherit(self, monkeypatch):
+    async def test_the_environment_is_an_allowlist_not_a_filtered_inherit(self, monkeypatch, tmp_path):
         # A denylist covers the credential names it knows and, by construction,
         # cannot cover the ones it does not — `GH_TOKEN`, `KUBECONFIG`, `NPM_TOKEN`
         # and every future tool's variable would have reached the child. So the
         # environment is built from nothing instead of filtered down.
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "NPM_TOKEN", "HOME"):
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "NPM_TOKEN"):
             monkeypatch.setenv(name, f"leaked-{name}")
+        # `GRADLE_OPTS` is named in the allowlist below because the sandbox launcher
+        # writes it, so a marker in the parent is what keeps the check honest: naming
+        # the variable alone would let a future filtered-inherit hand the child the
+        # parent's value under an allowed name. The launcher APPENDS to whatever it
+        # finds, so an inherited value survives into the child and trips the
+        # `leaked-` assertion below.
+        monkeypatch.setenv("GRADLE_OPTS", "leaked-GRADLE_OPTS")
+        # HOME keeps the `leaked-` marker but must be an ABSOLUTE path: on hosts
+        # where the userns sandbox is unavailable the probe child runs unsandboxed
+        # and inherits pytest's CWD (the repo root), and the workspace resolver
+        # mkdirs $HOME/workplace/... — a relative sentinel like "leaked-HOME"
+        # lands that tree inside the checkout and trips the conftest
+        # root-residue guard. Anchoring it under tmp_path keeps the leak
+        # assertion at full strength while any stray resolution stays in tmp.
+        monkeypatch.setenv("HOME", str(tmp_path / "leaked-HOME"))
         out = await tc._run_probe(["/bin/sh", "-c", "env"], None)
         assert out is not None
         assert "leaked-" not in out
         # And the allowlist really is minimal. The extras are not ours: the sandbox
-        # launcher injects its own markers (`KIROCREW_*`, `GIT_SSH_COMMAND`) and the
-        # shell adds `PWD`/`SHLVL`/`_`, so they are named rather than blanket-allowed
-        # — a NEW name appearing here should fail this and be looked at.
+        # launcher injects its own markers (`KIROCREW_*`, `GIT_SSH_COMMAND`,
+        # `GRADLE_OPTS`) and the shell adds `PWD`/`SHLVL`/`_`, so they are named
+        # rather than blanket-allowed — a NEW name appearing here should fail this
+        # and be looked at.
         ours = {"TERM", "NO_COLOR", "PAGER", "GIT_PAGER", "PATH", "LANG", "LC_ALL", "LC_CTYPE"}
+        # `GRADLE_OPTS` carries no inherited value: the launcher's guard appends
+        # `-Dorg.gradle.daemon=false` to whatever the ALLOWLISTED env holds, and the
+        # allowlist never carries it, so the child sees only the flag the launcher
+        # wrote. That the launcher always writes it is pinned from the shipped
+        # launcher source by
+        # test_sandbox_gradle_daemon.py::test_sets_the_flag_when_gradle_opts_is_absent.
         sandbox_injected = {"KIROCREW_HOST_PID", "KIROCREW_SANDBOX_ACTIVE",
-                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SPAWNED", "GIT_SSH_COMMAND"}
+                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SPAWNED",
+                            "GIT_SSH_COMMAND", "GRADLE_OPTS"}
         shell_added = {"PWD", "SHLVL", "_"}
         # macOS injects __CF_USER_TEXT_ENCODING into every spawned process
         # unconditionally (CoreFoundation per-user encoding preference). This is
         # not ours and not a leak — it is injected by the kernel/dyld, not
         # inherited from the parent environment.
         os_injected = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
+        # systemd injects session markers into processes it manages (systemd-run
+        # --user --scope). These are not inherited from the parent env and are
+        # not credentials — they identify the unit/journal stream.
+        systemd_injected = {"INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID",
+                            "MANAGERPID", "LISTEN_FDS", "LISTEN_FDNAMES"}
         names = {line.split("=", 1)[0] for line in out.splitlines() if "=" in line}
-        assert names <= ours | sandbox_injected | shell_added | os_injected, names
+        assert names <= (ours | sandbox_injected | shell_added | os_injected
+                         | systemd_injected), names
 
     @pytest.mark.asyncio
     async def test_the_child_path_is_the_sanitized_one(self, monkeypatch):

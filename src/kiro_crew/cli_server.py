@@ -3,30 +3,29 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import http.client
 import json
 import logging
 import os
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from kiro_crew import __version__, platform_compat
-from kiro_crew.beacon import is_default_home
+from kiro_crew import __version__, dep_sync, platform_compat
+from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
-    _DEFAULT_PORT,
     _session_work_dir,
     build_provider_factory,
     config_dir,
     config_path,
+    read_local_secret,
 )
 from kiro_crew.constants import DATA_WARNING
 from kiro_crew.context import ContextBuilder
@@ -34,7 +33,6 @@ from kiro_crew.dashboard import tailnet_serve
 from kiro_crew.dashboard.handlers.core import DASHBOARD_HTML_NOT_FOUND_MARKER
 from kiro_crew.dashboard.origin import (
     dashboard_origin,
-    parse_dashboard_url,
     resolve_dashboard_host,
 )
 from kiro_crew.dashboard.tailnet import is_governance_pinned_off, tailnet_origin
@@ -46,12 +44,43 @@ from kiro_crew.embeddings import (
 )
 from kiro_crew.env import activate_mise
 from kiro_crew.frontend import build_frontend_sync, ensure_dev_dist_symlink
+from kiro_crew.git_divergence import (
+    UNREADABLE_UNPARSEABLE,
+    DivergenceUnreadable,
+    count_divergence_sync,
+)
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, hooks_config_from_config_dict
 from kiro_crew.instances import run_marker
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
+from kiro_crew.platform.update_capability import (
+    EXTERNALLY_MANAGED_MESSAGES,
+    MANAGED_BY_GIT,
+    derive_capability,
+)
+
+# Client-side port resolution lives in kiro_crew.port_resolution, a light leaf
+# module the MCP stdio server can import without paying for this module's
+# import graph. Re-exported here (not merely used) because this namespace is
+# the historical public surface: external callers and a large body of tests
+# import and patch these names as ``kiro_crew.cli_server.<name>``, and the
+# chain's internal calls deliberately resolve through this namespace whenever
+# it is loaded (see port_resolution._patchable) so those patches keep
+# intercepting.
+from kiro_crew.port_resolution import (  # noqa: F401
+    _KIROCREW_SERVER_SUBCOMMANDS,
+    _args_look_like_kirocrew,
+    _basename_stem,
+    _config_url_port,
+    _gateway_owns_port,
+    _is_kirocrew_process,
+    _marker_port,
+    resolve_client_port,
+    resolve_client_port_ex,
+    resolve_client_port_src,
+)
 from kiro_crew.preflight import run_preflight_checks
 from kiro_crew.sel import sel
 from kiro_crew.service import controller as service_controller
@@ -62,8 +91,15 @@ from kiro_crew.session import SessionManager
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.gateway import run_gateway
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.taskrunner import TaskRunner
 from kiro_crew.vector_memory import VectorMemoryStore
+
+# NOTE: wheel_engine is imported lazily inside _update_wheel(), not here — it
+# pulls the manifest-verify / crypto path, and `kirocrew gateway` imports this
+# module on the boot path before the dashboard socket binds
+# (no-new-work-on-gateway-boot-path).
+
 
 # Loopback address used for the CLI's OWN requests to the gateway. Deliberately
 # the literal IPv4 address, never the name ``localhost``: on a dual-stack host
@@ -79,224 +115,6 @@ from kiro_crew.vector_memory import VectorMemoryStore
 # SPA's per-origin localStorage is keyed on that host, so emitting a different
 # origin would make every dashboard setting appear reset.
 _CLI_LOOPBACK = "127.0.0.1"
-
-
-def _config_url_port() -> int | None:
-    """Port explicitly named by ``dashboard.url``, or ``None``.
-
-    Distinct from :func:`parse_dashboard_url`, which substitutes
-    ``_DEFAULT_PORT`` for a portless URL (``http://my.host``). That substitution
-    is right for the *server* (it must bind something) but wrong for a client:
-    it would report "config says 5476" and short-circuit the run-marker
-    fallback below, even though the user never named a port. So detect the
-    explicit case and let a portless URL fall through.
-    """
-    try:
-        cfg = KiroCrewConfig.load()
-        url = cfg.dashboard.url or ""
-    except Exception:
-        # Config load failures must not break client commands.
-        return None
-    if not isinstance(url, str):
-        # ``dashboard.url`` is user-editable JSON and core installs may lack
-        # jsonschema, so the value can be any type (``"url": 123``). urlparse
-        # raises TypeError on a non-str, which is NOT a ValueError — without
-        # this guard a bad config type would crash every client command.
-        logging.getLogger(__name__).warning(
-            "Ignoring non-string dashboard.url of type %s", type(url).__name__
-        )
-        return None
-    if not url:
-        return None
-    try:
-        _, port = parse_dashboard_url(url)
-        # parse_dashboard_url already normalises the scheme, tolerates malformed
-        # URLs and applies the KIROCREW_PORT override; re-split only to learn
-        # whether the port was written down or defaulted in.
-        explicit = urllib.parse.urlsplit(url if "://" in url else f"http://{url}").port
-    except (TypeError, ValueError):
-        return None
-    return port if explicit is not None else None
-
-
-def _gateway_owns_port(port: int) -> bool:
-    """True only when *this user's* gateway process is listening on *port*.
-
-    Reachability is not enough to trust a discovered port. Client commands hand
-    the local secret to whatever answers (``_token`` and ``_logout`` send
-    ``X-Local-Secret``), and ``clear_marker`` runs only on graceful shutdown —
-    so a crashed gateway leaves a marker naming a port some unrelated process
-    may since have bound. A bare TCP connect would walk the secret straight into
-    that process, which could then mint owner tokens against the real gateway.
-
-    A command-line check is not enough either: argv is attacker-chosen, so a
-    listener launched as ``/tmp/kirocrew gateway`` would pass it. The proof used
-    here is an identity the attacker cannot forge, in three parts:
-
-    1. **Recorded pid** — ``run_marker.read_pid(port)`` reads the sidecar the
-       gateway wrote at ``0600`` inside the ``0700`` ``run/`` dir. Another local
-       user cannot write it, so they cannot nominate a process of theirs.
-    2. **Holds the port** — that pid must be among
-       ``platform_compat.find_listening_pids(port)``. This is what makes a stale
-       recorded pid harmless: it has to actually hold the port we are about to
-       send the secret to.
-    3. **Owned by us, and ours** — the pid's uid must equal the caller's
-       (``process_owner_uid``), and its argv must look like a gateway. The uid
-       check is what closes pid *recycling* into a foreign user's process; argv
-       remains only as defense in depth, never as the sole proof.
-
-    A same-user attacker is out of scope by construction: they can already read
-    ``.local_secret`` (mode ``0600``, their own uid), so nothing here can be an
-    escalation for them. The boundary this closes is a *different* local user.
-
-    **Fails closed** at every step: no sidecar, no recorded pid, a pid that does
-    not hold the port, an unresolvable uid, a missing lookup tool
-    (``find_listening_pids`` folds that into an empty list) or a throwing one —
-    all deny, and discovery is skipped in favour of the documented default.
-    ``--port`` and ``KIROCREW_PORT`` remain available on such hosts.
-
-    **Non-POSIX denies outright.** ``process_owner_uid`` cannot report an owner
-    on Windows, and a home that is writable by another user (a shared or
-    misconfigured ``KIROCREW_HOME``) would let them replace both the marker and
-    the sidecar with a forged listener — the file-permission argument that
-    carries step 1 is exactly what stops holding there. Rather than trust
-    steps 1-2 alone, discovery is skipped: Windows users keep ``--port`` /
-    ``KIROCREW_PORT``, which is precisely where they were before this fallback
-    existed, so nothing regresses. This is the one place the feature is
-    deliberately unavailable rather than approximated.
-    """
-    if not platform_compat.IS_POSIX:
-        return False
-    recorded = run_marker.read_pid(port)
-    if recorded is None:
-        return False
-    try:
-        pids = platform_compat.find_listening_pids(port)
-    except Exception:
-        return False
-    if recorded not in pids:
-        return False
-    owner = platform_compat.process_owner_uid(recorded)
-    if owner is None or owner != os.getuid():
-        return False
-    return _is_kirocrew_process(recorded)
-
-
-def _marker_port() -> int | None:
-    """Port of the sole gateway-owned run-marker, or ``None``.
-
-    Zero-configuration discovery for the common single-gateway box: the gateway
-    already advertises itself by writing ``<data-home>/run/gateway-<port>.bin``
-    (see :mod:`kiro_crew.instances.run_marker`), so a client with no ``--port``,
-    no ``KIROCREW_PORT`` and no port in ``dashboard.url`` can read that instead
-    of assuming 5476 and connecting to a dead port.
-
-    Two guards keep this from being a guess:
-
-    * **Ownership.** Only ports where a verified KiroCrew gateway process is
-      listening count (:func:`_gateway_owns_port`); a stale marker, or one whose
-      port has been taken over by an unrelated process, is discarded.
-    * **Ambiguity.** With several gateways up there is no basis to pick one, so
-      this refuses (returns ``None``, landing on the documented default) and
-      tells the user on stderr which ports it saw and how to name one.
-    """
-    try:
-        candidates = run_marker.marker_ports()
-    except Exception:
-        return None
-    if not candidates:
-        return None
-    owned = [p for p in candidates if _gateway_owns_port(p)]
-    if len(owned) == 1:
-        return owned[0]
-    if len(owned) > 1:
-        print(
-            f"⚠️  Multiple gateways are running (ports {', '.join(str(p) for p in owned)}); "
-            f"not guessing which one you meant — using {_DEFAULT_PORT}. "
-            "Pass --port or set KIROCREW_PORT to target a specific gateway.",
-            file=sys.stderr,
-        )
-    return None
-
-
-def resolve_client_port(cli_port: int | None) -> int:
-    """Return the dashboard port a *client* CLI command (token/status/logout/stop)
-    should talk to.
-
-    Resolution order:
-
-    1. Explicit ``--port`` CLI flag if the user passed one (``cli_port`` is not ``None``).
-    2. ``KIROCREW_PORT`` env var if set to a valid integer. Deliberately ABOVE
-       the bound-port export: an explicitly-set ``KIROCREW_PORT`` is how a
-       caller retargets a child at a DIFFERENT gateway — ``pod exec`` builds a
-       client env with ``KIROCREW_PORT=<pod-port>`` precisely so the command
-       reaches the pod, while the inherited ``KIROCREW_BOUND_PORT`` still
-       names the spawning LIVE gateway. Ranking the bound value higher would
-       walk pod ``token``/``status``/``logout`` (and the local secret they
-       carry) into the live gateway — a cross-plane isolation break.
-    3. ``KIROCREW_BOUND_PORT`` env var if set to a valid integer — the port the
-       parent gateway ACTUALLY bound, exported once its TCP site is listening
-       (``dashboard.server._export_bound_port``). Below the operator override
-       (see above); above config because a bound fact from the live parent
-       beats a guess re-derived from a portless ``dashboard.url``.
-    4. Port explicitly named by ``dashboard.url`` in the config file
-       (``<data-home>/config.json``), when it parses.
-    5. The sole gateway-owned run-marker (``<data-home>/run/gateway-<port>.bin``)
-       — see :func:`_marker_port`. Skipped when no marker's port is held by a
-       verified gateway process, and refused (with a stderr hint) when several
-       are.
-    6. ``_DEFAULT_PORT`` (5476) as the final fallback.
-
-    Steps 1, 2 and 4 match the server-side ``parse_dashboard_url()`` logic so
-    that ``kirocrew token`` / ``status`` / ``logout`` / ``stop`` all hit the
-    same port the gateway is actually bound to when the user has configured a
-    non-default ``dashboard.url`` (for example a dev instance on 6777 or an
-    alternative prod port like 7778). Steps 3 and 5 cover the case where
-    nothing was configured at all but a gateway is up on a non-default port
-    (e.g. started with ``kirocrew gateway --port 6776``): the parent's own
-    export, or the running gateway's marker, is better evidence than the 5476
-    default.
-    """
-    port, _ = resolve_client_port_ex(cli_port)
-    return port
-
-
-def resolve_client_port_ex(cli_port: int | None) -> tuple[int, bool]:
-    """Like :func:`resolve_client_port`, also reporting HOW the port resolved.
-
-    The second element is ``True`` when the port came from positive evidence
-    (an explicit flag, an env var, a configured port, or a verified
-    run-marker) and ``False`` when resolution fell through to
-    ``_DEFAULT_PORT``. Callers that cache a resolution for the process
-    lifetime need the distinction: a fall-through only proves nothing was
-    discoverable *at that instant* — during gateway boot the run-marker may
-    not be written yet — so pinning it would freeze the weakest outcome
-    forever, while every positive source is stable for the process lifetime.
-    """
-    if cli_port is not None:
-        return cli_port, True
-    env_port = os.environ.get("KIROCREW_PORT")
-    if env_port:
-        try:
-            return int(env_port), True
-        except ValueError:
-            # Fall through to bound/config/marker/default — main() validates
-            # this early, but guard here too in case the helper is reached via
-            # another path.
-            pass
-    bound_port = os.environ.get("KIROCREW_BOUND_PORT")
-    if bound_port:
-        try:
-            return int(bound_port), True
-        except ValueError:
-            pass
-    cfg_port = _config_url_port()
-    if cfg_port:
-        return cfg_port, True
-    discovered = _marker_port()
-    if discovered:
-        return discovered, True
-    return _DEFAULT_PORT, False
 
 
 def _probe_dashboard_health(port: int) -> None:
@@ -332,7 +150,7 @@ def _token(args: argparse.Namespace) -> None:
     runs this over SSH and regex-extracts the JWT from stdout, so mixing error
     prose into stdout both violates the Unix convention and hides the reason
     from any caller that only captures stderr (which is how a failed remote
-    mint used to surface as a useless ``<no stderr>``).
+    mint surfaces as a useless ``<no stderr>``).
     """
     # Seam-supplied pre-launch checks (CPP IdentityProvider seam) — e.g. a
     # companion SSO-session freshness prompt before minting a token. Public
@@ -345,10 +163,8 @@ def _token(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     port = resolve_client_port(args.port)
-    secret_path = config_dir() / ".local_secret"
-    try:
-        secret = secret_path.read_text().strip()
-    except FileNotFoundError:
+    secret = read_local_secret(port)
+    if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway", file=sys.stderr)
         sys.exit(1)
 
@@ -473,10 +289,8 @@ def _emit_session_urls(port: int, token: str) -> None:
 
 def _logout(port: int) -> None:
     """Revoke all dashboard sessions by calling the gateway's /api/logout endpoint."""
-    secret_path = config_dir() / ".local_secret"
-    try:
-        secret = secret_path.read_text().strip()
-    except FileNotFoundError:
+    secret = read_local_secret(port)
+    if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway")
         sys.exit(1)
 
@@ -501,6 +315,67 @@ def _logout(port: int) -> None:
     except (urllib.error.URLError, OSError):
         print("❌ Gateway not running — start it with: kirocrew gateway")
         sys.exit(1)
+
+
+_SHUTDOWN_RESPONSE_MAX_BYTES = 4096
+
+
+def _request_gateway_shutdown(port: int) -> bool:
+    """Request graceful shutdown through the gateway's self-authenticating API.
+
+    This is the safe fallback when the platform listener lookup is available but
+    returns no pid. The request targets a fixed IPv4 loopback URL and presents
+    the per-generation local secret; the handler independently requires both
+    loopback origin and a constant-time secret match before setting the same
+    shutdown event as SIGTERM.
+
+    A stale secret cannot authorize another gateway generation, and no process
+    identity is guessed or signaled on this path. Any missing credential,
+    refusal, malformed response, or transport failure returns ``False`` so the
+    caller retains the existing no-target diagnostic.
+    """
+    secret = run_marker.read_secret(port)
+    if not secret:
+        return False
+    request = urllib.request.Request(
+        f"http://{_CLI_LOOPBACK}:{port}/api/shutdown",
+        method="POST",
+        headers={"X-Local-Secret": secret, "Content-Type": "application/json"},
+        data=b"{}",
+    )
+    try:
+        with loopback_urlopen(request, timeout=5) as response:
+            if int(response.status) != 200:
+                return False
+            raw = response.read(_SHUTDOWN_RESPONSE_MAX_BYTES + 1)
+            if len(raw) > _SHUTDOWN_RESPONSE_MAX_BYTES:
+                return False
+            payload = json.loads(raw)
+    except (
+        http.client.HTTPException,
+        OSError,
+        RecursionError,
+        UnicodeError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        return False
+    return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("shutting_down"))
+
+
+def _report_authenticated_shutdown(port: int) -> bool:
+    """Request, audit, and report an authenticated graceful shutdown."""
+    if not _request_gateway_shutdown(port):
+        return False
+    sel().log_api_access(
+        caller="cli",
+        operation="gateway_stop",
+        outcome="allowed",
+        source="cli",
+        resources=f"port={port} via=api reason=listener_lookup_empty",
+    )
+    print(f"✅ Requested graceful shutdown from gateway on port {port}.")
+    return True
 
 
 def _stop(cli_port: int | None = None) -> None:
@@ -528,8 +403,8 @@ def _stop(cli_port: int | None = None) -> None:
         return
 
     # Cross-platform port -> listening PID lookup (lsof on POSIX, netstat -ano
-    # on Windows — there is no lsof there, which previously made `kirocrew stop`
-    # a no-op on Windows).
+    # on Windows — there is no lsof there, so an lsof-only lookup makes
+    # `kirocrew stop` a no-op on Windows).
     pids = platform_compat.find_listening_pids(port)
 
     if not pids:
@@ -566,6 +441,8 @@ def _stop(cli_port: int | None = None) -> None:
                     f"port {port}. Install {_tool} and retry."
                 )
             sys.exit(1)
+        if _report_authenticated_shutdown(port):
+            return
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
@@ -661,146 +538,6 @@ def _stop(cli_port: int | None = None) -> None:
         )
         print(f"No Kiro Crew gateway currently running on port {port} (process already exited).")
         sys.exit(1)
-
-
-# Subcommands that launch a long-running KiroCrew *server* process which
-# ``kirocrew stop`` may need to terminate. These mirror the entry-point
-# subcommands dispatched in ``cli.py`` (``gateway`` / ``dashboard``; ``start``
-# is the historical alias). The task runner (``run``) is intentionally excluded:
-# it is not bound to the dashboard port, so we must never SIGTERM it from
-# ``kirocrew stop``.
-_KIROCREW_SERVER_SUBCOMMANDS = frozenset({"gateway", "dashboard", "start"})
-
-
-def _basename_stem(tok: str) -> str:
-    """Basename of *tok* without a Windows ``.exe`` suffix.
-
-    Lets the venv launchers ``python.exe`` / ``kirocrew.exe`` match the same
-    checks as their POSIX ``python`` / ``kirocrew`` counterparts. ``shlex.split``
-    with ``posix=False`` leaves quotes on some tokens, so strip them too.
-
-    Split on BOTH separators explicitly rather than via ``os.path.basename``:
-    that is host-dependent (``posixpath`` on Linux does NOT split backslashes),
-    so a Windows cmdline classified on the Linux CI fleet would keep its full
-    ``D:\\...\\kirocrew.exe`` path and never match. This is host-independent — a
-    basename is whatever follows the last ``/`` or ``\\``.
-
-    Module scope rather than nested in :func:`_args_look_like_kirocrew` so
-    :func:`_own_console_script` shares the one definition.
-    """
-    cleaned = tok.strip('"')
-    base = cleaned.replace("\\", "/").rsplit("/", 1)[-1]
-    if base.lower().endswith(".exe"):
-        base = base[:-4]
-    return base
-
-
-def _args_look_like_kirocrew(args: str) -> bool:
-    """Return ``True`` if a process command-line *args* string is a KiroCrew server.
-
-    This gates ``os.kill(pid, SIGTERM)`` in :func:`_stop`, so it must be
-    **precise** (never match an unrelated process that merely mentions
-    "kirocrew") while still recognising *every* way the gateway can be spawned.
-
-    Instead of enumerating brittle substring variants (``kiro_crew.gateway`` vs
-    ``kiro_crew gateway`` vs ``kirocrew gateway`` …), we parse the command line
-    *structurally* and key on the real module/binary name plus a known server
-    subcommand (:data:`_KIROCREW_SERVER_SUBCOMMANDS`). This is deterministic and
-    robust to interpreter path, Python version suffix, and whitespace. Two spawn
-    shapes are recognised:
-
-    * **Module invocation** — ``<python> -m kiro_crew <subcmd>`` (the form used by
-      a service install and the launchd/systemd service), plus the legacy dotted
-      form ``<python> -m kiro_crew.<subcmd>``. A Python interpreter must precede
-      ``-m`` so we don't misread some other tool's ``-m`` flag (e.g. ``grep -m``).
-    * **Console script** — ``/path/to/kirocrew <subcmd>`` (used when the
-      ``kirocrew`` wrapper resolves on ``PATH``).
-
-    Examples::
-
-        >>> _args_look_like_kirocrew("/x/python3.10 -m kiro_crew gateway")
-        True
-        >>> _args_look_like_kirocrew("python3 -m kiro_crew.dashboard")
-        True
-        >>> _args_look_like_kirocrew("/usr/local/bin/kirocrew start")
-        True
-        >>> _args_look_like_kirocrew("python -m kiro_crew run /tmp/spec.md")  # task runner
-        False
-        >>> _args_look_like_kirocrew("vim /tmp/kirocrew-notes.txt")
-        False
-    """
-    # ``ps -o args=`` (POSIX) / Win32_Process.CommandLine (Windows WMI) return a
-    # shell-style string; tokenize it the way the host shell would. On Windows
-    # use posix=False so backslash path separators survive (default posix=True
-    # eats them: ``C:\Py\python.exe`` -> ``C:Pypython.exe``, breaking the
-    # interpreter/basename checks below). Fall back to a naive split on a
-    # malformed string (e.g. an odd quote) so this best-effort check never raises.
-    try:
-        tokens = shlex.split(args, posix=not platform_compat.IS_WINDOWS)
-    except ValueError:
-        tokens = args.split()
-
-    for index, token in enumerate(tokens):
-        # --- Module form: "<python> -m kiro_crew <subcmd>" / "-m kiro_crew.<subcmd>"
-        if token == "-m" and index + 1 < len(tokens):
-            # Only treat "-m" as Python's module flag when a Python interpreter
-            # precedes it; otherwise an unrelated tool's "-m" option could be
-            # misread (e.g. "grep -m kiro_crew gateway file"). The match is
-            # case-insensitive: the macOS framework build's interpreter basename
-            # is "Python" (capital P), which a case-sensitive startswith would
-            # miss, leaving stop/restart unable to find the gateway.
-            interpreter_seen = any(
-                _basename_stem(t).lower().startswith("python") for t in tokens[:index]
-            )
-            if interpreter_seen:
-                # "kiro_crew.gateway" -> ("kiro_crew", "gateway"); a bare
-                # "kiro_crew" -> ("kiro_crew", "").
-                package, _, dotted_subcmd = tokens[index + 1].partition(".")
-                if package == "kiro_crew":
-                    # Dotted submodule form: ``-m kiro_crew.gateway``.
-                    if dotted_subcmd in _KIROCREW_SERVER_SUBCOMMANDS:
-                        return True
-                    # Subcommand-as-argument form: ``-m kiro_crew gateway``. The
-                    # subcommand is argparse's first positional after the module,
-                    # i.e. always at index+2. Check only that slot so a later
-                    # positional/flag value cannot match — e.g.
-                    # ``-m kiro_crew run gateway`` ("gateway" is a file argument
-                    # to the task runner) must NOT be treated as a server.
-                    if (
-                        index + 2 < len(tokens)
-                        and tokens[index + 2] in _KIROCREW_SERVER_SUBCOMMANDS
-                    ):
-                        return True
-
-        # --- Console-script form: ".../kirocrew <subcmd>" (or kirocrew.exe on Win)
-        if (
-            _basename_stem(token) == "kirocrew"
-            and index + 1 < len(tokens)
-            and tokens[index + 1] in _KIROCREW_SERVER_SUBCOMMANDS
-        ):
-            return True
-
-    return False
-
-
-def _is_kirocrew_process(pid: int) -> bool:
-    """Return ``True`` if *pid* looks like a KiroCrew gateway process.
-
-    Resolves the process command line cross-platform via
-    :func:`platform_compat.process_command_line` (Linux ``/proc``, macOS ``ps``,
-    Windows ``Win32_Process`` WMI — the venv ``kirocrew.exe`` re-execs
-    ``python.exe`` so the image name alone is ambiguous there) and defers
-    classification to :func:`_args_look_like_kirocrew`.
-
-    ``process_command_line`` returns ``""`` on any failure (dead PID, missing
-    ``ps``, WMI error), which classifies as "not a match" — _stop()'s separate
-    ``listening_pid_tool_available()`` check already surfaces the tool-absent
-    case, so this never needs to raise.
-    """
-    out = platform_compat.process_command_line(pid)
-    if not out:
-        return False
-    return _args_look_like_kirocrew(out)
 
 
 def _pid_exited(pid: int) -> bool:
@@ -1112,11 +849,13 @@ def _wait_gateway_ready(
 
 def _print_token_url(port: int) -> None:
     """Wait for the gateway to come up, then print a fresh token URL."""
-    secret_path = config_dir() / ".local_secret"
     deadline = time.monotonic() + _RESTART_READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            secret = secret_path.read_text().strip()
+            secret = read_local_secret(port)
+            if not secret:
+                time.sleep(_RESTART_READY_POLL_INTERVAL)
+                continue
             url = f"http://{_CLI_LOOPBACK}:{port}/api/token/local?ttl={_RESTART_TOKEN_TTL}"
             req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
             with loopback_urlopen(req, timeout=3) as resp:
@@ -1149,7 +888,12 @@ def _restart(cli_port: int | None = None) -> None:
 
     1. If a systemd/launchd service is active AND the caller did not
        explicitly request a specific port, ask the platform to restart
-       it (``systemctl restart`` / ``launchctl unload + load``).
+       it (``systemctl restart`` / ``launchctl kickstart -k``). When the
+       service manager REFUSES that restart while the unit is still active
+       (system-scope unit, unprivileged caller / polkit denial), fail loudly
+       naming the privileged command the operator must run — never fall
+       through to the listener path, which cannot see a service gateway
+       bound to a unix socket and would misreport the outcome.
     2. Otherwise, SIGTERM the foreground gateway via the existing
        lsof+SIGTERM path used by ``kirocrew stop``, then spawn a
        detached replacement and **verify it is serving** before reporting
@@ -1163,17 +907,47 @@ def _restart(cli_port: int | None = None) -> None:
     short-circuiting through it would target the wrong gateway.
     """
     port = resolve_client_port(cli_port)
-    if cli_port is None and service_controller.restart_service():
-        sel().log_api_access(
-            caller="cli",
-            operation="gateway_restart",
-            outcome="allowed",
-            source="cli",
-            resources=f"port={port} via=service",
-        )
-        print("✅ Restarted kirocrew service.")
-        _print_token_url(port)
-        return
+    if cli_port is None:
+        if service_controller.restart_service():
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="allowed",
+                source="cli",
+                resources=f"port={port} via=service",
+            )
+            print("✅ Restarted kirocrew service.")
+            _print_token_url(port)
+            return
+        if service_controller.is_service_active():
+            # The service manager refused the restart while the unit is active
+            # RIGHT NOW — the system-scope unit needs root/polkit privileges
+            # this process does not have ("Interactive authentication
+            # required"). Falling through to the listener path would be worse
+            # than failing: on a unix-socket deployment nothing listens on TCP,
+            # so the fallback finds nothing to stop, spawns a competitor the
+            # KIROCREW_HOME lock refuses, and the original gateway keeps
+            # running while the command's outcome reads like a restart. Name
+            # the privileged command the operator must run instead. The
+            # active-check runs AFTER the refused restart so a service that
+            # merely stopped in between still falls through below.
+            hint = service_controller.manual_restart_hint()
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} via=service reason=service_restart_denied",
+            )
+            print(
+                "❌ A kirocrew service is installed and running, but the service "
+                "manager refused to restart it.\n"
+                "   This process lacks the privileges the service's scope "
+                "requires — the gateway was NOT restarted.\n"
+                "   Run the restart yourself:\n"
+                f"       {hint}"
+            )
+            sys.exit(1)
 
     # No service active — bounce the foreground gateway and detach a fresh one.
     # Reuse _stop() for the SIGTERM path so behavior stays in sync if _stop
@@ -1202,6 +976,7 @@ def _restart(cli_port: int | None = None) -> None:
     prior_marker_pid = run_marker.read_pid(port)
     listeners = platform_compat.find_listening_pids(port)
     incumbents = [p for p in listeners if _is_kirocrew_process(p)]
+    wait_for_incumbents = False
     if listeners or not platform_compat.listening_pid_tool_available():
         # TOCTOU: the gateway can exit between the check above and _stop()'s own
         # lookup. _stop() raises SystemExit(1) when it finds nothing — for restart
@@ -1212,7 +987,24 @@ def _restart(cli_port: int | None = None) -> None:
             _stop(cli_port)
         except SystemExit:
             pass
+        wait_for_incumbents = True
+    elif _report_authenticated_shutdown(port):
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_restart",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=shutdown_ack_listener_lookup_blind",
+        )
+        print(
+            f"❌ Gateway accepted graceful shutdown on port {port}, but listener PID "
+            "lookup is unavailable. Not starting a replacement because safe lock "
+            "release cannot be proven.\n   Wait for shutdown to finish, then run: "
+            "kirocrew restart"
+        )
+        sys.exit(1)
 
+    if wait_for_incumbents:
         alive = _wait_for_pids_exit(incumbents, _RESTART_STOP_TIMEOUT)
         if alive:
             # Refuse rather than spawn a replacement that the lock would reject.
@@ -1240,7 +1032,7 @@ def _restart(cli_port: int | None = None) -> None:
     pid = proc.pid
     # A pid is not a running gateway. The replacement can be refused by the
     # ownership guard, crash on a bad config, or hang before it binds — all of
-    # which used to print the success line below and exit 0 with nothing serving.
+    # which would print the success line below and exit 0 with nothing serving.
     # Report success only once the NEW gateway answers, and audit what happened.
     verdict, exit_status = _wait_gateway_ready(proc, port, prior_marker_pid, _RESTART_READY_TIMEOUT)
     if verdict != _READY_OK:
@@ -1286,42 +1078,67 @@ def _restart(cli_port: int | None = None) -> None:
     _print_token_url(port)
 
 
-def _update() -> None:
+def _update(force: bool = False) -> None:
     """Update Kiro Crew — dispatches based on install layout.
 
     Three install layouts, three update paths:
 
     * **git checkout** — fetch + reset --hard + rebuild (existing path).
+      The reset only runs for a FAST-FORWARDABLE checkout (behind its
+      upstream, not ahead). A checkout that has DIVERGED (committed local
+      work both ahead of and behind ``origin/<branch>``) is refused: the
+      hard reset would discard the local commits, and the tracked-change
+      prompt only covers uncommitted edits. ``force=True`` (the ``--force``
+      CLI flag) is the explicit opt-in that lets the reset discard them.
+      An ahead-only checkout has nothing to pull and is reported as up to
+      date without resetting.
     * **wheel / cli.sh** — fetch the release feed, compare versions, and
       re-run the installer if newer. This is the path that was missing and
       caused the ``KIROCREW_PROJECT_DIR not set`` error for cli.sh installs.
     * **externally managed** (desktop app, Docker) — print guidance on how
       to update via the correct surface instead of failing with an opaque error.
     """
-    from kiro_crew.platform.update_layout import (
-        EXTERNALLY_MANAGED,
-        InstallLayout,
-    )
+    from kiro_crew.platform.update_layout import InstallLayout
 
     print("👻 Updating Kiro Crew…\n")
 
+    # A policy-defined provider OWNS the update on this host. Checked before any
+    # layout dispatch so a manual `kirocrew update` cannot run the built-in
+    # git/CDN mechanism the administrator excluded.
+    from kiro_crew.platform.update_provider import apply_policy_update
+
+    applied = asyncio.run(apply_policy_update())
+    if applied is not None:
+        if applied:
+            print("\n✅ Update applied by the policy-defined update command.")
+            print("\n  Restart the gateway to use the new version:")
+            print("    kirocrew restart")
+        else:
+            print("\n❌ The policy-defined update command failed — see the log above.")
+            print("  Not falling back to the built-in updater: this host's policy")
+            print("  selects its own update mechanism.")
+            sys.exit(1)
+        return
+
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    proj_path = Path(proj) if proj else None
-    is_git = proj_path is not None and (proj_path / ".git").exists()
+    # Dispatch on the shared derivation, not on the git probe alone. The probe
+    # answers "is this a working tree", which is NOT the same question as "who
+    # owns updating this install": a container or a desktop bundle pointed at a
+    # checkout would otherwise take the git path here and reset a tree its own
+    # updater owns. `derive_capability` puts the externally managed stamp first
+    # for exactly that reason, and this is the surface that has to honour it.
+    capability = derive_capability(install_root=proj)
 
-    if not is_git:
-        # Not a git checkout — check if externally managed or wheel install.
-        from kiro_crew.beacon import distribution
-
-        dist = distribution()
-        if dist in EXTERNALLY_MANAGED:
-            print(f"  ℹ️  This install ({dist}) is managed externally.")
-            print(f"  {EXTERNALLY_MANAGED[dist]}")
+    if capability.managed_by != MANAGED_BY_GIT:
+        if capability.defers:
+            reason = capability.unavailable_reason or ""
+            print(f"  ℹ️  This install ({distribution()}) is managed externally.")
+            print(f"  {EXTERNALLY_MANAGED_MESSAGES.get(reason, '')}")
             return
 
         # Wheel / cli.sh install path.
         layout = InstallLayout(
-            kind=dist or "wheel",
+            kind=distribution() or "wheel",
             proj=proj,
             is_git=False,
             is_externally_managed=False,
@@ -1330,24 +1147,24 @@ def _update() -> None:
         _update_wheel(layout)
         return
 
-    # A git worktree or submodule stores ``.git`` as a FILE (a ``gitdir:``
-    # pointer), not a directory, so accept both — otherwise `kirocrew update`
-    # run from a worktree wrongly refuses with "No git repo".
-    assert proj_path is not None  # narrowing: is_git=True implies proj_path was set
-    if not (proj_path / ".git").exists():
-        print(f"❌ No git repo at {proj}")
-        sys.exit(1)
-
     print(f"  📂 {proj}")
 
     # Detect current branch
-    branch_result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git rev-parse timed out after %ss during update", exc.timeout
+        )
+        print("❌ Could not determine current branch (git rev-parse timed out)")
+        sys.exit(1)
     if branch_result.returncode != 0:
         print("❌ Could not determine current branch")
         sys.exit(1)
@@ -1367,36 +1184,134 @@ def _update() -> None:
 
     # Fetch + reset --hard: no merge conflicts, untracked files preserved
     print("  ⬇️  git fetch…")
-    result = subprocess.run(
-        ["git", "fetch", "origin", branch],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git fetch timed out after %ss during update", exc.timeout
+        )
+        print(f"  ❌ git fetch timed out after {exc.timeout}s")
+        sys.exit(1)
     if result.returncode != 0:
         print(f"  ❌ git fetch failed:\n{result.stderr.strip()}")
         sys.exit(1)
 
     # Check if there are new commits
-    diff_result = subprocess.run(
-        ["git", "diff", "HEAD", f"origin/{branch}", "--quiet"],
-        cwd=proj,
-        capture_output=True,
-        timeout=10,
-    )
-    if diff_result.returncode == 0:
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD", f"origin/{branch}", "--quiet"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+        )
+        up_to_date = diff_result.returncode == 0
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git diff timed out after %ss during update", exc.timeout
+        )
+        # Same branch a non-zero exit takes: assume new commits exist and let
+        # the divergence guard below re-classify before anything destructive.
+        print("  ⚠️  git diff timed out — continuing to the divergence check")
+        up_to_date = False
+    if up_to_date:
         print("\n✅ Already up to date!")
         return
 
+    # Divergence guard. The hard reset below discards local COMMITTED work,
+    # and the tracked-change prompt after this only sees uncommitted edits —
+    # a checkout carrying its own commits passes that prompt silently.
+    # Mirror the dashboard check's verdict: only a fast-forwardable checkout
+    # (behind and not ahead) proceeds to the reset; ahead-only has nothing to
+    # pull and returns without resetting; true divergence refuses unless the
+    # operator explicitly opted in with --force. Counted against
+    # origin/<branch> — the exact ref the reset targets, freshly updated by
+    # the fetch above.
+    #
+    # This runs TWICE — once here, once immediately before the reset — because
+    # the prompt below makes the gap to the destructive step unbounded. Both
+    # calls go through one classifier so the two sites differ only in what they
+    # PRINT, never in which states they recognise: a state handled in one and
+    # forgotten in the other is how a guard grows a hole.
+    def _divergence_verdict() -> tuple[str, int, int]:
+        """Classify HEAD against ``origin/<branch>`` for the reset decision.
+
+        Returns ``(verdict, ahead, behind)`` where verdict is one of:
+
+        * ``"unreadable"`` — the comparison could not be read; the caller must
+          refuse, since a guard that cannot count must not wave a destructive
+          reset through.
+        * ``"up_to_date"`` — nothing to pull (``behind == 0``), so
+          origin/<branch> is an ancestor of HEAD and the reset could only
+          REMOVE commits. Never resettable, ``--force`` included: that flag
+          exists to let a real update discard diverged work, not to delete
+          commits when there is nothing to update to.
+        * ``"diverged"`` — ahead AND behind; resettable only under ``--force``.
+        * ``"fast_forward"`` — behind and not ahead; nothing of its own to lose.
+        """
+        counts = count_divergence_sync(proj, f"origin/{branch}")
+        if isinstance(counts, DivergenceUnreadable):
+            if counts.reason == UNREADABLE_UNPARSEABLE:
+                print(f"  ❌ Could not parse the commit counts against origin/{branch}:")
+                print(f"     {counts.detail!r}")
+            else:
+                print(f"  ❌ Could not compare HEAD against origin/{branch}:")
+                print(f"     {counts.detail}")
+            return "unreadable", -1, -1
+        ahead, behind = counts.ahead, counts.behind
+        if behind == 0:
+            return "up_to_date", ahead, behind
+        if ahead > 0:
+            return "diverged", ahead, behind
+        return "fast_forward", ahead, behind
+
+    def _report_up_to_date(ahead: int) -> None:
+        suffix = f" ({ahead} local commit(s) ahead of origin/{branch})" if ahead else ""
+        print(f"\n✅ Already up to date!{suffix}")
+
+    verdict, ahead, behind = _divergence_verdict()
+    if verdict == "unreadable":
+        sys.exit(1)
+    if verdict == "up_to_date":
+        _report_up_to_date(ahead)
+        return
+    if verdict == "diverged":
+        if not force:
+            print(f"  ⚠️  This checkout has diverged from origin/{branch}:")
+            print(f"      {ahead} local commit(s) not on origin/{branch}, {behind} behind.")
+            print("  A hard reset would discard the local commits. Reconcile instead:")
+            print(f"      git rebase origin/{branch}    (or: git merge origin/{branch})")
+            print("  Or discard the local commits explicitly:")
+            print("      kirocrew update --force")
+            sys.exit(1)
+        print(f"  ⚠️  --force: discarding {ahead} local commit(s) not on origin/{branch}.")
+
     # Warn about local tracked-file changes before discarding
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git status timed out after %ss during update", exc.timeout
+        )
+        # Fail closed: this check exists to warn before the hard reset
+        # discards local tracked changes, so an unreadable answer must
+        # refuse the reset — same stance as the unreadable-divergence guard.
+        print("  ❌ Could not check for local changes (git status timed out)")
+        sys.exit(1)
     tracked_changes = [
         line for line in status.stdout.strip().splitlines() if not line.startswith("??")
     ]
@@ -1409,14 +1324,45 @@ def _update() -> None:
             print("  Aborted.")
             sys.exit(0)
 
+    # Re-classify immediately before the reset. The verdict above is a
+    # snapshot, and the prompt makes the gap to the reset unbounded:
+    # committing the listed changes in another terminal is the natural way to
+    # rescue them, and rebasing them onto the upstream afterwards is the
+    # natural next step — the first leaves the snapshot stale, the second
+    # turns the checkout ahead-only, and both end in the reset deleting the
+    # commits the operator just made to save that work. Only HEAD can move
+    # here (origin/<branch> is a local ref that only a fetch rewrites), so
+    # this needs no second network round trip.
+    verdict, ahead, behind = _divergence_verdict()
+    if verdict == "unreadable":
+        sys.exit(1)
+    if verdict == "up_to_date":
+        # Not an error: the operator's own commits made the update unnecessary.
+        # Unresettable even under --force, exactly as in the first pass.
+        _report_up_to_date(ahead)
+        return
+    if verdict == "diverged" and not force:
+        print(f"  ⚠️  Refusing to reset: {ahead} local commit(s) appeared on HEAD while")
+        print("      this update was waiting, which a hard reset would discard.")
+        print(f"      Reconcile with: git rebase origin/{branch}")
+        sys.exit(1)
+
     print(f"  🔄 git reset --hard origin/{branch}…")
-    result = subprocess.run(
-        ["git", "reset", "--hard", f"origin/{branch}"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git reset timed out after %ss during update", exc.timeout
+        )
+        print(f"  ❌ git reset timed out after {exc.timeout}s")
+        sys.exit(1)
     if result.returncode != 0:
         print(f"  ❌ git reset failed:\n{result.stderr.strip()}")
         sys.exit(1)
@@ -1424,7 +1370,18 @@ def _update() -> None:
     # Update the optional kiro-cli backend if present.
     if shutil.which("kiro-cli"):
         print("  🔄 kiro-cli update")
-        subprocess.run(["kiro-cli", "update"], capture_output=True, timeout=120)
+        try:
+            subprocess.run(
+                ["kiro-cli", "update"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logging.getLogger(__name__).warning(
+                "kiro-cli update timed out after %ss; skipping (best-effort)", exc.timeout
+            )
+            print("  ⚠️  kiro-cli update timed out — run manually: kiro-cli update")
 
     # Ensure a supported Node.js for frontend builds
     from kiro_crew.cli import _ensure_node  # circular import: cli -> cli_server -> cli
@@ -1433,32 +1390,67 @@ def _update() -> None:
     _ensure_node(proj)
 
     # Build the dashboard frontend assets (npm), then reinstall the package.
-    build_frontend_sync(proj_path)
+    build_frontend_sync(Path(proj))
 
-    print("  🔨 pip install -e .")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ❌ Install failed:\n{result.stderr.strip()}")
+    # Install the pulled revision into this CLI's own venv. `kirocrew update` is
+    # itself run FROM the console script pip would have to rewrite, so on Windows
+    # the reinstall cannot succeed and dep_sync substitutes a dependency-only sync
+    # (it reports, rather than silently tolerating, a revision that repointed the
+    # script — that is the one case still needing a terminal without kirocrew
+    # running).
+    print("  🔨 Installing the pulled revision…")
+
+    def _emit(message: str, error: bool) -> None:
+        print(f"  {'❌' if error else '•'} {message}")
+
+    rc = dep_sync.sync_or_reinstall(Path(proj), Path(sys.executable), _emit)
+    if rc != 0:
         sys.exit(1)
 
     print("\n✅ Kiro Crew updated!")
     print(f"\n{DATA_WARNING}\n")
 
-    # Re-install agent config so new denied commands take effect.
-    # Run as subprocess since the current process has old code loaded.
+    _refresh_agent_config(proj)
+
+
+def _refresh_agent_config(proj: str) -> None:
+    """Re-install agent config so new denied commands take effect.
+
+    Runs as a subprocess since the current process has old code loaded. The
+    refresh is best-effort: the update itself has already succeeded, so any
+    failure here downgrades to a warning telling the operator to re-run setup.
+
+    Two hardening properties this call site must keep:
+
+    * ``stdin`` is ``DEVNULL``. With ``capture_output=True`` the child's
+      output is piped into a buffer nobody displays until the call returns,
+      so any prompt it asks is invisible — and with an inherited terminal it
+      would block silently until the timeout. EOF on stdin makes a prompt
+      return immediately instead of hanging (``_input_or_skip`` takes its
+      ``_SetupAborted`` path, which setup treats as a clean skip; a bare
+      ``input()`` gets ``EOFError``), structurally, without relying on every
+      prompt in setup to guard itself with an isatty check.
+    * ``TimeoutExpired`` is caught. It is raised, not returned, so without a
+      handler a slow refresh would traceback out of ``kirocrew update`` right
+      after the success banner printed.
+    """
     print("  🔒 Refreshing agent config…")
-    r = subprocess.run(
-        [sys.executable, "-m", "kiro_crew", "setup", "--agent-only"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "kiro_crew", "setup", "--agent-only"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "agent-only config refresh timed out after %ss; skipping (best-effort)", exc.timeout
+        )
+        print("  ⚠️  Agent config refresh timed out — run: kirocrew setup --agent-only")
+        return
     if r.returncode == 0:
         print("  ✅ Agent config refreshed (deniedCommands + hooks updated)")
     else:
@@ -1472,13 +1464,20 @@ def _update_wheel(layout) -> None:
     the standard state for ``curl | sh`` installs where the venv at
     ``~/.kiro/crew-venv`` has no source tree.
     """
-    import json
-    import re
-    import urllib.request
 
     from kiro_crew import __version__ as local_version
     from kiro_crew.platform.update_governance import update_blocked_reason
-    from kiro_crew.platform.update_layout import cdn_bases, release_channel, wheel_update_command
+    from kiro_crew.platform.update_layout import (
+        cdn_bases,
+        cdn_bases_are_safe,
+        release_channel,
+        wheel_update_command,
+    )
+    from kiro_crew.platform.wheel_engine import (
+        WheelUpdateError,
+        apply_wheel_update,
+        running_from_managed_venv,
+    )
 
     channel = release_channel()
     feed_base, artifact_base = cdn_bases()
@@ -1496,8 +1495,7 @@ def _update_wheel(layout) -> None:
     # Shell safety: cdn_bases() reads KIROCREW_CDN_BASE which is operator-set.
     # Reject metacharacters that could enable command injection when the URL
     # flows through wheel_update_command() into ``sh -c``.
-    _SAFE_URL_RE = re.compile(r"^https://[A-Za-z0-9._/:%@~+\-]+$")
-    if not _SAFE_URL_RE.match(feed_base) or not _SAFE_URL_RE.match(artifact_base):
+    if not cdn_bases_are_safe():
         print("  ❌ CDN base URL contains disallowed characters")
         sys.exit(1)
 
@@ -1560,6 +1558,52 @@ def _update_wheel(layout) -> None:
         print("\n✅ Already on the latest version!")
         return
 
+    # The managed-venv shape takes the shadow path: the new version is built
+    # into a fresh sibling tree while this install keeps working, verified,
+    # then promoted atomically. The running gateway is never overwritten in
+    # place — its restart picks the new tree up through the stable link. Every
+    # other shape (pipx, a bare venv the operator manages) keeps the
+    # installer re-run, whose behavior is owned by cli.sh.
+    if running_from_managed_venv():
+        print("\n  🔄 Building the new version beside the current one…")
+        try:
+            promoted = apply_wheel_update(
+                channel=channel,
+                feed_base=feed_base,
+                artifact_base=artifact_base,
+                expected_version=remote_version,
+                progress=lambda msg: print(f"     {msg}"),
+            )
+        except (WheelUpdateError, OSError) as e:
+            # The engine wraps its own I/O failures in WheelUpdateError, but
+            # staging-filesystem errors raised outside those conversion sites
+            # (a full or unwritable disk at mkdir/tempdir time) surface as raw
+            # OSError — both take the same operator-facing failure path
+            # instead of a traceback.
+            # Failure text can quote the URL it tried, and the fallback
+            # installer command embeds the CDN base — either may carry
+            # credentials (a token-bearing KIROCREW_CDN_BASE), and this
+            # print lands in terminal history/scrollback. Same redaction
+            # pair the dashboard update surface applies before showing
+            # failure text.
+            from kiro_crew.security import (
+                redact_credentials,
+                redact_exfiltration_urls,
+            )
+
+            msg, _ = redact_credentials(str(e))
+            msg, _ = redact_exfiltration_urls(msg)
+            fallback, _ = redact_credentials(wheel_update_command(channel))
+            print(f"\n  ❌ {msg}")
+            print("  The current install was not modified. To update by")
+            print("  re-running the installer instead:")
+            print(f"    {fallback}")
+            sys.exit(1)
+        print(f"\n✅ Kiro Crew {remote_version} installed at {promoted}")
+        print("\n  Restart the gateway to switch to it:")
+        print("    kirocrew restart")
+        return
+
     # Run the installer
     cmd = wheel_update_command(channel)
     print("\n  🔄 Running installer…")
@@ -1598,6 +1642,67 @@ def _update_wheel(layout) -> None:
     print("    kirocrew restart")
 
 
+def _update_approve() -> None:
+    """Approve a pending in-app update armed from the dashboard (RFC OQ7).
+
+    The proof of host identity is READING THE NONCE FILE: it lives in the data
+    home with owner-only permissions, so presenting its nonce back to the
+    gateway demonstrates filesystem access as the gateway's own user — the
+    step a remote dashboard bearer cannot perform. The gateway then runs the
+    shadow apply itself and restarts; progress lands on the dashboard's
+    update overlay.
+    """
+    from kiro_crew.platform.update_stepup import read_pending
+
+    print("👻 Approving the pending in-app update…\n")
+    pending = read_pending()
+    if pending is None:
+        print("❌ No armed update request (it may have expired).")
+        print("   Arm one from the dashboard's About panel first, then re-run this.")
+        sys.exit(1)
+    print(f"  📦 v{pending.version} ({pending.channel} channel), expires in {pending.expires_in}s")
+
+    port = resolve_client_port(None)
+    url = f"http://127.0.0.1:{port}/api/update/approve"
+    payload = json.dumps({"nonce": pending.nonce}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # The local secret authenticates this CLI to a token-auth-enabled gateway.
+    # X-Internal-Secret is the header the middleware's internal-route branch
+    # validates (X-Local-Secret is a different, route-specific mechanism used
+    # by /api/token/local). Reading the secret is itself host-local evidence,
+    # the same class as the nonce file. An absent secret still works on a
+    # default loopback install where no token auth runs.
+    secret = read_local_secret(port)
+    if secret:
+        headers["X-Internal-Secret"] = secret
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    # Prefer the gateway's unix socket: it kernel-verifies the caller
+    # (SO_PEERCRED), so the approval works on a token-auth-enabled install
+    # without this CLI ever holding a dashboard token. TCP loopback is the
+    # fallback for hosts without the socket.
+    try:
+        from kiro_crew.dashboard.urls import dashboard_socket_path
+
+        socket_path: str | None = str(dashboard_socket_path(port))
+    except Exception:
+        socket_path = None
+    try:
+        with loopback_urlopen(req, timeout=15, unix_socket_path=socket_path) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("error", "")
+        except Exception:
+            detail = ""
+        print(f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else ""))
+        sys.exit(1)
+    except (urllib.error.URLError, OSError):
+        print("❌ Gateway is not running — start it, or update directly with: kirocrew update")
+        sys.exit(1)
+    print(f"\n✅ Approved. The gateway is applying v{body.get('version', pending.version)}")
+    print("   and will restart itself; watch progress in the dashboard.")
+
+
 def _status(args: argparse.Namespace) -> None:
     """Query the running gateway for stats, or print offline message."""
     port = resolve_client_port(getattr(args, "port", None))
@@ -1633,7 +1738,7 @@ def _status(args: argparse.Namespace) -> None:
 def _should_reconcile_launchd_launcher() -> bool:
     """Whether this gateway may repair the shared launchd launcher.
 
-    Only a non-frozen production instance may.
+    Only a production instance running outside the desktop bundle may.
 
     ``LIVE_PROGRAM`` is a per-user path under Application Support that
     ``KIROCREW_HOME`` does not scope, so a dev, pod, or worktree gateway
@@ -1643,22 +1748,29 @@ def _should_reconcile_launchd_launcher() -> bool:
     ``is_default_home`` is reused rather than re-derived so the two cannot drift
     on what counts as the real home.
 
-    A frozen build is excluded for a different reason: the launchd agent is a
-    ``service install`` artifact belonging to a source or pip install, while a
+    A bundled interpreter is excluded for a different reason: the launchd agent is
+    a ``service install`` artifact belonging to a source or pip install, while a
     packaged app manages its own backend lifecycle and supplies environment its
     interpreter needs — notably ``PYTHONPYCACHEPREFIX``, which keeps bytecode out
     of the signed bundle. A launcher naming the bundled executable would be run by
     launchd WITHOUT that environment, so the interpreter would write
     ``__pycache__`` inside the app and invalidate its signature. The packaged app
-    has no business owning this artifact at all.
+    has no business owning this artifact at all. The bundle is identified by its
+    interpreter's location (:func:`platform_compat.is_bundled_interpreter`), which
+    is the one runtime reading of the packaging layout.
     """
-    return sys.platform == "darwin" and not getattr(sys, "frozen", False) and is_default_home()
+    return (
+        sys.platform == "darwin"
+        and not platform_compat.is_bundled_interpreter()
+        and is_default_home()
+    )
 
 
 async def _gateway(
     *,
     no_dashboard: bool = False,
     no_crons: bool = False,
+    no_tunnel: bool = False,
     no_open: bool = False,
     port_override: str | None = None,
     json_ready: bool = False,
@@ -1718,6 +1830,7 @@ async def _gateway(
         cfg,
         no_dashboard=no_dashboard,
         no_crons=no_crons,
+        no_tunnel=no_tunnel,
         no_open=no_open,
         port_override=port_override,
         json_ready=json_ready,
@@ -1753,8 +1866,12 @@ async def _run_task(args: argparse.Namespace) -> None:
         extra_prefixes=cfg.memory.semantic_keys or None,
         episodic_limit=cfg.memory.episodic_max_results,
         embedding_dim=cfg.memory.embedding_dim,
+        decay_rates=cfg.memory.decay_rates or None,
     )
-    vector_memory.init()
+    # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
+    # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
+    # and would stall the loop.
+    await asyncio.to_thread(vector_memory.init)
     # Embeddings are always-on: wire the factory; bind embed_fn when the model
     # is already present. Deliberately NO download kick here — `kirocrew run`
     # is a one-shot CLI and must not start a 610MB download it will abandon at
@@ -1787,7 +1904,18 @@ async def _run_task(args: argparse.Namespace) -> None:
     conv_log = ConversationLog()
     conv_log.init()
     lessons = LessonStore()
-    skills = SkillsLoader()
+    # Constructed on a running loop, so construction-time sync skips itself;
+    # standalone `kirocrew run` has no gateway to own the sync, so run the
+    # explicit seam in a worker thread (mirrors gateway startup). A failed
+    # sync must not gate the task: continue with the skills already on disk.
+    skills = SkillsLoader(install_builtins=False)
+    try:
+        await asyncio.to_thread(skills.sync_builtins)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "builtin-skill sync failed; continuing with the skills already "
+            "on disk", exc_info=True,
+        )
     consolidator = HistoryConsolidator(
         log=conv_log,
         memory=memory,
@@ -1976,8 +2104,8 @@ def _logs_cmd(args: argparse.Namespace) -> None:
         probe = subprocess.run(
             ["journalctl", "-u", unit, "-n", "1", "--no-pager"],
             capture_output=True,
-            text=True,
             check=False,
+            **UTF8_TEXT,
         )
         if probe.returncode == 0 and probe.stdout.strip():
             if follow:
@@ -2003,7 +2131,21 @@ def _logs_cmd(args: argparse.Namespace) -> None:
             sudo_cmd.append("-f")
         os.execvp("sudo", sudo_cmd)
 
-    if plat == Platform.LAUNCHD and svc_macos.STDOUT_LOG.exists():
+    # Both guards mirror checks the systemd arm above already makes on its own
+    # branch. current_platform() returns LAUNCHD for any macOS host whether or
+    # not the agent is installed, so without PLIST_PATH this arm captures `logs`
+    # even when the gateway runs in the foreground; and a 0-byte STDOUT_LOG from
+    # an install that never started the agent still satisfies exists().
+    #
+    # Either miss is silent and total: this arm os.execvp()s, so there is no
+    # fall-through to the config_dir() log below and `kirocrew logs` exits 0
+    # having printed nothing.
+    if (
+        plat == Platform.LAUNCHD
+        and svc_macos.PLIST_PATH.exists()
+        and svc_macos.STDOUT_LOG.exists()
+        and svc_macos.STDOUT_LOG.stat().st_size > 0
+    ):
         cmd = ["tail", "-n", str(lines)]
         if follow:
             cmd.append("-f")

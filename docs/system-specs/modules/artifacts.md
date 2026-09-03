@@ -36,7 +36,7 @@ The dashboard provides a `/artifacts` library page for browse/search and a
 
 | Field | Type | Notes |
 |---|---|---|
-| `slug` | string | URL-safe handle, derived from `name` if not given |
+| `slug` | string | URL-safe handle. Derived from `name` when not given, resolving a collision by suffixing (`-2`, `-3`, …); an explicitly-passed slug is refused — never renamed — when it is already taken or malformed |
 | `name` | string | Human-readable display name |
 | `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
 | `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import` |
@@ -124,7 +124,7 @@ middleware live in one place.
 ```
 kirocrew artifact list [--tag T] [--kind K] [--q SUBSTR]
 kirocrew artifact show <slug> [--version N] [--meta]
-kirocrew artifact save --name N [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
+kirocrew artifact save --name N [--slug S] [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
 kirocrew artifact update <slug> [--content C | --content-file F] [--name N] [--description D] [--tags A,B]
 kirocrew artifact versions <slug>
 kirocrew artifact delete <slug>
@@ -215,7 +215,9 @@ each row carries an `available` flag so the FE can hint install-on-first-use for
 a not-yet-installed but installable destination. Governance: `publish_sync` has NO internal gate and `push_version` is
 ungated, so the two egress-arming routes go through
 `_publish_governance_denied` (fail-closed `capabilities.publish ∩
-destinations:<provider>`) BEFORE dispatch — `overwrite-remote` on the resolved
+destinations:<provider>`, a module-local alias for the shared
+`publish_governance.publish_denied_reason` — the same decision the public-web
+deploy path uses, see `governance.md`) BEFORE dispatch — `overwrite-remote` on the resolved
 `publication.provider`, and `clone` on the routed provider (a clone sets
 `auto_sync=True`, arming every future snapshot push). The four remote comment
 WRITE routes (post / reply / review / delete) are outbound egress too, so each
@@ -242,6 +244,42 @@ provider's first page are reachable rather than silently truncated.
 - `/artifacts/<slug>` — full-screen render of the current artifact in a
   sandboxed iframe (same security model as inline `<mcwidget>`), with a
   version dropdown
+
+### Publish panel (`PublishHub`) — reading a publish outcome
+
+`PublishHub` posts to the row's declared `endpoint` and must recognize **two**
+response shapes, because two different routes answer that POST:
+
+- `{url}` / `{public_url}` — the deploy shape (`POST /api/deploy/deploy`).
+- a serialized artifact carrying a `publication` block — what `POST
+  /api/artifacts/{slug}/publish` returns, which is where an app provider lands
+  when it hands the confirmed publish to the core route (the supported way to
+  reuse the core's single publish authorization + audit trail rather than
+  growing a second one). The link, when the destination exposes one, is
+  `publication.view_url`.
+
+`readPublishOutcome` is that reader, and it returns an *outcome*, not a url:
+
+- success is signalled by the return SHAPE, never inferred from a non-empty url
+  — a destination may publish successfully and expose no browsable link, and
+  conflating the two rendered a succeeded publish as the error branch with an
+  undefined message (a bare red icon and no text);
+- an `error` field wins over anything else in the same body;
+- `publication: null` (an unpublished artifact) is not success;
+- anything unrecognized is reported as a NAMED error (`unexpected_response`)
+  rather than an empty one.
+
+**HTTP 200 is not success on the artifact shape.** `publish_sync.publish()`
+treats the version push as best-effort: its re-publish branch runs
+`push_version(force=True)`, reads `refreshed.publication.last_error`, persists it
+and returns normally — so the route answers 200 with a publication whose remote
+content is stale. A non-empty (non-whitespace) `last_error` is therefore an error
+outcome carrying the provider's own already-redacted message; whitespace-only
+stays success, because the core writes `""` to clear the field.
+
+The public-exposure warning and the blocking `PublicPublishAckModal` are
+unchanged and unconditional — every destination gets both, on the clean path and
+on a scan override.
 
 ## Widget auto-registration
 
@@ -358,6 +396,13 @@ The page opens on the **All** view by default. The Starred/All selection is
 persisted per-browser (`localStorage['mc-artifacts-pinned-only']`), so a user
 who last chose **Starred** resumes there on their next visit.
 
+The firehose reads lightweight history projections: each JSONL file is streamed
+as bytes, lines without the serialized `"file_changes"` key are skipped without
+JSON parsing, and only `ts` plus `meta.file_changes` are retained in a bounded
+file-stamp cache. It never routes through the full parsed-message cache, so a
+dashboard refetch cannot pin or repeatedly decode the complete transcript
+corpus while looking for document paths.
+
 Materialization is authorization-gated: the requested path must appear in the
 recorded chat `file_changes` (never an arbitrary client path), and the read is
 routed through the `hooks.safe_read_file_bytes` keystone. `source` is recorded
@@ -438,7 +483,7 @@ every write-side unit test still green — so test the round-trip
 - **Restricted sessions** — POST/PATCH/DELETE are denied when the dashboard
   classifies the session as restricted (`_is_restricted_session`).
 - **SEL audit** — every mutation emits a `log_tool_invocation` event from the
-  HTTP layer (`api/dashboard/handlers/artifacts.py`). Reads are not audited.
+  HTTP layer (`dashboard/handlers/artifacts.py`). Reads are not audited.
   `_audit` redacts caller-supplied text before it reaches the SEL writer (which
   signs bytes as-written and does NOT redact): the `error` string and every
   string leaf of `extra` metadata pass through `redact_via_context`, so an
@@ -453,8 +498,67 @@ every write-side unit test still green — so test the round-trip
   defaults for missing keys, so future schema additions don't break existing
   files.
 - **Frontend rendering** — artifact bodies are rendered in the same sandboxed
-  iframe that powers `<mcwidget>`. No `dangerouslySetInnerHTML` without
+  iframe that powers `<mcwidget>`, and that frame loads a **real document** from
+  `GET /sandbox-doc/{doc_id}/{tok}` rather than a browser-built `blob:` URL. A
+  blob URL is refused outright by some WebKit-based in-app browsers (which can
+  take the whole page down with it) and a sandboxed `srcdoc` frame blank-renders
+  on WebKit, so a plain document URL is the only form that loads everywhere. The
+  authed `POST /api/sandbox-doc` stashes the html the caller already holds and
+  returns the URL; the path credential is client-bound with a short TTL, and the
+  response pins `Content-Security-Policy: sandbox` so the document keeps an
+  opaque origin even when opened top-level. Flags match what the embedding frame
+  already grants, so nothing is newly permitted or denied. The same response's
+  `frame-ancestors` is **`'self'` plus the ancestors `'self'` cannot express**
+  (`origin.frame_ancestors_value`), and both halves are load-bearing. `'self'` is
+  resolved by the BROWSER against the frame's real URL, so it stays correct behind
+  a TLS-terminating tunnel that rewrites `Host` and may not forward
+  `X-Forwarded-Proto` — deriving the origin server-side instead names
+  `http://localhost:<port>` while the browser is on `https://<tunnel-host>` and
+  blanks every frame on that path. `'self'` alone is not enough because the
+  directive is matched against EVERY ancestor: the Instances embed nests a remote
+  dashboard inside the local one, so a widget sits three levels down (local
+  dashboard → embedded dashboard → widget) with a grandparent on a different
+  origin, and the browser refuses the embed while the `GET` still returns 200.
+  Those extra ancestors come from `server._extra_frame_ancestors` (the embedding
+  parent's port, from a validly-signed token claim) and each is re-validated
+  against a strict origin form, so a malformed or inexpressible source — a
+  bracketed IPv6 literal is not a valid CSP host-source — cannot reach the header.
+  See `dashboard/handlers/sandbox_doc.py`. No `dangerouslySetInnerHTML` without
   DOMPurify; no inline event handlers.
+- **The detail frame is sized to its document, and promoted to its own
+  compositing layer.** Both are corrections to shapes that only misbehave on iOS
+  WebKit, so both are invisible in a desktop dev loop and both are pinned by
+  tests in `website/src/test/ArtifactBody.iframeBlob.test.tsx`.
+  - The frame takes the height its document reports (`includeHeightReporter`, the
+    same `mc-widget-height` protocol the chat frame uses, in its own measured-height
+    key space) and carries **no minimum**. It previously stood in a fixed
+    `calc(100vh - 240px)` box with `minHeight: 480`, which on a phone put a short
+    artifact in a frame hundreds of pixels taller than itself and made the reader
+    scroll a pane inside a scrolling page. A floor reintroduced above the reported
+    height brings both back.
+  - `transform: translateZ(0)` is on the frame because iOS WebKit was measured
+    **skipping the document's first paint**: it loaded, its injected scripts ran,
+    it reported a correct layout height, and it sat in a correctly sized visible
+    frame while painting nothing. Four unrelated post-load invalidations each
+    made it appear (a 1px resize, a transform toggle, an opacity flip, a display
+    toggle), so promotion is the one remedy that needs no timing — anything
+    scheduled off the `load` event is a race on a slow connection. Content height
+    only ever *correlated* with the symptom because tall content happened to
+    trigger one of those invalidations.
+- **A frame showing something that is not ours offers a retry.** The document URL
+  is single-use, so a navigation the ENGINE starts on its own (memory pressure, a
+  back/forward cache eviction) re-requests a spent URL and lands the frame on a
+  404 page — which fires `load` like any other navigation and leaves a silent
+  empty box, while the failure notice stays hidden because the mint itself
+  succeeded. Every document this surface builds carries the height reporter, so
+  silence past a grace window is the signal to surface the existing retry (which
+  re-mints; re-pointing at the spent URL recovers nothing). Deliberately not an
+  automatic re-mint: a second `load` also happens when a link inside an artifact
+  navigates the frame, and silently pulling the reader back would fight them.
+  `/sandbox-doc/` is on the service worker's skip list for the same single-use
+  reason, and because an iframe navigation has `mode === 'navigate'`, so the
+  worker's offline fallback would otherwise serve the SPA shell INTO the widget
+  frame (`website/src/test/serviceWorkerSkipRules.test.ts` runs the real worker).
 
 ## Versioning
 

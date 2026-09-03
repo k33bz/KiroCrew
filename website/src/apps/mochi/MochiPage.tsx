@@ -149,7 +149,7 @@ export default function MochiPage() {
     return (
       <>
         <PageHeader title={PRODUCT_NAME} subtitle={i18nT('apps.mochi.instances.connecting')} />
-        <div className="px-6 pb-8">
+        <div className="px-4 md:px-6 pb-8">
           <div className="space-y-4 animate-pulse">
             {[1, 2, 3].map((i) => (
               <div key={i} className="h-16 rounded bg-bg-elevated" />
@@ -289,7 +289,7 @@ function LiveView() {
   return (
     <>
       <PageHeader title={PRODUCT_NAME} subtitle={i18nT('apps.mochi.mochiPage.desktop_pet_companion')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {!isElectron && (
           <div role="note" className="mb-4 text-[13px] text-muted">
             {i18nT('apps.mochi.mochiPage.this_is_the_browser_view_everything_here_is_live')}
@@ -652,12 +652,18 @@ function AddWatchForm({
           placeholder: a placeholder disappears the moment you type, so the
           field's meaning was only available while it was empty — and a
           placeholder is not an accessible name. Wrapping also associates the
-          two without needing generated ids. */}
+          two without needing generated ids.
+          Each input then repeats its span's catalog KEY as an aria-label, which
+          leaves the computed name identical: an ancestor <label> cannot be seen by
+          static analysis (nor can htmlFor/id), so this is the only form of the
+          association a linter can check. Always the same key as the span beside it
+          — a second string here would silently drift from the visible one. */}
       <label className="flex flex-col gap-1">
         <span className="text-[10px] text-muted">{i18nT('apps.mochi.mochiPage.field_name')}</span>
         <input
           value={label}
           onChange={(e) => setLabel(e.target.value)}
+          aria-label={i18nT('apps.mochi.mochiPage.field_name')}
           placeholder={i18nT('apps.mochi.mochiPage.what_to_call_it')}
           className="rounded-md border border-border bg-transparent px-2 py-1.5 text-sm w-32"
         />
@@ -693,6 +699,7 @@ function AddWatchForm({
           <input
             value={newKind}
             onChange={(e) => setNewKind(e.target.value)}
+            aria-label={i18nT('apps.mochi.mochiPage.category_name')}
             placeholder={i18nT('apps.mochi.mochiPage.category_name')}
             autoFocus
             className="rounded-md border border-border bg-transparent px-2 py-1.5 text-sm w-28"
@@ -704,6 +711,7 @@ function AddWatchForm({
         <input
           value={target}
           onChange={(e) => setTarget(e.target.value)}
+          aria-label={i18nT('apps.mochi.mochiPage.field_target')}
           placeholder={i18nT('apps.mochi.mochiPage.url_or_what_to_watch')}
           className="w-full rounded-md border border-border bg-transparent px-2 py-1.5 text-sm"
         />

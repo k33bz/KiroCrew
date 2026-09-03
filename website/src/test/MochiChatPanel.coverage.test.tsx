@@ -70,6 +70,18 @@ const openExternal = vi.fn()
 /** Local image bytes, so an inline image can render without touching disk. */
 const readLocalImage = vi.fn(async (_path: string): Promise<string | null> => null)
 
+/**
+ * Whether the panel believes it runs inside the Electron shell. The reveal
+ * button delegates to the shell bridge, so the panel withholds it in a plain
+ * browser tab; most tests here exercise the shell surface, hence `true`.
+ * Read through a getter so a test can flip it without a module reset.
+ */
+let electronShell = true
+vi.mock('../lib/electron', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  get isElectron() { return electronShell },
+}))
+
 vi.mock('../apps/mochi/src/mochiApi', () => ({
   api: {
     getMochiConfig: async () => ({ petName: 'Mochi', theme: 'mocha' }),
@@ -128,6 +140,7 @@ beforeEach(() => {
   subscribers.clear()
   history = []
   backendOnline = true
+  electronShell = true
   sendMessage.mockResolvedValue(undefined)
   editResend.mockResolvedValue({ ok: true })
   respondApproval.mockResolvedValue(undefined)
@@ -253,6 +266,40 @@ describe('PinnedSidePanel', () => {
     expect(markPinnedSeen).toHaveBeenCalledWith('/home/u/src/a.ts')
     expect(previewFile).toHaveBeenCalledWith('/home/u/src/a.ts')
     expect(onMarkSeen).toHaveBeenCalledWith('/home/u/src/a.ts')
+  })
+
+  it('still marks a pin seen in a browser tab, but skips the shell-only preview', async () => {
+    electronShell = false
+    const onMarkSeen = vi.fn()
+    render(
+      <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set(['/home/u/src/a.ts'])}
+        deletedPaths={new Set()} visible onMarkSeen={onMarkSeen} />,
+    )
+    await userEvent.click(screen.getByText('a.ts'))
+    // Mark-seen is HTTP-backed and works everywhere; only the OS previewer
+    // needs the shell, so that call alone is withheld.
+    expect(markPinnedSeen).toHaveBeenCalledWith('/home/u/src/a.ts')
+    expect(onMarkSeen).toHaveBeenCalledWith('/home/u/src/a.ts')
+    expect(previewFile).not.toHaveBeenCalled()
+  })
+
+  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin on hover', async () => {
+    electronShell = false
+    render(
+      <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
+        deletedPaths={new Set()} visible />,
+    )
+    // No previewer and no update dot to clear: a click would have no visible
+    // payoff, so the row must not present as a control at all.
+    const label = screen.getByText('a.ts')
+    expect(label.closest('[role="button"]')).toBeNull()
+    fireEvent.click(label)
+    expect(previewFile).not.toHaveBeenCalled()
+    expect(markPinnedSeen).not.toHaveBeenCalled()
+    // The unpin affordance is its own HTTP-backed control and stays reachable.
+    await userEvent.hover(label)
+    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
   it('reveals Unpin on hover and unpins on click', async () => {
@@ -584,7 +631,7 @@ describe('ChatPanel context menu', () => {
     await screen.findByText('old turn')
     const menu = await openMenu(container)
     await userEvent.click(menu.getByRole('menuitem', { name: 'Reset Mochi' }))
-    expect(await screen.findByText('Reset Mochi?')).toBeInTheDocument()
+    expect(await screen.findByText('Reset \u201cMochi\u201d?')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Reset' }))
     await waitFor(() => expect(resetMochi).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.queryByText('old turn')).not.toBeInTheDocument())
@@ -630,22 +677,21 @@ describe('ChatPanel edit and resend', () => {
 })
 
 describe('ChatPanel approval card', () => {
-  it('asks about the tool and its input, with a trust hint when nothing is scopable', async () => {
+  it('asks about the tool and its input without Trust when the server omitted proof', async () => {
     await renderPanel()
     emit('onApprovalRequest', approvalFrame())
     expect(await screen.findByText('execute_bash')).toBeInTheDocument()
     expect(screen.getByText('ls -la')).toBeInTheDocument()
     expect(screen.getByText(/Wants to run/)).toBeInTheDocument()
-    expect(
-      screen.getByText('Trust also auto-approves execute_bash from now on.'),
-    ).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Trust' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Trust also auto-approves/)).not.toBeInTheDocument()
   })
 
   it('relabels the card once the approval reaches the agent', async () => {
     await renderPanel()
     emit('onApprovalRequest', approvalFrame())
     await userEvent.click(await screen.findByRole('button', { name: 'Approve' }))
-    expect(respondApproval).toHaveBeenCalledWith('req-1', 'approve', undefined)
+    expect(respondApproval).toHaveBeenCalledWith('req-1', 'approve', undefined, false)
     expect(await screen.findByText('Approved')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
   })
@@ -654,7 +700,7 @@ describe('ChatPanel approval card', () => {
     await renderPanel()
     emit('onApprovalRequest', approvalFrame())
     await userEvent.click(await screen.findByRole('button', { name: 'Reject' }))
-    expect(respondApproval).toHaveBeenCalledWith('req-1', 'reject', undefined)
+    expect(respondApproval).toHaveBeenCalledWith('req-1', 'reject', undefined, false)
     expect(await screen.findByText('Rejected')).toBeInTheDocument()
   })
 
@@ -673,7 +719,9 @@ describe('ChatPanel approval card', () => {
 
   it('reveals the scoped grants behind Trust instead of firing the widest one', async () => {
     await renderPanel()
-    emit('onApprovalRequest', approvalFrame({ fullCommand: 'cat /etc/hosts', baseCommand: 'cat,wc' }))
+    emit('onApprovalRequest', approvalFrame({
+      fullCommand: 'cat /etc/hosts', baseCommand: 'cat,wc', trustGrantable: true,
+    }))
     const trust = await screen.findByRole('button', { name: 'Trust' })
     expect(trust).toHaveAttribute('aria-expanded', 'false')
     await userEvent.click(trust)
@@ -683,21 +731,27 @@ describe('ChatPanel approval card', () => {
     expect(screen.getByRole('button', { name: /cat \/etc\/hosts/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Trust all tools' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Trust all cat, wc commands' }))
-    expect(respondApproval).toHaveBeenCalledWith('req-1', 'trust_base', 'cat *,wc *')
+    expect(respondApproval).toHaveBeenCalledWith('req-1', 'trust_base', 'cat *,wc *', true)
     expect(await screen.findByText('Trusted')).toBeInTheDocument()
   })
 
   it('grants only this command when the exact-command scope is picked', async () => {
     await renderPanel()
-    emit('onApprovalRequest', approvalFrame({ fullCommand: 'cat /etc/hosts', baseCommand: 'cat' }))
+    emit('onApprovalRequest', approvalFrame({
+      fullCommand: 'cat /etc/hosts', baseCommand: 'cat', trustGrantable: true,
+    }))
     await userEvent.click(await screen.findByRole('button', { name: 'Trust' }))
     await userEvent.click(screen.getByRole('button', { name: /cat \/etc\/hosts/ }))
-    expect(respondApproval).toHaveBeenCalledWith('req-1', 'trust_command', 'cat /etc/hosts')
+    expect(respondApproval).toHaveBeenCalledWith(
+      'req-1', 'trust_command', 'cat /etc/hosts', true,
+    )
   })
 
   it('offers no family grant when it would duplicate the command grant', async () => {
     await renderPanel()
-    emit('onApprovalRequest', approvalFrame({ fullCommand: 'fs_read', baseCommand: 'fs_read' }))
+    emit('onApprovalRequest', approvalFrame({
+      fullCommand: 'fs_read', baseCommand: 'fs_read', trustGrantable: true,
+    }))
     await userEvent.click(await screen.findByRole('button', { name: 'Trust' }))
     expect(screen.queryByRole('button', { name: /Trust all .* commands/ })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Trust all tools' })).toBeInTheDocument()
@@ -795,7 +849,9 @@ describe('ChatPanel streaming footer', () => {
     await renderPanel()
     stream('Building it now <mcwidget title="Half')
     expect(await screen.findByText('Building it now')).toBeInTheDocument()
-    expect(screen.queryByText(/mcwidget/)).not.toBeInTheDocument()
+    // The stream commit is async; wait for React to flush before asserting the
+    // negative, or a slow runner still sees the pre-strip markup and fails.
+    await waitFor(() => expect(screen.queryByText(/mcwidget/)).not.toBeInTheDocument())
   })
 
   it('replaces the streamed text with the committed message', async () => {
@@ -821,6 +877,23 @@ describe('ChatPanel markdown affordances', () => {
     expect(previewFile).toHaveBeenCalledWith('src/main.py')
     await userEvent.click(screen.getByRole('button', { name: 'Show in file manager' }))
     expect(revealFile).toHaveBeenCalledWith('src/main.py')
+  })
+
+  it('renders the chip inert in a browser tab, where the shell bridge is absent', async () => {
+    electronShell = false
+    history = [
+      { role: 'assistant', content: 'Look at `src/main.py` first.', timestamp: 1700000000000 },
+    ]
+    await renderPanel()
+    // Preview and reveal both delegate to the shell bridge, so in a browser tab
+    // the chip keeps the path (with its full-path tooltip) but offers no dead
+    // controls: no buttons, and the label is plain text rather than focusable.
+    const label = await screen.findByTitle('src/main.py')
+    expect(label).not.toHaveAttribute('role')
+    expect(screen.queryByRole('button', { name: 'Preview' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show in file manager' })).not.toBeInTheDocument()
+    fireEvent.click(label)
+    expect(previewFile).not.toHaveBeenCalled()
   })
 
   it('chips an absolute path found in ordinary prose', async () => {

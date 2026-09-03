@@ -1,10 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import type { MockedFunction } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import type { Artifact } from '../types'
+
+// The sandboxed frames mint their document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
 
 vi.mock('../api/client')
 // Stub the embedded chat page (companion chat) — its rendering is covered by its
@@ -66,7 +75,10 @@ describe('ArtifactDetailPage', () => {
     vi.clearAllMocks()
     // Spy rather than assign: only a spy lands in the registry that
     // vi.restoreAllMocks() can undo. The env provides both natively.
-    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
+    // Well-formed blob: URI, not a bare 'blob:test' literal — see the note in
+    // WidgetFrame.test.tsx's beforeEach for why a malformed mock value here
+    // risks a deferred ECONNREFUSED crashing an unrelated shard.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:http://localhost:6776/test')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     // Default events response so the events query never throws "undefined".
     // Individual tests can override this with .mockResolvedValueOnce when
@@ -230,11 +242,11 @@ describe('ArtifactDetailPage', () => {
     })
     vi.mocked(api).artifact = vi.fn((s: string) =>
       Promise.resolve(mkArtifact({ slug: s, name: s === 'art-a' ? 'Artifact A' : 'Artifact B' })),
-    ) as any
+    ) as MockedFunction<typeof api.artifact>
     vi.mocked(api).artifactVersions = vi.fn((s: string) =>
       Promise.resolve({ slug: s, versions: [1] }),
-    ) as any
-    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as any
+    ) as MockedFunction<typeof api.artifactVersions>
+    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as MockedFunction<typeof api.artifactComments>
 
     function Nav() {
       const navigate = useNavigate()

@@ -20,6 +20,11 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `minKiroCrewVersion` | string | Minimum Gateway version required |
 | `tags` | string[] | Discovery tags (e.g. `["oncall", "monitoring"]`) |
 | `jobFamilies` | string[] | Job families this app is relevant to |
+| `highlights` | string[] | Concise feature bullets for the detail page |
+| `useCases` | string[] | Short, operator-oriented situations where the app is useful |
+| `configuration` | string[] | Concise setup or configuration steps shown on the detail page |
+| `screenshots` | string[] | Real product screenshots; paths follow the same distribution rules as hero art |
+| `screenshotsDark` | string[] | Optional dark-appearance screenshot variants |
 
 ## Resources
 
@@ -29,6 +34,29 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `skills` | string[] | Paths to skill directories |
 | `sops` | string[] | Paths to SOP (Standard Operating Procedure) files |
 | `mcpServers` | object | MCP server definitions (same format as `mcp.json`) |
+
+### How a stdio `command` is resolved at registration
+
+A stdio entry's `command` (no `url`) is not always written verbatim — registration
+resolves it so the server starts under the interpreter its dependencies were
+installed against:
+
+- **A bare Python launcher** (`python`, `python3`, `py`, or the same with `.exe`)
+  resolves to the app's own venv interpreter (`.venv/bin/python3`, or
+  `.venv\Scripts\python.exe` on Windows) when it exists as a runnable file, else
+  to the gateway's own interpreter — never a PATH lookup. Exception: a server
+  whose `args` launch a `kiro_crew` module (`-m kiro_crew...`) always gets the
+  gateway's interpreter, since app venvs cannot import `kiro_crew`.
+- **Any other bare name** (no path separator, no drive qualifier) is rewritten
+  only when the app's venv provides that exact binary as a runnable file (a pip
+  console script — invisible to PATH because the venv is never activated). Note
+  this means a venv-provided binary shadows a same-named PATH dependency.
+  `node`, `npx`, `docker` and friends are otherwise left for PATH, as declared.
+- **A command carrying a path** (absolute or relative) is never rewritten. If it
+  does not point at a runnable file at registration time, a warning naming the
+  app, server, and command is logged — the entry is still written.
+- The host CLI name `kirocrew` is pinned to the running gateway before any of
+  the above applies.
 
 ## Scheduling
 
@@ -47,6 +75,13 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
       "cron_expr": "0 9 * * 1-5",
       "message": "Generate daily digest",
       "agent": "digest-agent"
+    },
+    {
+      "name": "market-open",
+      "cron_expr": "30 9 * * 1-5",
+      "message": "Summarise the overnight tape",
+      "timezone": "America/New_York",
+      "skip_dates": ["2026-12-25"]
     }
   ]
 }
@@ -59,6 +94,8 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `cron_expr` | string | Cron expression (mutually exclusive with `every`) |
 | `message` | string | Prompt sent to the agent on each run |
 | `agent` | string | Agent to run (optional, uses default if omitted) |
+| `timezone` | string | IANA zone name the schedule and `skip_dates` are evaluated in, e.g. `America/New_York`. Optional, but an empty value falls back to the gateway config's timezone and then to **UTC** — so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC, the wrong calendar day for most users. An unknown zone is rejected at manifest validation. A per-**user** zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
+| `skip_dates` | string[] | Calendar dates the job must not fire on, evaluated in `timezone`. Must be zero-padded `YYYY-MM-DD` — `2026-1-1` parses but never matches the padded fire-time rendering, so it is rejected at manifest validation rather than silently skipping nothing |
 | `enabled` | boolean | Default `true`. Must be a JSON boolean — any other type is rejected at manifest validation. When `false` the cron is registered **paused** (visible in the Schedule view, resumable) instead of firing on install/enable — for jobs that need user configuration first |
 
 > **Caveat:** disabling an app deletes its registered cron jobs, and re-enabling
@@ -103,6 +140,189 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `ui.pages[].mountFunction` | string | `"mount"` | Exported function name in the ESM bundle |
 | `ui.sidebar.section` | string | `"Apps"` | Sidebar section name |
 | `ui.sidebar.order` | number | `10` | Sort order within section |
+| `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
+| `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
+
+### `ui.overlays` — Replacing a Host Overlay Surface
+
+An overlay is a surface that floats above whatever the user is looking at and is
+opened by a gesture the host owns, so unlike `ui.pages` it has no route and no
+sidebar placement. Declaring one lets an enabled app take over a host surface:
+
+```json
+{
+  "ui": {
+    "overlays": [
+      { "id": "command-bar", "replaces": "quick-search" }
+    ]
+  }
+}
+```
+
+`replaces` names a host slot. `quick-search` is the only slot the dashboard
+currently offers -- it is the Cmd+K / Ctrl+K surface -- and an unknown slot name is
+reported and ignored rather than silently dropping the overlay.
+
+**Host-internal until App Kit adopts it.** Both fields are validated by the backend
+for any manifest, but only an app whose `origin` is `builtin` can actually claim a
+slot: an overlay `id` must name a component compiled into the dashboard bundle, and
+there is no ESM `entryPoint` for overlays the way `ui.pages` has one. An installed app
+declaring `ui.overlays` is refused at install, and a self-registered one is refused
+when slots are resolved -- `builtin` provenance is assigned only by the builtin
+registration Kiro Crew runs at startup and cannot be self-reported. Treat this as the
+mechanism builtin apps use to replace a host surface, not yet as a third-party
+extension point.
+
+A builtin declaring `ui.overlays` must NOT also declare `ui.entry`: builtin
+registration re-derives `origin` on every startup and downgrades an app that ships a
+UI bundle to `local`, which would then be refused its own slot. A test enforces this
+so the combination fails the build rather than silently reverting the surface.
+
+At most one enabled app owns a slot. When two enabled apps declare the same
+`replaces`, the first by app name wins and the collision is reported -- the winner
+does not depend on which app was enabled or installed more recently.
+
+## Contributions
+
+### `contributes.commands` — Adding Rows to the Command Bar
+
+Adds command rows to the host's Command Bar. This is the lightest thing an app can
+be: a command-contributing app needs no page, no frontend bundle, no backend and no
+process — a manifest, plus whatever skill its prompt names.
+
+```json
+{
+  "contributes": {
+    "commands": [
+      {
+        "id": "approve-all",
+        "title": "Approve all PRs",
+        "subtitle": "Approve every pull request behind a link",
+        "icon": "Check",
+        "keywords": ["pr", "lgtm"],
+        "argument": {
+          "placeholder": "Paste a GitHub link…",
+          "hint": "A PR search, a label, or a single pull request.",
+          "kind": "url",
+          "hosts": ["github.com"],
+          "patternError": "Not a github.com link."
+        },
+        "prompt": "Load the $my-skill skill and approve every PR behind {argument}",
+        "autoSend": true
+      }
+    ]
+  }
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `id` | yes | lowercase alphanumeric + dashes; unique within the app |
+| `title` | yes | row label, up to 120 characters |
+| `prompt` | yes | the action: a new session is seeded with this text, up to 4000 characters |
+| `subtitle` | no | defaults to the app's display name |
+| `icon` | no | a name from the host's glyph set; an unknown name falls back |
+| `keywords` | no | hidden match aliases |
+| `argument` | no | the ONE value the command collects before it runs; must be an object |
+| `autoSend` | no | send the seeded prompt instead of leaving it in the composer |
+
+Every entry of `commands` must be an object, and every length above is counted in UTF-16
+code units -- what the launcher itself counts. Both matter for the same reason: the host
+validates your manifest twice, once on install and once when it renders, and anything the
+two would measure differently is a command that installs clean and then does not appear.
+So a title of 100 emoji is 200 units, not 100, and a single non-object entry is refused
+rather than quietly skipped past.
+
+Inside `argument`:
+
+| Field | Required | Notes |
+|---|---|---|
+| `kind` | no | `url` or `text`; defaults to `text`. An unknown kind is refused |
+| `hosts` | no | `url` only: allowed hostnames, up to 20. Empty means any host |
+| `placeholder` | no | field placeholder |
+| `hint` | no | one line under the field |
+| `patternError` | no | shown when the value is not accepted |
+
+`contributes` sits beside `ui`, not inside it: `ui` declares surfaces the app owns,
+while a contribution is a row inside a surface the host owns and renders.
+
+**A contribution is data, never code.** There is no way to ship a function or an icon
+URL: the launcher would be running app-authored JavaScript inside the host's surface
+on every keystroke, and the root page promises to issue no network request. Ask for a
+new glyph name by pull request.
+
+**The host owns the matcher; a manifest names one rather than supplying it.** The
+collected value is spliced into an instruction handed to an agent with tools, so it has
+to be checked before the prompt is built — but `kind` selects one of a fixed set the
+host implements, and there is no way to ship a regex of your own. An earlier revision
+of this contract accepted `argument.pattern`; a pattern from a manifest runs against
+the field on every keystroke on the thread that draws the launcher, and shapes like
+`^(a+)+$` or `^(a|aa)+$` are a few characters long and exponential, so an `argument`
+that still carries `pattern` is now REFUSED rather than migrated — leaving it to fall
+back on `text` would accept any non-empty string with `autoSend` still on. An unknown
+`kind` is refused for the same reason.
+
+`kind: "url"` parses the value with the runtime's own URL parser and then applies
+`hosts`. The allowlist is exact unless an entry starts with a dot: `github.com` does
+not admit `github.com.evil.test`, while `.github.com` admits `gist.github.com`. Only
+`http` and `https` are accepted. `kind: "text"` takes any non-empty value.
+
+This is less precise than a regex, deliberately: a pattern could demand `/pull/<n>`,
+while `url` + `hosts` admits any URL on the host and leaves what the link DENOTES to
+the agent — or to your skill, which is the better place for your own product's URL
+taxonomy.
+
+Declaring an argument the prompt never interpolates is an error — the reader would be
+asked for a value the command then ignores. A command whose prompt needs no value
+simply omits `argument`; activating it is the whole action.
+
+**What the reader sees with `autoSend`.** The host shows the resolved prompt — the
+template with the reader's value already spliced in — in the argument field before
+the send, so the instruction is visible at the moment it fires. Write prompts on the
+assumption they will be read.
+
+**`autoSend` requires an `argument`.** That preview is what makes the send informed and
+it lives in the argument step, so a command that collects nothing never reaches it and
+the combination is refused rather than silently downgraded. Such a command still works:
+its prompt lands in the composer and one keystroke sends it. `autoSend` is also
+honoured only for the JSON boolean `true`, never for the string `"true"`.
+
+A malformed command is skipped with a console warning and the app's other commands
+still load. Commands from a disabled app do not appear at all.
+
+**If your app is SIGNED, set `minKiroCrewVersion`.** Contributions are covered by the
+admission signature -- a contributed prompt goes to an agent with tools and `autoSend`
+fires it, so leaving it unsigned would make your rows the one part of a signed app an
+attacker could rewrite with the signature still verifying. The consequence for you is
+that a signed manifest declaring `contributes` does not verify on a gateway older than
+this change, because that gateway computes the signed bytes without the
+`contributes` key. It fails CLOSED -- a refused install, not a silent downgrade -- but
+the error will not obviously point here, so declare the floor and the install refuses
+for a legible reason instead. Unsigned apps are unaffected, as are signed apps that
+contribute nothing: the key is only added to the payload when non-empty, so every
+signature issued before this existed still verifies.
+
+### App Icon
+
+`iconPath` is the App Store's card and row icon, and it is **top-level** — not
+under `ui`. `ui.pages[].icon` and `ui.pages[].iconUrl` above are the sidebar glyph
+for an app that is already *installed*, a different surface; neither one supplies
+a store icon, and an app that declares only those publishes no icon at all.
+
+```json
+{
+  "iconPath": "assets/icon.png"
+}
+```
+
+`kirocrew app init` scaffolds `assets/icon.png` and this field, so a new app
+starts with a working icon rather than a placeholder card. Replace the generated
+placeholder with real artwork before publishing.
+
+For the artwork requirements — path form, dimensions, why the icon must be
+opaque, and how the dark variant relates — see
+[Publishing an app](publishing-guide.md), which owns that spec for every art
+field.
 
 ### Hero Images
 
@@ -115,7 +335,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "/apps/my-app/ui/hero-light.svg",
-    "heroImageDark": "/apps/my-app/ui/hero-dark.svg"
+    "heroImageDark": "/apps/my-app/ui/hero-dark.svg",
+    "heroImageDetail": "/apps/my-app/ui/hero-detail-light.svg",
+    "heroImageDetailDark": "/apps/my-app/ui/hero-detail-dark.svg"
   }
   ```
 
@@ -126,7 +348,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "ui/hero-light.svg",
-    "heroImageDark": "ui/hero-dark.svg"
+    "heroImageDark": "ui/hero-dark.svg",
+    "heroImageDetail": "ui/hero-detail-light.svg",
+    "heroImageDetailDark": "ui/hero-detail-dark.svg"
   }
   ```
 
@@ -134,6 +358,11 @@ and detail cards. The path form depends on how the app is distributed:
 |-------|------|-------------|
 | `heroImage` | string | Hero image shown on the App Store card (light theme) |
 | `heroImageDark` | string | Hero image variant used in dark theme |
+| `heroImageDetail` | string | Wide banner preferred by the detail page (light theme) |
+| `heroImageDetailDark` | string | Wide detail banner used in dark theme |
+
+Hero images are illustrative marketing art. `screenshots` are separate and must
+show the real product UI; the detail page renders both when both are declared.
 
 ## Backend
 
@@ -154,7 +383,7 @@ and detail cards. The path form depends on how the app is distributed:
 |-------|------|---------|-------------|
 | `backend.entryPoint` | string | | Script to run (relative to app root), or a dotted Python module path launched via `python -m` (used by built-in apps like `file-explorer`, e.g. `kiro_crew.apps.builtins.file_explorer.server`) |
 | `backend.port` | string | `"auto"` | Port number or `"auto"` for auto-assignment |
-| `backend.healthCheck` | string | `"/health"` | Health check endpoint path |
+| `backend.healthCheck` | string | `"/health"` | Absolute health-check path beginning with `/`; unsafe or ambiguous paths are refused. Polled until it answers at startup, then re-polled for the life of the backend — keep the handler cheap and dependency-free. A backend that stops answering it is dropped from the reverse proxy and its MCP servers are deregistered until it answers again. |
 | `backend.routes` | string | | Base route path for the backend |
 | `backend.type` | string | `""` | Backend runtime: `"python"`, `"asgi"`, `"node"`, `"exec"` (execute the entry point file as-is), or `""` (auto-detect from `entryPoint` — a `.sh` file or an extensionless executable with a non-Python shebang is treated as a shell launcher) |
 
@@ -192,9 +421,36 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 | `backend.hooks.on_startup` | string | `module.path:callable` invoked when the app's hooks are wired up |
 | `backend.hooks.on_shutdown` | string | `module.path:callable` invoked when the app is disabled/torn down |
 
-`hooks.routes` handlers are wired up when the app is enabled (via
-`on_app_enable`, also re-run at gateway startup via `on_gateway_startup`), so
-they go live without waiting for a Gateway restart.
+`hooks.routes` handlers are wired up when the app is enabled **through the
+Gateway** -- the dashboard's enable action (`on_app_enable`), also re-run at
+gateway startup (`on_gateway_startup`) -- so on that path they go live without
+waiting for a Gateway restart.
+
+`kirocrew app enable` is not that path. The CLI is a separate process with no
+handle on a running Gateway's imported modules, so it cannot load or replace
+hooks: a Gateway that is already up keeps executing the hook module it imported
+earlier, even though the command succeeds and `app info` reports the new
+version. Restart the Gateway, or disable and re-enable the app from the
+dashboard, for hook changes to take effect. The CLI prints this reminder after
+enabling any app that declares `backend.hooks`.
+
+**Importing your own modules.** Hook entry files are loaded from their file path
+into a synthetic package named after the app, never via `sys.path`, so use a
+**relative** import to reach a sibling module:
+
+```python
+# backend/routes.py
+from . import config          # backend/config.py
+from .render import to_html   # backend/render.py
+```
+
+A relative import resolves inside the app's own directory tree and cannot walk
+above the app root (`from ... import x` is refused). It is not a sandbox: app
+Python already runs in the Gateway process with full filesystem access, so a
+symlinked sibling resolves wherever it points. Do not use a bare
+`import config`: `sys.modules["config"]` is process-global, so two apps each
+shipping a `config.py` would end up sharing one module. `from kiro_crew...`
+absolute imports are for built-in apps only.
 
 ## Permissions
 
@@ -422,6 +678,11 @@ the user to run locally instead of executing it on the server.
 - `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case)
 - `name` must not be `system` (it would shadow the `system.*` notification-channel
   namespace)
+- `name` must not be `library` (the dashboard serves `/apps/library` as a static
+  page — the installed-app management surface — and it registers ahead of the
+  `/apps/:name` route, so an app by that name would have an unreachable page).
+  Refused at every install door, including registry installs before any
+  clone/build work, with the machine-readable error code `reserved_app_name`.
 - `name` must not be a Windows reserved device stem — `con`, `prn`, `aux`, `nul`,
   `com1`–`com9`, `lpt1`–`lpt9` — because the app name becomes a directory and
   Windows resolves those inside every directory. Names that merely resemble one
@@ -433,6 +694,8 @@ the user to run locally instead of executing it on the server.
 - All required fields must be non-empty strings
 - Each cron entry must specify either `every` or `cron_expr`
 - Each UI page must have `route` and `label`
+- Each UI overlay must have `id` and `replaces`; both must be kebab-case, and `id`
+  must be unique within the manifest
 
 ## Full Example
 
@@ -444,6 +707,9 @@ the user to run locally instead of executing it on the server.
   "description": "Monitor tickets, pipelines, and alarms for your on-call rotation",
   "author": "kirocrew",
   "tags": ["oncall", "monitoring"],
+  "useCases": ["Keep a shared view of firing alerts and active investigations"],
+  "configuration": ["Connect an alert provider in Settings, then start in read-only mode"],
+  "screenshots": ["ui/screenshots/board.png"],
   "agents": ["agents/ticket-analyst.json"],
   "skills": ["skills/oncall-runbook"],
   "crons": [

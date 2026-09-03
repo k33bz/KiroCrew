@@ -17,9 +17,11 @@ import { api } from '../api/client'
 import { Badge } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import { framablePreviewUrl, safeHttpUrl } from '../lib/safeUrl'
+import { useCloudDeploymentEnabled } from '../hooks/useCloudDeploymentEnabled'
 import type { Artifact, WebAppMetadata } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
 function statusBadgeVariant(status: string): 'ok' | 'warn' | 'err' | 'aim' {
   switch (status) {
     case 'live': return 'ok'
@@ -131,7 +133,7 @@ function CostPills({ cost, label }: { cost: WebAppMetadata['cost']; label: strin
             key={i}
             className="inline-flex items-baseline gap-1.5 rounded-full border border-border bg-bg-elevated px-2.5 py-1"
           >
-            <span className="text-[11px] text-muted">{Number(e.views ?? 0).toLocaleString()} {i18nT('components.webAppArtifactCard.views')}</span>
+            <span className="text-[11px] text-muted">{fmtNumber(Number(e.views ?? 0))} {i18nT('components.webAppArtifactCard.views')}</span>
             <span className="text-[12px] font-medium text-text-strong">${Number(e.usd ?? 0).toFixed(4)}</span>
           </span>
         ))}
@@ -343,6 +345,9 @@ export default function WebAppArtifactCard({
   }, [dt])
 
   const navigate = useNavigate()
+  // Whether this installation may deploy to a public cloud URL at all. Gates the
+  // not-deployed hero CTA below.
+  const cloudDeployEnabled = useCloudDeploymentEnabled()
   // Deploy-time profile picker: registered profiles from the Artifact Deploy
   // app's control plane. Empty selection = the registry default; the choice is
   // baked into the seed prompt so the skill runs `--profile <choice>` and
@@ -431,7 +436,11 @@ export default function WebAppArtifactCard({
             {i18nT('components.webAppArtifactCard.not_deployed_yet_deploy_to_your_own_aws_account')}
           </p>
           <div className="flex items-center gap-2 flex-wrap">
-            {registeredProfiles.length > 0 && (
+            {/* Only the deploy ACTION is withheld when the platform disallows cloud
+                deployment — the card's preview, architecture and metadata above stay,
+                because removing them would hide information about the artifact for a
+                reason that has nothing to do with the artifact. */}
+            {cloudDeployEnabled && registeredProfiles.length > 0 && (
               <SimpleSelect
                 value={deployProfile}
                 onChange={setDeployProfile}
@@ -444,6 +453,7 @@ export default function WebAppArtifactCard({
                 aria-label={i18nT('components.webAppArtifactCard.aws_profile_to_deploy_with')}
               />
             )}
+            {cloudDeployEnabled && (
             <button
               type="button"
               onClick={openDeployChat}
@@ -454,11 +464,14 @@ export default function WebAppArtifactCard({
               <Rocket size={14} aria-hidden="true" />
               {i18nT('components.webAppArtifactCard.deploy')}
             </button>
+            )}
+            {cloudDeployEnabled && (
             <span className="text-[10px] text-muted">
               {registeredProfiles.length > 0
                 ? i18nT('components.webAppArtifactCard.opens_a_new_chat_session_to_run_the_deploy')
                 : i18nT('components.webAppArtifactCard.opens_a_new_chat_session_to_run_the_deploy_add_a')}
             </span>
+            )}
           </div>
         </div>
 

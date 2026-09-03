@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import ctypes
 import functools
 import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -48,8 +50,10 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, NamedTuple, Protocol
 
+from kiro_crew._ssl_compat import _ssl_context_has_ca_trust
 from kiro_crew.config.loader import config_path
 from kiro_crew.config.paths import config_dir
+from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
@@ -94,9 +98,15 @@ _POOLING_TYPE_LAST = 3
 # small: KV-cache size scales linearly with n_ctx (~115KB/token for this
 # model) and the embedder may load in more than one process (gateway +
 # kirocrew-core MCP server — the GGUF weights themselves are mmap'd and
-# physically shared, the KV buffers are not). n_ubatch must cover the whole
-# input for pooled embedding models — keep all three in lockstep.
+# physically shared, the KV buffers are not). The logical batch still covers
+# the complete input for last-token pooling; llama.cpp may split that work into
+# smaller physical micro-batches without changing the resulting vector.
 _N_CTX = 2048
+# Physical decode micro-batch. Keeping this below the logical batch bounds the
+# compute scratch arena without reducing the accepted context. Qwen3's
+# 6,000-char maximum input produces byte-identical vectors at 512 and 2048,
+# while 512 avoids roughly 419 MiB of peak RSS on the shipped Linux runtime.
+_N_UBATCH = 512
 # Safety truncation (chars) before inference, sized under _N_CTX at a
 # conservative ~4 chars/token so a clipped input always fits the context
 # window. Only pathological un-chunked blobs exceed this; mirrors the
@@ -108,6 +118,69 @@ _LLM_LOAD_RETRY_SECS = 300.0  # re-attempt a failed model load after this long
 # exit. Bounded so an unload never wedges a shutdown; the thread is a daemon, so
 # a straggler cannot hold the interpreter open either.
 _INFER_STOP_TIMEOUT_SECS = 30.0
+# llama.cpp sizes its compute pools from the HOST CPU COUNT when the caller does
+# not pass them: n_threads = cpu//2 and n_threads_batch = cpu (see the vendored
+# llama.py). Embedding is prompt processing, so it runs on the BATCH pool — on a
+# 16-core host EVERY embed, even an 8-character one, fanned out across all 16
+# cores and measured ~4.5 cores sustained inside the gateway. A 0.6B model over
+# short text does not need that, and oversubscribing the box makes the pool both
+# suffer and cause contention. Pinned low here, overridable via
+# memory.embedding_threads.
+_DEFAULT_EMBED_THREADS = 4
+# Bulk corpus loops (the post-migration re-embed sweep above all) run for as long
+# as the corpus takes: measured 429 ms/row at 4 threads on ~500-character rows,
+# so a 3,000-row migrated memory is ~21 minutes at a SUSTAINED 3.7 cores. That is
+# indistinguishable from a runaway process to the user — laptop fans spin up and
+# stay up — even though every row is legitimate work.
+#
+# Nobody is waiting on that work. A row with a NULL embedding is still FTS5
+# keyword-searchable the moment it lands; the sweep only adds SEMANTIC reach over
+# memories the user imported from a previous install. So the sweep is optimized
+# for staying invisible, not for finishing early, and the defaults below are
+# deliberately slow: one thread at a 20% duty cycle is ~0.2 of a core, which no
+# fan reacts to. On the measured host that is ~7 s/row, so a 3,000-row backlog
+# takes hours — and that is fine. It is idempotent and resumes across restarts
+# (an unfinished row stays NULL and the next boot picks it up), so a machine that
+# is never on long enough to finish still converges over several sessions.
+#
+# Two independent dials for a deployment that wants it faster (a server, or a
+# user who wants semantic search over old memories today):
+#
+#   * ``memory.embedding_bulk_threads`` — threads for BULK jobs only, so raising
+#     it never slows a query the user is waiting on. 0 means "inherit
+#     ``embedding_threads``".
+#   * ``memory.embedding_bulk_duty`` — the fraction of wall time the loop may
+#     spend computing. 1.0 runs flat out.
+#
+# Total CPU work is unchanged either way (measured 1.39–1.57 CPU-seconds per row
+# across 1/2/4 threads); what changes is how thinly it is spread. Fans respond to
+# sustained load, so spreading it is the whole point. The one cost of spreading
+# is that the ~700MB model stays resident while the sweep runs, which is why the
+# sweep still probes for pending rows BEFORE loading anything.
+_DEFAULT_BULK_THREADS = 1
+_DEFAULT_BULK_DUTY = 0.2
+# Floor on the duty cycle. A typo of 0.001 would otherwise turn a multi-hour
+# sweep into a multi-week one, which is indistinguishable from it never running.
+_MIN_BULK_DUTY = 0.05
+# Cap on a single pace sleep. This exists ONLY so one pathological row (a
+# 6,000-character blob whose inference takes seconds) cannot park the sweep for
+# minutes; it must stay well ABOVE the delay an ordinary row produces at the
+# default duty (~5.6s at 1.39s/row and 0.2), or it would quietly override the
+# configured duty on EVERY row instead of catching the outlier it is named for.
+_MAX_BULK_PACE_SLEEP = 30.0
+# Only log an embed's queue wait at INFO once it is long enough for a waiting
+# caller to notice; below this it stays DEBUG so ordinary memory writes do not
+# emit a line each.
+_EMBED_WAIT_LOG_MS = 250.0
+# Scheduling classes for the shared inference queue. The whole process shares ONE
+# model on ONE thread, so a bulk corpus sweep and a user's query compete for the
+# same single slot: without ordering, a short interactive embed waits behind
+# however much background work happens to be queued. Lower value wins.
+PRIORITY_INTERACTIVE = 0  # a human is blocked on this (prompt build, search box)
+PRIORITY_NORMAL = 1  # bounded explicit write (one lesson, one preference)
+PRIORITY_BULK = 2  # corpus loops: backfill, migration, ingestion, consolidation
+# Shutdown outranks everything so close() is not stuck behind a queued sweep.
+_PRIORITY_SENTINEL = -1
 
 # ── Download constants ──
 
@@ -139,9 +212,7 @@ _MODEL_URL_ENV = "KIROCREW_EMBED_MODEL_URL"
 # _EDITABLE_CONFIG allowlist, so no API caller and no agent can point the
 # embedder at an arbitrary file.
 _MODEL_PATH_ENV = "KIROCREW_EMBED_MODEL_PATH"
-_DEFAULT_MODEL_URL = (
-    "https://d3j0sthz5doyui.cloudfront.net/models/qwen3-embedding-0.6b.gguf"
-)
+_DEFAULT_MODEL_URL = "https://d3j0sthz5doyui.cloudfront.net/models/qwen3-embedding-0.6b.gguf"
 _HTTP_TIMEOUT_SECS = 1800  # 610MB at >=340KB/s; slower links retry with backoff
 _HTTP_CHUNK_BYTES = 1 << 20
 # Written by the HTTP downloader every ~16MB so the status endpoint can report
@@ -156,6 +227,34 @@ _LIBS_DIR_NAME = "llama_cpp_libs"
 # from (see _vendor/llama_cpp/llama_cpp.py). An operator-set value wins, which
 # is the escape hatch for a GPU build or a hand-assembled lib dir.
 _LIB_PATH_ENV = "LLAMA_CPP_LIB_PATH"
+# The upstream Linux x86_64 CPU wheel is built with these code-generation
+# switches enabled. Its startup path executes the corresponding instructions
+# before llama.cpp can make a runtime dispatch decision, so loading it on a
+# weaker CPU raises SIGILL and kills the whole process. Linux exposes `pni` for
+# SSE3; the parser below normalizes that spelling to `sse3`.
+_LINUX_X86_64_REQUIRED_CPU_FLAGS = frozenset(
+    {"avx", "avx2", "bmi2", "f16c", "fma", "sse3", "ssse3"}
+)
+_LINUX_CPUINFO_PATH = Path("/proc/cpuinfo")
+
+#: MSVC runtime DLLs the vendored Windows libs IMPORT but which are not shipped
+#: beside them. All four ship with the Microsoft Visual C++ 2015-2022
+#: Redistributable, and a clean Windows install may carry none of them.
+#:
+#: Read off the PE import tables of the four DLLs in ``win_amd64`` rather than
+#: guessed: ``llama.dll`` and ``ggml.dll`` need the first three, and
+#: ``ggml-base.dll``/``ggml-cpu.dll`` additionally pull ``VCOMP140.DLL``, the MSVC
+#: OpenMP runtime. Both Linux payloads DO vendor their equivalent
+#: (``libgomp-*.so.1.0.0``), which is what makes this an omission on the Windows
+#: lane rather than a deliberate asymmetry. They are not vendored here because
+#: redistributing Microsoft's runtime is a licensing decision, not a packaging one
+#: — so the gap is reported precisely instead of being papered over.
+_WINDOWS_MSVC_RUNTIME_DLLS = (
+    "MSVCP140.dll",
+    "VCRUNTIME140.dll",
+    "VCRUNTIME140_1.dll",
+    "VCOMP140.DLL",
+)
 
 # The native-library closure every supported platform MUST ship, keyed by the
 # `llama_cpp_libs/<dir>` name. `libllama` is the entry point ctypes opens by
@@ -237,6 +336,54 @@ def _platform_libs_dirname() -> str | None:
     return None
 
 
+def _missing_windows_msvc_runtime() -> list[str]:
+    """Which MSVC runtime DLLs the vendored Windows libs need but cannot be found.
+
+    Probed BY NAME through the OS loader rather than by listing a directory, so the
+    answer reflects the same search the vendored DLLs' own imports will perform
+    (System32, the app directory, the DLL search path) instead of a guess about where
+    the redistributable installed itself.
+
+    Always empty off Windows: ``ctypes.WinDLL`` does not exist elsewhere.
+    """
+    if sys.platform != "win32":
+        return []
+    absent: list[str] = []
+    for name in _WINDOWS_MSVC_RUNTIME_DLLS:
+        try:
+            ctypes.WinDLL(name)
+        except OSError:
+            absent.append(name)
+    return absent
+
+
+def _linux_x86_64_cpu_flags(
+    cpuinfo_path: Path = _LINUX_CPUINFO_PATH,
+) -> frozenset[str] | None:
+    """Return features shared by every visible Linux x86_64 processor.
+
+    ``None`` means the host did not expose a usable feature list. Callers must
+    fail closed because a wrong optimistic answer can terminate the process
+    with SIGILL before Python can catch anything.
+    """
+    try:
+        cpuinfo = cpuinfo_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    per_cpu: list[frozenset[str]] = []
+    for line in cpuinfo.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() == "flags":
+            flags = {flag.lower() for flag in value.split()}
+            if "pni" in flags:
+                flags.add("sse3")
+            per_cpu.append(frozenset(flags))
+    if not per_cpu:
+        return None
+    return frozenset.intersection(*per_cpu)
+
+
 def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     """Report vendored native libs that :data:`_REQUIRED_VENDORED_LIBS` expects but are absent.
 
@@ -245,7 +392,7 @@ def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     running one. ``root`` defaults to the installed ``_vendor`` directory, so
     the same check runs against a source tree, an unpacked sdist, or an
     installed wheel — that cross-lane reuse is the point, since each packaging
-    lane (sdist rules, wheel package_data, PyInstaller spec) selects these
+    lane (sdist rules, wheel package_data) selects these
     files by a different mechanism and can therefore drop them independently.
 
     A platform dir that is entirely absent is reported as missing all of its
@@ -283,6 +430,25 @@ def _install_diskcache_stub() -> None:
     stub.Cache = Cache  # type: ignore[attr-defined]
     stub.FanoutCache = Cache  # type: ignore[attr-defined]
     sys.modules["diskcache"] = stub
+
+
+def _harden_llama_null_streams() -> None:
+    """Make llama-cpp-python's process-global suppression streams Unicode-safe.
+
+    The vendored suppressor temporarily assigns its import-time ``os.devnull``
+    handles to ``sys.stdout`` and ``sys.stderr`` while a model loads. That load
+    runs on a background thread, so unrelated gateway output can reach those
+    handles. Reconfiguring the existing wrappers preserves the native ``dup2``
+    suppression while removing the host locale from that process-wide window.
+    """
+    llama_utils = sys.modules.get("llama_cpp._utils")
+    if llama_utils is None:
+        return
+    for name in ("outnull_file", "errnull_file"):
+        stream = getattr(llama_utils, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 @functools.lru_cache(maxsize=1)
@@ -337,6 +503,51 @@ def _load_llama_class():
                 _LIB_PATH_ENV,
             )
             return None
+        if libs_dirname == "win_amd64":
+            # Named rather than left to surface as the loader's own
+            # "[WinError 126] The specified module could not be found", which points
+            # at the library being opened rather than at the runtime it imports and
+            # so reads as a broken platform. Same reasoning as the missing-files
+            # branch above: the fix here is one download, and an operator cannot
+            # guess it from a WinError.
+            missing_runtime = _missing_windows_msvc_runtime()
+            if missing_runtime:
+                logger.warning(
+                    "The bundled Windows llama.cpp runtime needs the Microsoft Visual "
+                    "C++ 2015-2022 Redistributable (x64); this host is missing %s. "
+                    "Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe "
+                    "and restart Kiro Crew. Memory falls back to keyword search until "
+                    "then. Set %s to use an operator-provided runtime instead.",
+                    ", ".join(missing_runtime),
+                    _LIB_PATH_ENV,
+                )
+                return None
+        if libs_dirname == "linux_x86_64":
+            cpu_flags = _linux_x86_64_cpu_flags()
+            if cpu_flags is None:
+                logger.warning(
+                    "Cannot verify CPU compatibility for the bundled Linux x86_64 "
+                    "llama.cpp runtime from %s. Refusing the native runtime because "
+                    "an unsupported instruction would terminate the gateway; memory "
+                    "falls back to keyword search. Set %s to use an operator-provided "
+                    "runtime.",
+                    _LINUX_CPUINFO_PATH,
+                    _LIB_PATH_ENV,
+                )
+                return None
+            missing_cpu_flags = sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS - cpu_flags)
+            if missing_cpu_flags:
+                logger.warning(
+                    "Bundled Linux x86_64 llama.cpp runtime requires CPU features "
+                    "%s; this host is missing %s. Refusing the native runtime because "
+                    "it would terminate the gateway with SIGILL; memory falls back to "
+                    "keyword search. Set %s to use a compatible operator-provided "
+                    "runtime.",
+                    ", ".join(sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS)),
+                    ", ".join(missing_cpu_flags),
+                    _LIB_PATH_ENV,
+                )
+                return None
     # setdefault so an operator-provided override (e.g. a GPU build) wins.
     os.environ.setdefault(_LIB_PATH_ENV, str(libs_dir))
     _install_diskcache_stub()
@@ -346,6 +557,7 @@ def _load_llama_class():
     try:
         from llama_cpp import Llama  # noqa: F811
 
+        _harden_llama_null_streams()
         return Llama
     except Exception:
         logger.warning("Vendored llama-cpp-python failed to import", exc_info=True)
@@ -382,6 +594,162 @@ def _read_memory_config() -> dict:
     except Exception:
         logger.debug("Could not read the memory config section", exc_info=True)
     return {}
+
+
+def _embed_threads() -> int:
+    """Thread count for llama.cpp's embedding compute pools.
+
+    Read from the RAW ``memory`` config section for the same reason the rest of
+    this module does: the download thread and the backend factory must not pull
+    in the full config dataclass import graph. Clamped to ``[1, cpu_count]`` so a
+    typo cannot hand llama.cpp a zero, a negative, or a count far above the
+    machine's cores.
+    """
+    raw = _read_memory_config().get("embedding_threads")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raw = _DEFAULT_EMBED_THREADS
+    return max(1, min(raw, os.cpu_count() or _DEFAULT_EMBED_THREADS))
+
+
+def bulk_embed_threads() -> int:
+    """Thread count for ``PRIORITY_BULK`` inference, from ``memory``.
+
+    Defaults to :data:`_DEFAULT_BULK_THREADS` — one thread, because nothing is
+    waiting on bulk work and a single thread is what keeps it off the fans. An
+    explicit 0 means "inherit :func:`_embed_threads`", which is how a deployment
+    opts back into the interactive pool for its sweeps. A value above the
+    interactive count is honoured (a server that wants the sweep done fast is a
+    legitimate choice) but still clamped to the machine's cores.
+    """
+    raw = _read_memory_config().get("embedding_bulk_threads")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raw = _DEFAULT_BULK_THREADS
+    elif raw == 0:
+        return _embed_threads()
+    return max(1, min(raw, os.cpu_count() or _DEFAULT_EMBED_THREADS))
+
+
+def bulk_duty_cycle() -> float:
+    """Fraction of wall time a bulk corpus loop targets for inference.
+
+    A target rather than a ceiling: :func:`bulk_pace_delay` caps one pause at
+    :data:`_MAX_BULK_PACE_SLEEP`, so a row slow enough to ask for more idle than
+    that runs at a higher effective duty than configured.
+
+    1.0 disables pacing (the pre-existing behaviour). Anything else is clamped to
+    ``[_MIN_BULK_DUTY, 1.0]``, so a typo cannot stretch a sweep to the point
+    where it looks stalled. Bools are rejected before ``isinstance(x, int)`` can
+    accept ``True`` as 1.
+
+    Non-finite values are rejected explicitly rather than left to the clamp. This
+    reads the RAW config section — the loader's ``_safe_float`` guard is NOT in
+    the path — and ``json.load`` accepts the ``NaN`` literal, which compares
+    false against every bound and would slip through ``max()`` unchanged.
+
+    ``float()`` itself can raise: ``json.load`` yields arbitrary-precision ints,
+    and one wider than a double (a 309-digit integer) raises ``OverflowError``.
+    That would propagate out through ``bulk_pace_delay`` into the sweep and abort
+    it, leaving every pending row NULL — a config typo must degrade to the
+    default, never stop the sweep.
+    """
+    raw = _read_memory_config().get("embedding_bulk_duty")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raw = _DEFAULT_BULK_DUTY
+    try:
+        duty = float(raw)
+    except (OverflowError, ValueError):
+        duty = _DEFAULT_BULK_DUTY
+    if not math.isfinite(duty):
+        duty = _DEFAULT_BULK_DUTY
+    if duty >= 1.0:
+        return 1.0
+    return max(_MIN_BULK_DUTY, duty)
+
+
+def bulk_pace_delay(elapsed: float) -> float:
+    """Seconds a bulk loop should idle after a unit of work taking *elapsed*.
+
+    Duty *d* means work occupies ``d`` of the cycle, so the idle share is
+    ``elapsed * (1 - d) / d`` — at ``d = 0.5`` the loop sleeps for exactly as
+    long as it worked. Returns 0.0 when pacing is off, and never returns more
+    than :data:`_MAX_BULK_PACE_SLEEP`.
+
+    Callers sleep in their OWN thread and hold no model lock while doing so, so
+    an interactive embed arriving mid-pause is served at full speed rather than
+    waiting out the pause. That is why this returns a delay for the caller to
+    honour instead of sleeping inside the shared inference worker.
+    """
+    if elapsed <= 0:
+        return 0.0
+    duty = bulk_duty_cycle()
+    if duty >= 1.0:
+        return 0.0
+    return min(elapsed * (1.0 - duty) / duty, _MAX_BULK_PACE_SLEEP)
+
+
+def _chars_bucket(chars: int) -> str:
+    """Low-cardinality size band for the inference metric.
+
+    Bucketed rather than raw so the metric can separate a short interactive query
+    from a bulk consolidation block without an unbounded attribute domain.
+    """
+    for bound in (128, 512, 2000, 6000):
+        if chars <= bound:
+            return f"<={bound}"
+    return ">6000"
+
+
+def _emit_embed_timing(
+    t0: float,
+    t_started: float,
+    texts: "list[str]",
+    *,
+    priority: int = PRIORITY_NORMAL,
+    failed: bool = False,
+) -> None:
+    """Report queue wait and model time separately for one embed call.
+
+    The split is the point. ``infer_ms`` is the model's own cost. ``wait_ms`` is
+    this call blocked on the queue while ANOTHER caller's embed ran, because the
+    whole process is serialized onto one model on one inference thread. A short
+    interactive embed reporting a large ``wait_ms`` is therefore not slow, it is
+    queued behind bulk background work — and that is a different defect with a
+    different fix than slow inference.
+    """
+    now = time.monotonic()
+    # Clamped: monotonic makes a negative value impossible on the real path, but a
+    # negative sample is silently REJECTED by the recorder (losing the datapoint)
+    # and logs a warning, so a clock edge case must not cost us the measurement.
+    wait_ms = max(0.0, (t_started - t0) * 1000.0)
+    infer_ms = max(0.0, (now - t_started) * 1000.0)
+    chars = sum(len(t) for t in texts)
+    # BULK stays at DEBUG however long it waited. Being preempted is the DESIGNED
+    # outcome for a corpus sweep, not news, and a migration preempted row-by-row
+    # would otherwise emit thousands of INFO lines and bury the interactive ones
+    # this log exists to surface.
+    reportable = wait_ms >= _EMBED_WAIT_LOG_MS and priority != PRIORITY_BULK
+    level = logging.INFO if reportable else logging.DEBUG
+    logger.log(
+        level,
+        "Embed timing: wait=%.0fms infer=%.0fms n=%d chars=%d prio=%d%s",
+        wait_ms,
+        infer_ms,
+        len(texts),
+        chars,
+        priority,
+        " FAILED" if failed else "",
+    )
+    try:
+        recorder = get_recorder()
+        recorder.histogram("kirocrew.embed.queue_wait", wait_ms, unit="ms")
+        recorder.histogram(
+            "kirocrew.embed.inference",
+            infer_ms,
+            unit="ms",
+            attrs={"chars_bucket": _chars_bucket(chars)},
+        )
+    except Exception:
+        logger.debug("Embed timing metric emission failed", exc_info=True)
 
 
 class CustomModelSpec(NamedTuple):
@@ -880,12 +1248,18 @@ class EmbeddingBackend(abc.ABC):
         """True when the backend can produce vectors right now (model loaded)."""
 
     @abc.abstractmethod
-    def embed(self, text: str) -> "list[float] | None":
-        """Embed a single text. Returns None on any failure."""
+    def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> "list[float] | None":
+        """Embed one text, or None when unavailable.
+
+        *priority* orders competing callers on the shared model (``PRIORITY_*``).
+        Implementations that do not queue may ignore it.
+        """
 
     @abc.abstractmethod
-    def embed_batch(self, texts: "list[str]") -> "list[list[float]] | None":
-        """Embed multiple texts. Returns None on any failure."""
+    def embed_batch(
+        self, texts: "list[str]", *, priority: int = PRIORITY_NORMAL
+    ) -> "list[list[float]] | None":
+        """Embed several texts, or None when unavailable. See :meth:`embed`."""
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -898,7 +1272,7 @@ class EmbeddingBackend(abc.ABC):
 class _InferJob:
     """One ``create_embedding`` call handed to the embedder's worker thread."""
 
-    __slots__ = ("llm", "texts", "result", "error", "done")
+    __slots__ = ("llm", "texts", "result", "error", "done", "started")
 
     def __init__(self, llm: object, texts: "list[str]") -> None:
         self.llm = llm
@@ -906,6 +1280,9 @@ class _InferJob:
         self.result: object | None = None
         self.error: BaseException | None = None
         self.done = threading.Event()
+        # Set by the worker once it actually begins inference, so the caller can
+        # separate time spent QUEUED from time spent in the model.
+        self.started: float = 0.0
 
 
 class LlamaCppEmbedder(EmbeddingBackend):
@@ -953,9 +1330,37 @@ class LlamaCppEmbedder(EmbeddingBackend):
         self._lock = threading.Lock()  # serializes inference (Llama is not thread-safe)
         self._load_lock = threading.Lock()  # guards loader-thread spawn state
         self._load_thread: threading.Thread | None = None
-        # Single owned inference thread + its job queue (see the class docstring).
-        self._jobs: "queue.SimpleQueue[_InferJob | None]" = queue.SimpleQueue()
+        # Single owned inference thread + its PRIORITY job queue (see the class
+        # docstring). Items are ``(priority, seq, job)``. ``seq`` is a strictly
+        # increasing tiebreaker, which makes the ordering stable — equal
+        # priorities stay FIFO — and also means the heap never has to compare two
+        # _InferJob objects, which are not orderable.
+        self._jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]" = queue.PriorityQueue()
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        # Thread count currently programmed into the loaded context, and whether
+        # this backend can reprogram it at all. Both are touched ONLY by the
+        # single inference worker, under ``_lock``, so they need no lock of their
+        # own. ``None`` means "not yet known" — the count llama.cpp got at load
+        # time is _embed_threads(), but re-deriving that here would go stale if
+        # the config changed since, so the worker programs it explicitly on the
+        # first job instead of assuming.
+        self._applied_threads: int | None = None
+        self._thread_class_unsupported = False
+        # Guards the DISPATCH state — (_infer_thread, _jobs) selection, worker
+        # spawn, and the enqueue — as one atomic step. Deliberately NOT _lock:
+        # the worker holds _lock across inference, so enqueueing under it would
+        # block every submitter behind the in-flight embed and put at most one
+        # job in the queue, which is exactly the condition that made priority
+        # meaningless before. Held only for a heap push, never across inference,
+        # a join, or a model load.
+        self._dispatch_lock = threading.Lock()
         self._infer_thread: threading.Thread | None = None
+
+    def _next_seq(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
 
     @property
     def model_path(self) -> Path:
@@ -1044,13 +1449,27 @@ class LlamaCppEmbedder(EmbeddingBackend):
             return
         try:
             started = time.monotonic()
+            threads = _embed_threads()
             llm = llama_cls(
                 model_path=str(self._model_path),
                 embedding=True,
                 pooling_type=_POOLING_TYPE_LAST,
                 n_ctx=_N_CTX,
+                # n_batch == n_ctx so the logical batch always covers the whole
+                # input in one go, which last-token pooling needs. This used to
+                # also size a ~1.24 GB per-token logits buffer in the vendored
+                # constructor; that buffer is now skipped entirely in embedding
+                # mode (see the `n_score_rows` divergence comment in
+                # src/kiro_crew/_vendor/llama_cpp/llama.py, issue #6827), so
+                # n_batch no longer trades memory against input length.
                 n_batch=_N_CTX,
-                n_ubatch=_N_CTX,
+                n_ubatch=_N_UBATCH,
+                # Both pools are pinned. Embedding is prompt processing, so the
+                # BATCH pool is the one that actually runs, but leaving the
+                # generation pool at llama.cpp's cpu//2 default would still size
+                # a second oversubscribed pool on this thread.
+                n_threads=threads,
+                n_threads_batch=threads,
                 verbose=False,
             )
             # Validate the model's REAL output width against the configured dim
@@ -1114,6 +1533,15 @@ class LlamaCppEmbedder(EmbeddingBackend):
                     except Exception:  # noqa: BLE001 - freeing must not propagate
                         logger.debug("Freeing abandoned model failed", exc_info=True)
                 return
+            # A fresh context carries llama.cpp's load-time thread count, so the
+            # count the worker last programmed no longer describes it. Clear the
+            # record BEFORE publishing, or the first job on the new context would
+            # match the stale count and skip programming entirely — leaving a
+            # bulk sweep on the interactive pool (or the reverse) with nothing to
+            # show why. Written from the loader thread and read by the inference
+            # worker; both are single plain-attribute accesses (GIL-atomic), and
+            # the only cost of racing is one redundant set_n_threads call.
+            self._applied_threads = None
             self._llm = llm  # atomic publish (GIL)
         except Exception:
             logger.warning("Failed to load embedding model %s", self._model_path, exc_info=True)
@@ -1138,7 +1566,7 @@ class LlamaCppEmbedder(EmbeddingBackend):
             logger.debug("Could not probe embedding dim", exc_info=True)
             return None
 
-    def _infer_loop(self, jobs: "queue.SimpleQueue[_InferJob | None]") -> None:
+    def _infer_loop(self, jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]") -> None:
         """Worker body: run queued ``create_embedding`` calls, one at a time.
 
         ``jobs`` is passed in rather than read from ``self`` so this worker is
@@ -1150,55 +1578,161 @@ class LlamaCppEmbedder(EmbeddingBackend):
         waiting on ``job.done``. ``None`` is the shutdown sentinel from
         :meth:`close`; exiting the thread is what releases llama.cpp's compute
         pool.
+
+        This worker — NOT the caller — holds ``_lock`` across inference. That is
+        what lets the queue's priority mean anything: while the caller held it,
+        every other caller blocked *before* it could enqueue, so at most one job
+        was ever queued and there was nothing to order. Serialization is
+        unchanged, because a single owner thread running under ``_lock`` is
+        strictly no more concurrent than a single caller holding it was.
         """
         while True:
-            job = jobs.get()
+            prio, _seq, job = jobs.get()
             if job is None:
+                # close() has already dropped the model. Anything queued behind
+                # the sentinel would otherwise wait on job.done forever, since
+                # no worker will serve this queue again — fail them explicitly.
+                self._drain_orphans(jobs)
                 return
             try:
-                job.result = job.llm.create_embedding(job.texts)  # type: ignore[attr-defined]
+                with self._lock:
+                    self._apply_thread_class(job.llm, prio)
+                    job.started = time.monotonic()
+                    job.result = job.llm.create_embedding(job.texts)  # type: ignore[attr-defined]
             except BaseException as exc:  # noqa: BLE001 - relayed to the caller verbatim
                 job.error = exc
             finally:
                 job.done.set()
 
-    def _create_embedding(self, llm: object, texts: "list[str]") -> object:
-        """Run one ``create_embedding`` on the owned thread; re-raise its error.
+    def _apply_thread_class(self, llm: object, priority: int) -> None:
+        """Program llama.cpp's compute pools for this job's scheduling class.
 
-        Caller must hold ``_lock``, which keeps at most one job in flight.
-        The wait is unbounded, matching the previous inline call — a wedged
-        native inference blocked the caller then too.
+        A BULK job may run on fewer threads than an interactive one
+        (``memory.embedding_bulk_threads``), so a minutes-long corpus sweep does
+        not hold most of the box while a human is typing. The count is a property
+        of the CONTEXT, not of the call, so it is resolved per job — the config
+        read is a small uncached parse and the ``llama_set_n_threads`` call just
+        stores two ints, both negligible against the ~100–400 ms inference this
+        precedes on the same thread. The native call is skipped when the class
+        did not change, which is the steady state.
+
+        Fail-soft by design: a backend without a reprogrammable context (a stub,
+        a future non-llama.cpp backend) keeps whatever it loaded with, warns
+        once, and never retries. Losing the dial must never lose the embedding.
         """
-        thread = self._infer_thread
-        if thread is None or not thread.is_alive():
-            # New worker, new queue. A straggler left behind by a timed-out
-            # close() join keeps draining its OWN queue, so it can neither
-            # consume this worker's jobs nor eat this worker's future sentinel.
-            self._jobs = queue.SimpleQueue()
-            thread = threading.Thread(
-                target=self._infer_loop, args=(self._jobs,), name="kc-embed-infer", daemon=True
+        if self._thread_class_unsupported:
+            return
+        want = bulk_embed_threads() if priority >= PRIORITY_BULK else _embed_threads()
+        if want == self._applied_threads:
+            return
+        ctx = getattr(llm, "_ctx", None)
+        setter = getattr(ctx, "set_n_threads", None)
+        if not callable(setter):
+            self._thread_class_unsupported = True
+            logger.debug(
+                "Embedding backend cannot reprogram its thread count; "
+                "memory.embedding_bulk_threads has no effect"
             )
-            self._infer_thread = thread
-            thread.start()
-        jobs = self._jobs
+            return
+        try:
+            setter(want, want)
+        except Exception:
+            # Leave _applied_threads alone: the context is still running whatever
+            # it had, and pretending otherwise would skip the next attempt.
+            self._thread_class_unsupported = True
+            logger.debug("Could not set embedding thread count", exc_info=True)
+            return
+        self._applied_threads = want
+
+    @staticmethod
+    def _drain_orphans(
+        jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]",
+    ) -> None:
+        """Fail every job left on a retired queue so no caller waits forever."""
+        while True:
+            try:
+                _prio, _seq, job = jobs.get_nowait()
+            except queue.Empty:
+                return
+            if job is None:
+                continue
+            job.error = RuntimeError("embedding backend closed before this job ran")
+            job.done.set()
+
+    def _submit_infer(
+        self, llm: object, texts: "list[str]", priority: int = PRIORITY_NORMAL
+    ) -> "_InferJob":
+        """Queue one inference for the owned thread and wait for the job to finish.
+
+        Returns the completed job rather than its result, so the caller can read
+        ``job.started`` and tell queue wait apart from model time. Errors are
+        left ON the job; :meth:`_create_embedding` is the raising wrapper.
+
+        The caller does NOT hold ``_lock`` — the worker takes it around the
+        actual inference — so several callers can have work queued at once and
+        *priority* decides who the single model serves next. The wait is
+        unbounded, matching the previous inline call: a wedged native inference
+        blocked the caller then too.
+        """
         job = _InferJob(llm, texts)
-        jobs.put(job)
+        with self._dispatch_lock:
+            # Retirement check, worker selection/spawn and the enqueue are ONE
+            # atomic step. Split, they lose two ways: two callers racing an
+            # absent worker each spawn one and orphan the loser's thread, and a
+            # close() landing between the worker check and the enqueue puts the
+            # job on a queue no worker will ever serve, so job.done is never set
+            # and the caller blocks forever on an unbounded wait.
+            if self._closed or not self._serving or llm is not self._llm:
+                # The backend was retired or swapped while this call was in
+                # flight. Fail the job here rather than queueing it into a space
+                # nothing will drain; embed_batch turns this into None, which is
+                # the ABC's documented "no embedding available".
+                job.error = RuntimeError("embedding backend retired before this job was queued")
+                job.done.set()
+                return job
+            thread = self._infer_thread
+            if thread is None or not thread.is_alive():
+                # New worker, new queue. A straggler left behind by a timed-out
+                # close() join keeps draining its OWN queue, so it can neither
+                # consume this worker's jobs nor eat this worker's future sentinel.
+                self._jobs = queue.PriorityQueue()
+                thread = threading.Thread(
+                    target=self._infer_loop,
+                    args=(self._jobs,),
+                    name="kc-embed-infer",
+                    daemon=True,
+                )
+                self._infer_thread = thread
+                thread.start()
+            self._jobs.put((priority, self._next_seq(), job))
+        # Wait OUTSIDE the lock: the wait is unbounded, and holding the dispatch
+        # lock across it would serialize every submitter behind this one job.
         job.done.wait()
+        return job
+
+    def _create_embedding(
+        self, llm: object, texts: "list[str]", priority: int = PRIORITY_NORMAL
+    ) -> object:
+        """Run one ``create_embedding`` on the owned thread; re-raise its error."""
+        job = self._submit_infer(llm, texts, priority)
         if job.error is not None:
             raise job.error
         return job.result
 
-    def embed(self, text: str) -> list[float] | None:
+    def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed a single text. Returns None on any failure."""
-        result = self.embed_batch([text])
+        result = self.embed_batch([text], priority=priority)
         return result[0] if result else None
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]] | None:
+    def embed_batch(
+        self, texts: list[str], *, priority: int = PRIORITY_NORMAL
+    ) -> list[list[float]] | None:
         """Embed multiple texts. Returns None on any failure (incl. model not loaded yet).
 
         Never blocks on the model load: when the model isn't in memory yet this
-        kicks a background load and returns ``None`` immediately. Inference on a
-        loaded model is serialized behind ``_lock`` (tens of ms per short text).
+        kicks a background load and returns ``None`` immediately. Inference is
+        serialized onto one owned thread; *priority* decides the order that
+        single model serves competing callers (see ``PRIORITY_*``).
         """
         if not texts or not any(t.strip() for t in texts):
             return None
@@ -1216,13 +1750,26 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 logger.debug("Truncating embed input %d -> %d chars", len(t), _MAX_EMBED_CHARS)
                 t = t[:_MAX_EMBED_CHARS]
             clipped.append(t)
-        with self._lock:
-            try:
-                resp = self._create_embedding(llm, clipped)
-                vectors = [item["embedding"] for item in resp["data"]]  # type: ignore[index]
-            except Exception:
-                logger.debug("In-process embed failed", exc_info=True)
-                return None
+        _t0 = time.monotonic()
+        job = self._submit_infer(llm, clipped, priority)
+        # started==0 means the worker never reached inference (drained orphan).
+        _started = job.started or time.monotonic()
+        if job.error is not None:
+            if not isinstance(job.error, Exception):
+                # BaseException (KeyboardInterrupt/SystemExit) is relayed to the
+                # caller verbatim, as it was when the call ran inline.
+                _emit_embed_timing(_t0, _started, clipped, priority=priority, failed=True)
+                raise job.error
+            logger.debug("In-process embed failed", exc_info=job.error)
+            _emit_embed_timing(_t0, _started, clipped, priority=priority, failed=True)
+            return None
+        try:
+            vectors = [item["embedding"] for item in job.result["data"]]  # type: ignore[index]
+        except Exception:
+            logger.debug("In-process embed failed", exc_info=True)
+            _emit_embed_timing(_t0, _started, clipped, priority=priority, failed=True)
+            return None
+        _emit_embed_timing(_t0, _started, clipped, priority=priority)
         if len(vectors) != len(clipped) or not vectors or not vectors[0]:
             logger.warning(
                 "Unexpected embedding response (got %d vectors for %d texts)",
@@ -1281,15 +1828,25 @@ class LlamaCppEmbedder(EmbeddingBackend):
             self._llm = None
             self._load_failed_at = 0.0
             self._load_thread = None
-            thread, self._infer_thread = self._infer_thread, None
-            if thread is not None and thread.is_alive():
-                # Holding _lock means no job can be queued behind this sentinel.
-                # If the join times out, the straggler stays parked on THIS
-                # queue, which the next worker will not share (see
-                # _create_embedding), so the sentinel it eventually consumes is
-                # still its own.
-                self._jobs.put(None)
-                thread.join(_INFER_STOP_TIMEOUT_SECS)
+            # Same lock the submitters use, so a retirement can never interleave
+            # with a dispatch: a caller either enqueues onto a live worker before
+            # this runs, or sees the retired state and fails fast.
+            with self._dispatch_lock:
+                thread, self._infer_thread = self._infer_thread, None
+                # Retire the queue at the same time as the thread, so a late caller
+                # cannot enqueue onto a queue that is shutting down.
+                jobs, self._jobs = self._jobs, queue.PriorityQueue()
+                if thread is not None and thread.is_alive():
+                    # The sentinel outranks queued work, so a large sweep already
+                    # in the queue cannot delay shutdown. The worker fails
+                    # anything still queued on its way out (_drain_orphans)
+                    # rather than leaving a caller waiting on job.done.
+                    jobs.put((_PRIORITY_SENTINEL, self._next_seq(), None))
+        # Join OUTSIDE _lock. The WORKER now holds _lock around inference, so
+        # joining while holding it would deadlock against a job that was dequeued
+        # just before the sentinel until the timeout expired.
+        if thread is not None and thread.is_alive():
+            thread.join(_INFER_STOP_TIMEOUT_SECS)
 
 
 _shared_embedder: EmbeddingBackend | None = None
@@ -1415,7 +1972,7 @@ _SSL_CA_PATHS = (
 def _make_ssl_context() -> ssl.SSLContext:
     """Create an SSL context that finds system CA certs on all supported platforms.
 
-    Bundled Python runtimes (like the PyInstaller desktop backend) may not ship
+    Bundled Python runtimes (like the desktop backend's interpreter) may not ship
     their own CA bundle and rely on ``ssl.SSLContext.load_default_certs()`` which
     calls OpenSSL's defaults — those can miss when the compiled-in cert path
     doesn't match the host OS (common on AL2 with cross-compiled Python).
@@ -1423,9 +1980,7 @@ def _make_ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     try:
         ctx.load_default_certs()
-        # Verify the defaults work by checking the cert store has entries
-        stats = ctx.cert_store_stats()
-        if stats["x509_ca"] > 0:
+        if _ssl_context_has_ca_trust(ctx):
             return ctx
     except ssl.SSLError:
         pass
@@ -1770,6 +2325,13 @@ def make_sync_embed_fn() -> Callable[[str], "list[float] | None"]:
     ``None`` until the model is resident.
     """
 
+    # Priority travels OUT OF BAND rather than as a cached argument: adding it to
+    # the lru_cache key would re-embed the same text once per priority, losing the
+    # reuse that currently lets episodic recall ride on the lessons embed of the
+    # identical query. Thread-local is safe because embed() blocks on the calling
+    # thread — the hand-off to kc-embed-infer happens inside it.
+    _call_priority = threading.local()
+
     @functools.lru_cache(maxsize=_EMBED_CACHE_MAX)
     def _cached_embed(text: str, model_id: str) -> tuple[float, ...]:
         del model_id  # cache-key only — routes stale entries away after a backend swap
@@ -1782,15 +2344,24 @@ def make_sync_embed_fn() -> Callable[[str], "list[float] | None"]:
                 info.currsize,
                 info.maxsize,
             )
-        vec = get_shared_embedder().embed(text)
+        vec = get_shared_embedder().embed(
+            text, priority=getattr(_call_priority, "value", PRIORITY_NORMAL)
+        )
         if vec is None:
             raise _EmbedFailed
         return tuple(vec)
 
-    def _embed(text: str) -> list[float] | None:
+    def _embed(text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
+        _call_priority.value = priority
         try:
             return list(_cached_embed(text, get_shared_embedder().model_id))
         except _EmbedFailed:
             return None
+        finally:
+            _call_priority.value = PRIORITY_NORMAL
 
+    # Explicit capability flag rather than a TypeError probe: a TypeError raised
+    # from INSIDE a custom embed_fn must not be misread as "does not take a
+    # priority", which would silently downgrade every call to the default.
+    _embed.accepts_priority = True  # type: ignore[attr-defined]
     return _embed

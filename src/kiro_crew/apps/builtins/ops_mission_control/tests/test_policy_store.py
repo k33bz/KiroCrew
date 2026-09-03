@@ -10,10 +10,12 @@ write. Found in review; fixed by moving them to `ops_mission_control_policy.json
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +26,10 @@ from kiro_crew import platform_compat
 class _HomeIsolated(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
+        # addCleanup on the line after mkdtemp: unittest skips tearDown when
+        # setUp raises, so an rmtree there leaks the directory on every setUp
+        # failure.
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self._prev = os.environ.get("KIROCREW_HOME")
         os.environ["KIROCREW_HOME"] = str(self.tmp)
 
@@ -32,7 +38,6 @@ class _HomeIsolated(unittest.TestCase):
             os.environ.pop("KIROCREW_HOME", None)
         else:
             os.environ["KIROCREW_HOME"] = self._prev
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 class TestTheCeilingIsOnTheKeystoneFloor(_HomeIsolated):
@@ -647,3 +652,202 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
                         source,
                         f"{writer.__name__} delegates but also touches the file directly",
                     )
+
+
+class TestPolicyLockdownOrdering(_HomeIsolated):
+    """The ceiling's write must never publish a file it has not protected.
+
+    Ports the previous-store-survival recipe from
+    ``test/test_aws_consent.py::TestGrantIsOnTheKeystoneFloor``: every failure
+    inside ``atomic_write`` happens BEFORE the rename, so a transient lockdown
+    or write failure can no longer reach — let alone delete — the previous,
+    healthy ceiling (the old post-publish ``restrict_to_owner`` + unlink-on-
+    OSError shape silently reset the operator's autonomy policy on one lockdown
+    failure).
+    """
+
+    def test_write_lockdown_precedes_content(self):
+        """Measured by the file's SIZE at lockdown time — zero means no policy
+        byte existed yet. A post-write stat passes on the buggy ordering too,
+        so it would not be a regression test."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import (
+            models,
+            policy_store,
+        )
+
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring(target):
+            sizes.append(os.stat(target).st_size)
+            return real_restrict(target)
+
+        with mock.patch("kiro_crew.platform_compat.restrict_to_owner", _measuring):
+            policy_store.set_mode(models.MODE_OBSERVE)
+
+        self.assertTrue(sizes, "premise: the lockdown ran at all")
+        self.assertEqual(
+            sizes[0], 0,
+            f"the file already held payload bytes when it was locked down: {sizes[0]} bytes",
+        )
+
+    def test_a_failed_lockdown_preserves_the_previous_ceiling(self):
+        from kiro_crew.apps.builtins.ops_mission_control.backend import (
+            models,
+            policy_store,
+        )
+
+        policy_store.set_mode(models.MODE_OBSERVE)
+        before = policy_store.policy_path().read_bytes()
+
+        def _refuse(_target):
+            raise OSError("cannot resolve the invoking user's SID")
+
+        with mock.patch("kiro_crew.platform_compat.restrict_to_owner", _refuse):
+            with self.assertRaises(OSError):
+                policy_store.set_mode(models.MODE_ACT)
+
+        self.assertEqual(
+            policy_store.policy_path().read_bytes(), before,
+            "the previous ceiling was altered",
+        )
+        self.assertEqual(
+            policy_store.read_mode("unset"), models.MODE_OBSERVE,
+            "a failed new write destroyed the previously recorded ceiling",
+        )
+
+    def test_a_failed_payload_write_preserves_the_previous_ceiling(self):
+        """Same property for an ordinary write failure (disk full creating the
+        temp file), which never even reaches the lockdown."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import (
+            models,
+            policy_store,
+        )
+
+        policy_store.set_mode(models.MODE_OBSERVE)
+        before = policy_store.policy_path().read_bytes()
+
+        def _no_space(*_a, **_kw):
+            raise OSError("no space left on device")
+
+        # Scope the failure to atomic_write's own tempfile binding — patching
+        # the shared stdlib module attribute would hand a spurious ENOSPC to
+        # every other mkstemp caller alive in this worker.
+        with mock.patch(
+            "kiro_crew.atomic_write.tempfile", types.SimpleNamespace(mkstemp=_no_space)
+        ):
+            with self.assertRaises(OSError):
+                policy_store.set_mode(models.MODE_ACT)
+
+        self.assertEqual(
+            policy_store.policy_path().read_bytes(), before,
+            "the previous ceiling was altered",
+        )
+        self.assertEqual(
+            policy_store.read_mode("unset"), models.MODE_OBSERVE,
+            "a transient write failure destroyed the previously recorded ceiling",
+        )
+
+
+class TestTheCeilingIsNeverPublishedOverAFailedRead(_HomeIsolated):
+    """The BASE read of a read-modify-write may not fail open.
+
+    ``_read`` collapses every failure to ``{}``, which is right for the gate
+    readers — an unreadable ceiling resolves to ``observe`` with no act-rules,
+    the most restrictive answer, not a permissive one. It is wrong as the base of
+    ``set_ceiling``/``put``, which rewrite the WHOLE file: there ``{}`` means
+    "discard every other operator-only key", and this one file holds ALL of them
+    — the ceiling, the ledger remote, the Slack channel, the rotation identity,
+    the primary-instance flag.
+
+    Every one of those falls back to a value the agent CAN influence, so a
+    transient EACCES reproduces by accident the exact bypass the keystone floor
+    exists to prevent. The class above proved a failed WRITE cannot reach the
+    previous ceiling; a failed READ went around it, because the write that
+    followed succeeded — it just wrote a document with everything missing.
+    """
+
+    def _unreadable_policy(self):
+        """Fail ONLY the policy file's read, as a transient EACCES would.
+
+        Scoped by path: a blanket ``read_text`` failure would also break home
+        resolution and ``config.json``, and the test would pass for the wrong
+        reason.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        target = policy_store.policy_path()
+        real_read_text = Path.read_text
+
+        def _guarded(path_self, *args, **kwargs):
+            if Path(path_self) == target:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", _guarded)
+
+    def test_a_read_that_failed_never_truncates_the_ceiling(self):
+        """The durable harm, asserted directly: every OTHER operator-only key
+        the operator set must still be on the fenced floor afterwards."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        policy_store.set_ceiling(mode="observe", rules=[])
+        policy_store.put("slack_channel", "#ops-the-operator-chose")
+        policy_store.put("ledger_sync_remote", "https://git.example/ops-ledger.git")
+        before = policy_store.policy_path().read_bytes()
+
+        with self._unreadable_policy():
+            with contextlib.suppress(OSError):
+                policy_store.set_ceiling(mode="act")
+            with contextlib.suppress(OSError):
+                policy_store.put("primary_instance", True)
+
+        self.assertEqual(
+            policy_store.policy_path().read_bytes(), before,
+            "a failed read was published back over the ceiling",
+        )
+        self.assertEqual(
+            policy_store.get("slack_channel"), "#ops-the-operator-chose",
+            "a failed read dropped the operator's outbound destination",
+        )
+        self.assertEqual(
+            policy_store.get("ledger_sync_remote"), "https://git.example/ops-ledger.git",
+            "a failed read dropped the operator's ledger remote",
+        )
+
+    def test_an_unreadable_ceiling_refuses_the_write(self):
+        """The operator must be told, rather than being handed a 200 for a
+        ceiling change that did not happen."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        with self._unreadable_policy():
+            with self.assertRaises(OSError):
+                policy_store.set_ceiling(mode="act")
+
+    def test_an_unreadable_ceiling_refuses_a_single_key_write(self):
+        """``put`` is the generic setter for the destination and identity keys,
+        and rewrites the same whole file, so it needs the same refusal."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        with self._unreadable_policy():
+            with self.assertRaises(OSError):
+                policy_store.put("slack_channel", "#somewhere-else")
+
+    def test_a_missing_ceiling_is_still_a_first_write(self):
+        """Absent is the one failure where ``{}`` is the truth. The guard must
+        not turn the operator's very first settings save into an error."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        self.assertFalse(policy_store.policy_path().exists())
+        policy_store.set_ceiling(mode="act")
+        self.assertEqual(policy_store.read_mode("observe"), "act")
+
+    def test_a_corrupt_ceiling_still_repairs_on_write(self):
+        """Existing tolerance, pinned so the unreadable-file guard is not
+        mistaken for a licence to start failing on corruption too."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        policy_store.policy_path().parent.mkdir(parents=True, exist_ok=True)
+        policy_store.policy_path().write_text("{ not json", encoding="utf-8")
+        policy_store.set_ceiling(mode="act")
+        self.assertEqual(policy_store.read_mode("observe"), "act")

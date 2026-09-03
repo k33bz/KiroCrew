@@ -2,14 +2,17 @@ import { useState, useMemo, useEffect, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Download, Loader2, RefreshCw, Sparkles } from 'lucide-react'
-import { api } from '../../api/client'
+import { api, ApiError } from '../../api/client'
+import ProjectSkillsTrustList from '../../components/ProjectSkillsTrustList'
 import { Card, Btn, SearchInput, EmptyState, Toggle } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import Modal from '../../components/Modal'
-import SkillForm, { assembleSkillContent, parseSkillContent, type SkillFormData } from '../../components/SkillForm'
+import SkillForm, { assembleSkillContent, parseSkillContent, skillPathProblem, skillPostPath, type SkillFormData } from '../../components/SkillForm'
 import SkillDirectoryBrowser from '../../components/SkillDirectoryBrowser'
 import SkillBrowserModal from '../../components/SkillBrowserModal'
 import DiffBlock from '../../components/DiffBlock'
+import ListDetailBack from '../../components/ListDetailBack'
+import { useListDetailView } from '../../hooks/useListDetailView'
 import { useProvider } from '../../providers'
 import type { Skill } from '../../types'
 import SkillContextBudget from './SkillContextBudget'
@@ -18,8 +21,22 @@ import { Trans } from 'react-i18next'
 
 import { fmtBytes, fmtCompact } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { parseErrorCode } from '../../utils/errorReport'
 import { SettingRef } from '../../components/settingRef/SettingRef'
 const EMPTY_FORM: SkillFormData = { name: '', category: '', description: '', triggers: '', tags: '', always: false, body: '' }
+
+/**
+ * The list-detail shell's height.
+ *
+ * `svh` (the viewport with browser chrome SHOWING) rather than `vh`: `vh`
+ * resolves against the large viewport, so on a phone the pane runs under the
+ * address bar and its bottom edge — which while narrow holds the only visible
+ * pane — is unreachable. `svh` also does not re-resolve as the URL bar
+ * animates, unlike `dvh`. Identical to `vh` on a desktop, where there is no
+ * dynamic chrome. The `vh` declaration stays as the fallback for browsers
+ * without `svh`, matching the shell's own `supports-[height:100dvh]` pattern.
+ */
+const PANE_SHELL_CLASS = 'flex gap-3 -mx-2 md:mx-0 h-[calc(100vh-260px)] supports-[height:100svh]:h-[calc(100svh-260px)] min-h-[420px]'
 
 /** Humanize a kebab/snake-case skill name for display. */
 const displayName = (s: Skill) => s.name.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
@@ -57,6 +74,7 @@ export default function SkillsTab() {
   const [detailEditing, setDetailEditing] = useState(false)
   // Multi-provider skill browser drawer (Add Skill button).
   const [skillBrowserOpen, setSkillBrowserOpen] = useState(false)
+  const [createError, setCreateError] = useState('')
 
   // Deep-linkable view param: ?view=budget swaps to the control plane.
   // Entering the budget view PUSHES a history entry so browser Back returns to
@@ -95,7 +113,20 @@ export default function SkillsTab() {
     onSuccess: () => {
       setFormData(EMPTY_FORM)
       setCreating(false)
+      setCreateError('')
       queryClient.invalidateQueries({ queryKey: ['skills'] })
+    },
+    // The form's sanitizeSkillName mirror gates most bad names before they leave
+    // the browser, but it is a mirror rather than the authority: a name the
+    // preview accepted and the server did not still lands here. `invalid_name`
+    // is the empty-sanitize refusal a non-Latin name earns, and it is the one
+    // whose English prose the user seeing it is least able to read, so it gets a
+    // translated hint; every other code's server prose is already actionable.
+    onError: (e: Error) => {
+      const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
+      setCreateError(code === 'invalid_name'
+        ? i18nT('components.skillForm.invalid_name_hint')
+        : e.message)
     },
   })
 
@@ -145,6 +176,9 @@ export default function SkillsTab() {
   const allFiltered = useMemo(() => [...localSkills, ...packageSkills], [localSkills, packageSkills])
   const selectedSkill = useMemo(() => skills.find(s => s.key === selectedKey) ?? null, [skills, selectedKey])
 
+  // Narrow viewport shows one pane at a time; a desktop shows both.
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
+
   // Keep a valid selection: default to the first skill, and recover if the
   // current selection is filtered out or deleted.  Suspended while editing:
   // selectedSkill is derived from the *unfiltered* skills array, so the
@@ -158,7 +192,7 @@ export default function SkillsTab() {
     }
   }, [allFiltered, selectedKey, detailEditing])
 
-  const selectSkill = (s: Skill) => { setSelectedKey(s.key); setDetailEditing(false) }
+  const selectSkill = (s: Skill) => { setSelectedKey(s.key); setDetailEditing(false); openDetail() }
 
   /** One row in the left list. */
   const renderRow = (s: Skill) => {
@@ -197,10 +231,10 @@ export default function SkillsTab() {
   }
 
   if (isLoading) return (<>
-    <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 flex items-center gap-2">{i18nT('pages.overview.skillsTab.skills')} <InfoTip text={i18nT('pages.overview.skillsTab.on_demand_skills_loaded_when_the_agent_determine')} /> <Btn primary disabled>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></h4>
+    <h4 className="text-sm font-semibold text-text-strong mb-2 flex items-center gap-2">{i18nT('pages.overview.skillsTab.skills')} <InfoTip text={i18nT('pages.overview.skillsTab.on_demand_skills_loaded_when_the_agent_determine')} /> <Btn primary disabled>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></h4>
     <Card>
       <div className="flex items-center gap-2 mb-3"><div className="h-8 max-w-[480px] flex-1 rounded-md animate-pulse" style={{ background: 'var(--border)', opacity: 0.5 }} /></div>
-      <div className="flex gap-3 h-[calc(100vh-260px)] min-h-[420px]">
+      <div className={PANE_SHELL_CLASS}>
         <div className="w-[240px] shrink-0 space-y-1">{Array.from({ length: 6 }).map((_, i) => (
           <div key={i} className="h-[58px] rounded-md animate-pulse" style={{ background: 'var(--border)', opacity: 0.5, animationDelay: `${i * 80}ms` }} />
         ))}</div>
@@ -212,17 +246,46 @@ export default function SkillsTab() {
   // Control plane: full-page budget view, deep-linkable via ?view=budget.
   if (viewBudget) return <SkillContextBudget onBack={hideBudget} />
 
+  // One predicate for the Create button's `disabled` and its onClick guard, so
+  // the two can never disagree — a keyboard activation that races the disabled
+  // attribute would otherwise send a request the button was already refusing.
+  // `.trim()` is what makes a whitespace-only name a non-submission rather than a
+  // truthy string that earns an untranslated `name is required` 400.
+  const createCanSubmit = formData.name.trim() !== ''
+    && skillPathProblem(formData.name, formData.category) === null
+    && !createSkill.isPending
+
   return (<>
     <PendingSkillsPanel />
+    <ProjectSkillsTrustList />
     {/* Create Skill Modal */}
-    <Modal open={creating} onClose={() => setCreating(false)} title={i18nT('pages.overview.skillsTab.create_new_skill')} maxWidth={560} footer={<>
-      <Btn onClick={() => setCreating(false)}>{i18nT('pages.overview.skillsTab.cancel')}</Btn>
-      <Btn primary onClick={() => { if (formData.name) { const path = formData.category ? `${formData.category}/${formData.name}` : formData.name; createSkill.mutate({ name: path, content: assembleSkillContent(formData) }) } }} disabled={!formData.name}>{i18nT('pages.overview.skillsTab.create')}</Btn>
+    {/* The gate reads the SANITIZED name and category, not the raw ones and not
+        the combined path: a segment that sanitizes to nothing (typically one
+        written entirely in a non-Latin script) would otherwise pass
+        `!formData.name`, or hide behind a surviving sibling segment, and reach the
+        server only to be silently renamed or refused with an English 400. A name
+        that is nothing BUT separators (`/`) is the sharpest case, because the
+        surviving sibling is the category and the skill lands under it with the
+        name discarded — hence skillPathProblem, not a bare emptiness test.
+        `isPending` closes the same window a second time over, since an in-flight
+        create must not be re-sent or abandoned mid-request. */}
+    <Modal open={creating} onClose={() => { if (createSkill.isPending) return; setCreating(false) }} title={i18nT('pages.overview.skillsTab.create_new_skill')} maxWidth={560} footer={<>
+      <Btn disabled={createSkill.isPending} onClick={() => setCreating(false)}>{i18nT('pages.overview.skillsTab.cancel')}</Btn>
+      <Btn primary onClick={() => { if (!createCanSubmit) return; createSkill.mutate({ name: skillPostPath(formData.name, formData.category), content: assembleSkillContent(formData) }) }} disabled={!createCanSubmit}>{i18nT('pages.overview.skillsTab.create')}</Btn>
     </>}>
       <SkillForm data={formData} onChange={setFormData} />
+      {createError && <p className="text-danger text-[12px] mt-2">{createError}</p>}
     </Modal>
 
-    <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 flex items-center gap-2">{i18nT('pages.overview.skillsTab.skills_count', { count: skills.length })} <InfoTip text={i18nT('pages.overview.skillsTab.skills_tip')} /> <span className="ml-auto flex items-center gap-2"><Btn onClick={showBudget} className="text-accent border-accent/30 bg-accent/5 hover:bg-accent/10">{i18nT('pages.overview.skillsTab.budget_doorway_static')}</Btn><Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn><Btn primary onClick={() => { setFormData(EMPTY_FORM); setCreating(true) }}>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></span></h4>
+    {/* No top margin: the pane that hosts this tab owns the gap under the tab
+      * strip (SidePanelLayout's narrow `pt-3`, the desktop header's `pb-3`).
+      * A margin here would stack on top of it and put this tab further from the
+      * divider than the tabs whose first element is a Card. Dropped outright
+      * rather than with `first:mt-0`, because `PendingSkillsPanel` above returns
+      * null when nothing is pending — this heading moves in and out of
+      * `:first-child` with the pending count, so a positional rule would make
+      * the gap depend on it. */}
+    <h4 className="text-sm font-semibold text-text-strong mb-2 flex flex-wrap items-center gap-2">{i18nT('pages.overview.skillsTab.skills_count', { count: skills.length })} <InfoTip text={i18nT('pages.overview.skillsTab.skills_tip')} /> <span className="w-full md:w-auto md:ml-auto flex flex-col md:flex-row items-stretch md:items-center [&>button]:justify-center md:[&>button]:justify-start gap-2"><Btn onClick={showBudget} className="text-accent border-accent/30 bg-accent/5 hover:bg-accent/10">{i18nT('pages.overview.skillsTab.budget_doorway_static')}</Btn><Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn><Btn primary onClick={() => { setFormData(EMPTY_FORM); setCreateError(''); setCreating(true) }}>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></span></h4>
     <p className="text-[12px] text-muted mb-2"><Trans i18nKey="pages.overview.skillsTab.auto_create_hint" components={{ settingRef: <SettingRef configKey="skills.auto_create_from_sessions" /> }} /></p>
     <Card>
       <div className="flex items-center gap-2 mb-3">
@@ -236,13 +299,13 @@ export default function SkillsTab() {
       </div>
 
       {skills.length === 0 ? <EmptyState icon={<Sparkles className="lucide-inline" />} title={i18nT('pages.overview.skillsTab.no_skills_yet')} subtitle={i18nT('pages.overview.skillsTab.empty_subtitle')} action={<Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn>} /> : (
-        /* Master-detail: skill list (pane 1) on the left, then the directory
+        /* List-detail: skill list (pane 1) on the left, then the directory
          *  browser (panes 2+3: file tree + file content) on the right. */
-        <div className="flex gap-3 h-[calc(100vh-260px)] min-h-[420px]">
+        <div className={PANE_SHELL_CLASS}>
           {/* Pane 1 — skill list.  ``scrollbar-overlay`` keeps the scrollbar
            *  hidden until hover and overlays it so the row width never shifts
            *  between scrollable and non-scrollable states. */}
-          <div className="w-[240px] shrink-0 overflow-y-auto scrollbar-overlay border border-border rounded-md p-2" role="listbox" aria-label={i18nT('pages.overview.skillsTab.skills')}>
+          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto scrollbar-overlay border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.skillsTab.skills')}>
             {localSkills.map(renderRow)}
             {packageSkills.length > 0 && (
               <div className="mt-2">
@@ -253,15 +316,25 @@ export default function SkillsTab() {
               </div>
             )}
             {allFiltered.length === 0 && <div className="text-muted/70 text-[12px] italic px-2 py-2">{i18nT('pages.overview.skillsTab.no_skills_match_query', { query: skillFilter })}</div>}
-          </div>
+          </div>}
 
           {/* Panes 2+3 — directory browser, or the edit form */}
-          <div className="flex-1 min-w-0 flex flex-col border border-border rounded-md bg-card overflow-hidden">
+          {showDetail && <div className="flex-1 min-w-0 flex flex-col border border-border rounded-md bg-card overflow-hidden">
             {!selectedSkill ? (
               <div className="flex items-center justify-center h-full text-muted text-[13px]">{i18nT('pages.overview.skillsTab.select_a_skill_to_view_its_files')}</div>
             ) : detailEditing ? (
               <div className="flex flex-col h-full min-h-0">
-                <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-border shrink-0">
+                {/* Back gets its own full-width row rather than joining the
+                    action row: with Cancel and Save already there, adding a
+                    third control to one row trips AUTOSDE's
+                    max-two-buttons-per-row. A row that already carries three is
+                    tolerated; a compliant one may not grow into that. */}
+                {isMobile && (
+                  <div className="px-4 pt-2.5 shrink-0">
+                    <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
                   <span className="text-sm font-mono font-bold text-text-strong truncate">{selectedSkill.key}</span>
                   <div className="flex gap-2 shrink-0">
                     <Btn onClick={() => setDetailEditing(false)}>{i18nT('pages.overview.skillsTab.cancel')}</Btn>
@@ -275,7 +348,14 @@ export default function SkillsTab() {
             ) : (
               <div className="flex flex-col h-full min-h-0">
                 {/* Detail header: name, source badge, Edit/Delete (kirocrew only) */}
-                <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-border shrink-0">
+                {/* Own row, same reason as the edit header: Edit and Delete
+                    already fill this row's two-control budget. */}
+                {isMobile && (
+                  <div className="px-4 pt-2.5 shrink-0">
+                    <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="text-sm font-bold text-text-strong truncate">{displayName(selectedSkill)}</span>
                     {sourceLabel(selectedSkill.source) && (
@@ -295,7 +375,7 @@ export default function SkillsTab() {
                 </div>
               </div>
             )}
-          </div>
+          </div>}
         </div>
       )}
     </Card>
@@ -454,6 +534,11 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
               <span className="ml-2 text-[10px] px-1.5 py-[1px] rounded-full bg-accent-subtle text-accent font-bold">{i18nT('pages.overview.skillsTab.update')}</span>
             )}
             {p.has_scripts && (
+              /* Plain badge: the always-requires-review explanation renders as
+                 visible text in the expanded panel (and the panel hint carries
+                 the same caveat), so a hover title here would be a third
+                 rendering of one sentence — and a tooltip BUTTON would be a
+                 fourth control in the row (AUTOSDE max-two-buttons-per-row). */
               <span className="ml-2 text-[10px] px-1.5 py-[1px] rounded-full bg-warn-subtle text-warn font-bold">{i18nT('pages.overview.skillsTab.script')}</span>
             )}
           </div>
@@ -473,6 +558,15 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
       </div>
       {open && detail && (
         <div className="mt-2 space-y-2">
+          {p.has_scripts && (
+            /* Scripts are a hard security boundary: a script-bearing candidate
+               stages for manual review even with skills.approval_required off.
+               Without this note a user who disabled approval sees the row and
+               has no idea why the setting "didn't work". */
+            <div className="text-[11px] p-2 rounded bg-warn-subtle text-warn border border-border">
+              {i18nT('pages.overview.skillsTab.scripts_always_require_review')}
+            </div>
+          )}
           {isUpdate && detail.stale_base && (
             <div className="text-[11px] p-2 rounded bg-warn-subtle text-warn border border-border">
               {i18nT('pages.overview.skillsTab.this_skill_changed_after_this_update_was_written')}
@@ -583,6 +677,14 @@ function PendingSkillsPanel() {
       qc.invalidateQueries({ queryKey: ['skills-pending'] })
     },
   })
+  const dismissAll = useMutation({
+    mutationFn: () => api.dismissAllPendingSkills(pending.map(p => p.slug)),
+    onSuccess: () => {
+      setReviewSlug(null)
+      qc.removeQueries({ queryKey: ['skills-pending-detail'] })
+      qc.invalidateQueries({ queryKey: ['skills-pending'] })
+    },
+  })
   // Only claim a deep-linked candidate is gone once the queue has actually been
   // read -- `pending` is [] while the first fetch is in flight, which would
   // otherwise flash the notice on every deep link.
@@ -591,8 +693,14 @@ function PendingSkillsPanel() {
   // already resolved lands on a Skills tab that looks completely normal, and
   // the user is left hunting for a row that no longer exists.
   if (pending.length === 0 && !reviewMissing) return null
+  // No top margin on the root, for the same reason as the tab's heading below:
+  // this panel is the Skills tab's FIRST in-flow element whenever it renders,
+  // and the pane already owns the gap under the tab strip. It is also WHY that
+  // heading drops its margin outright instead of using `first:mt-0` — this panel
+  // returns null when there is nothing pending, so the heading moves in and out
+  // of `:first-child` with the pending count.
   return (
-    <div className="mt-4 mb-2">
+    <div className="mb-2">
       {/* Suppressed when the ONLY thing to show is the resolved-candidate
           notice: a "Pending review (0)" heading over a sentence explaining
           there is nothing to review reads like a broken count. */}
@@ -600,6 +708,7 @@ function PendingSkillsPanel() {
         <h4 className="text-sm font-semibold text-text-strong mb-2 flex items-center gap-2">
           {i18nT('pages.overview.skillsTab.pending_review_count', { count: pending.length })}
           <InfoTip text={i18nT('pages.overview.skillsTab.auto_generated_skill_candidates_awaiting_your_ap')} />
+          <Btn danger className="ml-auto text-[11px]" onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_all_confirm', { count: pending.length }))) dismissAll.mutate() }}>{i18nT('pages.overview.skillsTab.dismiss_all')}</Btn>
         </h4>
       )}
       {pending.length > 0 && (

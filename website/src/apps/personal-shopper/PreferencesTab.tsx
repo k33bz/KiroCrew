@@ -172,6 +172,18 @@ export function PreferencesTab() {
         </Btn>
       </form>
 
+      {/* Stated at the point of interaction, not only on the App Store card:
+          the advisor cannot read this store, so a preference typed here does
+          not reach it until the user says it in the conversation. Given the
+          same weight as the form above it -- as a muted footnote it read as
+          fine print next to an affordance that looks fully functional. */}
+      <p
+        role="note"
+        className="text-sm px-3 py-2 rounded-lg bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text)] leading-relaxed"
+      >
+        {i18nT('apps.personalShopper.preferencesTab.the_advisor_cannot_read_this_list_paste_what_ma')}
+      </p>
+
       {preferences.length === 0 && (
         <EmptyState
           icon={<Tag size={28} />}
@@ -416,10 +428,14 @@ function PreferenceRow({
           }
         }}
       >
+        {/* Named after the row it replaces: the inline form has no visible label,
+            and the pencil that opened it is gone while it is open, so the field
+            has to say which preference it is editing. */}
         <input
           value={editText}
           onChange={(e) => setEditText(e.target.value)}
-          className="flex-1 text-sm bg-transparent outline-none text-[var(--text)]"
+          aria-label={i18nT('apps.personalShopper.preferencesTab.edit_named_preference', { text: pref.text })}
+          className="flex-1 text-sm bg-transparent text-[var(--text)]"
           autoFocus
           onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false) }}
         />

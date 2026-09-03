@@ -20,7 +20,6 @@ import os
 import shutil
 import socket
 import stat
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator
@@ -509,9 +508,12 @@ def test_create_server_pipe_closes_the_handle_when_the_read_mode_flip_fails(
 
     real_close = _winapi.CloseHandle
     closed: list[int] = []
+    failed_handle: int | None = None
     address = transport.resolve_address(tmp_path / "gateway.sock")
 
-    def _boom(*_args: object) -> None:
+    def _boom(handle: int, *_args: object) -> None:
+        nonlocal failed_handle
+        failed_handle = int(handle)
         raise OSError("read-mode flip failed")
 
     def _spy_close(handle: int) -> None:
@@ -524,7 +526,8 @@ def test_create_server_pipe_closes_the_handle_when_the_read_mode_flip_fails(
         with pytest.raises(OSError, match="read-mode flip"):
             transport._create_server_pipe(address, first=True)
 
-    assert len(closed) == 1, "the orphaned pipe handle was not closed"
+    assert failed_handle is not None
+    assert failed_handle in closed, "the orphaned pipe handle was not closed"
     # Proof the instance is really gone: FILE_FLAG_FIRST_PIPE_INSTANCE refuses a
     # second first-instance while any handle to the name is still open, so this
     # only succeeds if the failed attempt released it.
@@ -755,15 +758,11 @@ async def test_wait_closed_returns_once_connections_are_cancelled(
     await asyncio.wait_for(started.wait(), timeout=5)
 
     server.close()
-    if sys.version_info >= (3, 12):
-        # Awaiting here first is the bug: prove it would block. Gated because
-        # the semantics are version-dependent -- measured blocking on 3.12.13,
-        # and CI showed 3.10 returning immediately, which matches the CPython
-        # change that made wait_closed() await accepted connections landing in
-        # 3.12.0. On 3.10 the reordering is a harmless no-op, so only the
-        # positive assertion below applies there.
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(server.wait_closed()), timeout=0.5)
+    # Awaiting here first is the bug: prove it would block. CPython 3.12.0 made
+    # wait_closed() await accepted connections, so with a stub still attached
+    # this cannot return -- which is why the daemon drains and cancels first.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(server.wait_closed()), timeout=0.5)
 
     for task in handlers:
         task.cancel()

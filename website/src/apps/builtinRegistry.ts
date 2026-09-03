@@ -28,6 +28,7 @@ export const BUILTIN_COMPONENT_REGISTRY: Record<string, LazyComponent> = {
   '/channels': lazy(() => import('../pages/ChannelPage')),
   '/auto-improvement': lazy(() => import('./auto-improvement/AutoImprovementPage')),
   '/auto-research': lazy(() => import('./auto-research/ResearchLabPage')),
+  '/aws-control': lazy(() => import('./aws-control/AwsControlPage')),
   '/file-explorer': lazy(() => import('./file-explorer/FileExplorerPage')),
   '/code-review-sage': lazy(() => import('./code-review-sage/CodeReviewSagePage')),
   '/workflows': lazy(() => import('./workflows/WorkflowsPage')),
@@ -44,6 +45,7 @@ export const BUILTIN_COMPONENT_REGISTRY: Record<string, LazyComponent> = {
   '/mochi': lazy(() => import('./mochi/MochiPage')),
   '/spec-builder': lazy(() => import('./spec-builder/SpecBuilderPage')),
   '/personal-shopper': lazy(() => import('./personal-shopper/PersonalShopperPage')),
+  '/design-tweak': lazy(() => import('./design-tweak/DesignTweakPage')),
 }
 
 /**

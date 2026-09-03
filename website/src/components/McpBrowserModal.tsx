@@ -21,6 +21,7 @@ import { safeHttpUrl } from '../lib/safeUrl'
 import type { DiscoveredMcpServer, McpDiscoverDetail, McpInstallPlan } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 interface Props {
   open: boolean
   onClose: () => void
@@ -46,6 +47,7 @@ function installReadyFor(
 }
 
 export default function McpBrowserModal({ open, onClose }: Props) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
@@ -183,7 +185,8 @@ export default function McpBrowserModal({ open, onClose }: Props) {
     if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1) }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1) }
     else if (e.key === 'Enter' && selectedServer && !(selectedServer.installed || installedOverride.has(serverKey(selectedServer)))) {
-      e.preventDefault()
+      // Only the Enter branch is claimed — arrow navigation stays untouched.
+      if (!ime.claimEnter(e)) return
       // Consent gate: only install once the detail query for the selected
       // server has resolved — i.e. the pane showing the install plan and
       // required env is actually rendered, not still loading.
@@ -194,6 +197,7 @@ export default function McpBrowserModal({ open, onClose }: Props) {
       const phase = installPhases[serverKey(selectedServer)]
       if (!phase || phase.step === 'error') handleInstall(selectedServer)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ime` is excluded deliberately: useImeGuard returns a fresh object each render whose methods all close over a ref-held latch, so every copy reads the same live composition state at fire time. Depending on it would rebuild this handler on every render and buy nothing.
   }, [moveSelection, selectedServer, installedOverride, installPhases, handleInstall, queryClient])
 
   return (
@@ -217,6 +221,7 @@ export default function McpBrowserModal({ open, onClose }: Props) {
           onQueryChange={handleQueryChange}
           onKeyDown={handleKeyDown}
           onClear={clearQuery}
+          inputProps={ime.bindComposition()}
         />
 
         <DiscoveryStates debouncedQuery={debouncedQuery} isLoading={isLoading} resultCount={results.length} noun="servers" />
@@ -474,7 +479,7 @@ function ServerDetailPanel({
       </div>
 
       {phase?.step === 'done' && !phase.enabled && (
-        <div className="mb-3 p-2 rounded bg-warn-subtle border border-[var(--warn)]/30 text-xs text-[var(--warn)]" data-testid="installed-disabled-note">
+        <div className="mb-3 p-2 rounded bg-warn-subtle border border-warn/30 text-xs text-[var(--warn)]" data-testid="installed-disabled-note">
           {i18nT('components.mcpBrowserModal.installed_disabled_review_the_entry_in_the_serve')}
           {phase.requiredEnv.length > 0 ? ', set its environment variables,' : ''} {i18nT('components.mcpBrowserModal.and_enable_it_there_to_start_using_it')}
         </div>
@@ -485,7 +490,7 @@ function ServerDetailPanel({
         </div>
       )}
       {phase?.step === 'conflict' && (
-        <div className="mb-3 p-2 rounded bg-warn-subtle border border-[var(--warn)]/30 text-xs text-[var(--warn)]">
+        <div className="mb-3 p-2 rounded bg-warn-subtle border border-warn/30 text-xs text-[var(--warn)]">
           {i18nT('components.mcpBrowserModal.a_server_named_already_exists', { name: server.name })}
         </div>
       )}
@@ -518,7 +523,7 @@ function ServerDetailPanel({
 
           {/* Env vars the user must fill in after install. */}
           {requiredEnv.length > 0 && (
-            <div className="mb-3 p-2.5 rounded-md border border-[var(--warn)]/30 bg-warn-subtle" data-testid="required-env">
+            <div className="mb-3 p-2.5 rounded-md border border-warn/30 bg-warn-subtle" data-testid="required-env">
               <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--warn)] mb-1">
                 <KeyRound size={12} aria-hidden="true" />
                 {i18nT('components.mcpBrowserModal.requires_environment_variables')}

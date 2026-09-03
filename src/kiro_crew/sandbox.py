@@ -20,6 +20,7 @@ Config: ``"sandbox": "auto" | "off"`` in ``~/.kiro/crew/config.json``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import ctypes.util
 import errno
@@ -31,17 +32,19 @@ import re
 import select
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
 from kiro_crew.platform import current_context
 
 try:
@@ -51,6 +54,7 @@ except ImportError:  # non-POSIX (Windows)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from concurrent.futures import ThreadPoolExecutor
     from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -59,11 +63,538 @@ logger = logging.getLogger(__name__)
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
 
+# Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
+# over credential paths, plus the SSH shadow dir). The kernel pins a source for
+# the mount's lifetime, so the launcher cannot unlink them and they orphan when
+# the sandboxed process exits. The launcher names them with this prefix plus
+# its own pid ("kirocrew_sb_<pid>_..."); the pid is the liveness key the
+# janitor probes. The age threshold backstops recycled pids for the removals
+# that stay safe against a live mount (plain files and empty dirs).
+_MOUNT_SOURCE_PREFIX = "kirocrew_sb_"
+_MOUNT_SOURCE_MAX_AGE_SECONDS = 24 * 3600
+
+# Pin-scan stabilization budget: a mount-namespace holder can fork a successor
+# and exit between the /proc listing and its own mountinfo read, so a pass
+# that observed a vanish rescans newly appeared pids; past this many passes
+# coverage is reported as unproven instead of looping.
+_PIN_SCAN_MAX_PASSES = 3
+# The overflow uid: what /proc/<pid> stats to for a process whose uid has no
+# mapping in the reader's user namespace. Such a holder CAN be binding our
+# sources, so it is a coverage gap, not a foreign user. The value is a
+# writable sysctl, so it is read from the host; an unreadable sysctl answers
+# None, and the scan then treats EVERY unreadable non-own uid as a gap.
+_OVERFLOW_UID_SYSCTL = "/proc/sys/kernel/overflowuid"
+
+
+@functools.lru_cache(maxsize=1)
+def _overflow_uid() -> int | None:
+    try:
+        return int(Path(_OVERFLOW_UID_SYSCTL).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 # Legacy sandbox launcher directory (before migration to <config_dir>/run/).
 _LEGACY_LAUNCHER_DIR = "/tmp"
 
 # Sensitive directories to hide from the agent subprocess tree.
 # "strict" mode hides all; "standard" mode only hides non-workflow dirs.
+#: The cache leaf, mirroring ``policy_distribution.CACHE_DIR_LEAF``; spelled here so
+#: this module needs no import from the governance engine.  Pinned equal by
+#: ``test_governance_distribution``.
+_POLICY_CACHE_LEAF = "policy_cache"
+#: Gateway-only runtime subtree that holds authenticated macOS decoder images.
+#: The gateway opens these outside the agent sandbox; every sandbox mode must
+#: hide the whole subtree while the image is still writable and through spawn.
+_VOICE_RUNTIME_LEAF = os.path.join("run", "voice-runtime")
+#: The data home the ``$HOME``-relative entries below assume.
+_CREW_HOME_DEFAULT = ".kiro/crew"
+
+#: Both data-home spellings every crew-relative rule below has to cover: a host that
+#: has not run the ``~/.kirocrew`` -> ``~/.kiro/crew`` migration still holds the real
+#: bytes at the legacy path, and ``config_dir()`` can resolve to either.
+_CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
+
+# ── The crew data home's governance tree, reconciled with security.py ──
+#
+# ``security.sensitive_home_dirs()`` is the AGENT-TOOL gate: it is what
+# ``is_sensitive_path`` refuses for a file_read/file_write tool call. The lists in this
+# module are a SEPARATE, OS-level gate — a spawned ``python -c`` or a shell command does
+# an ``open()`` that never routes through the tool gate, so a path fenced only there is
+# readable through any sandbox mode. Two entries (``.vault``, ``policy_cache``) were
+# already carried in both; the rest of the governance tree was not, which left the
+# ceiling itself (``security_policy.json``) readable and WRITABLE from an app lifecycle
+# script, a script hook, or a command cron.
+#
+# Reconciling the two is NOT a union, and the reason is specific: Kiro Crew's own MCP
+# servers (``mcp_core``, ``mcp_cron``, ``mcp_computer``) are spawned by kiro-cli UNDER
+# this launcher and share the agent's mount namespace, as does a script cron's
+# ``boot_platform()``. Whatever they open at OS level cannot be masked. So each crew-home
+# leaf gets one of three dispositions:
+#
+#   HIDDEN    Nothing that runs inside the sandbox reads it. An empty dir/file is
+#             bind-mounted over it, in EVERY mode — the treatment ``.vault`` already
+#             gets, for the same reason.
+#   READONLY  In-sandbox code READS it and a WRITE would let the agent choose its own
+#             ceiling. Hiding a ceiling is the WRONG direction: an absent policy file
+#             resolves to the permissive standalone default, so masking
+#             ``security_policy.json`` from the process that enforces it REMOVES the
+#             ceiling instead of protecting it. Exposed read-only instead, which is what
+#             ``policy_cache`` already does.
+#   VISIBLE   In-sandbox code needs READ *and* WRITE, so no OS rule can apply without
+#             breaking it. These stay on the tool gate alone.
+#
+# ``test_sandbox_governance_mask.py`` pins the union of the three equal to the crew-home
+# half of ``security.sensitive_home_dirs()``, so a leaf added there cannot silently land
+# in none of them. Spelled here rather than imported so this low-level module keeps not
+# importing the 7k-line security module (the ``_POLICY_CACHE_LEAF`` convention above).
+
+#: Crew-home leaves with no legitimate in-sandbox reader — bind-masked in every mode.
+_CREW_HIDDEN_LEAVES: tuple[str, ...] = (
+    # Channel credentials. Already file-masked in cc/strict via ``_CC_FILES``; listing
+    # it here extends the same treatment to standard, where a spawned command could
+    # otherwise read every Slack/Discord token off disk.
+    ".env",
+    # App data holding live credentials or owner-authorization bits. Whole DIRECTORY,
+    # not the leaf file, because an atomic write renames a sibling temp into place.
+    "apps/aws-control/data",
+    "apps/meetings/data/edits",
+    "whatsapp",
+    "workspace/md-notebook/pat",
+    "workspace/md-notebook/vaults.json",
+    "workspace/md-notebook/settings.json",
+    # Browser session material. The extension token reaches the CLI through the
+    # environment, never by ``open()``, so masking the file costs nothing; the other
+    # four are retired leaves with no reader left in the tree. The LIVE browser paths
+    # (``browser-state``, ``playwright-snapshots``, ``pw``, ``playwright-cli-config.json``)
+    # are deliberately absent from the sensitive list and stay fully visible.
+    "browser-cookies.txt",
+    "playwright-storage-state.json",
+    "playwright-extension-token",
+    "browser-mode-enabled",
+    "browser-engine",
+    # Cross-session state whose authorization model is "a session reaches only its own",
+    # enforced by the HTTP routes. Every legitimate reader goes through the gateway, so
+    # OS-masking closes the sideways path without touching a live consumer.
+    "ledger",
+    "cron-history",
+    "workflow_library",
+    "agentcore-inbound",
+    "routing",
+    "webhooks",
+    "live_target.json",
+    "backup",
+    "mcp-apps",
+    # Auth stores and signing keys owned by the gateway web server alone.
+    "token_signing.key",
+    "refresh_chains.json",
+    "kas",
+    "ops_mission_control_secrets.json",
+    "ops_mission_control_policy.json",
+    # No producer and no consumer left in the tree; masked so a backup restore that
+    # resurrects a stale file cannot make it readable either.
+    ".kiro_cli_binary_trust.json",
+    # The identity/auth SQLite store and its WAL/SHM/journal sidecars, whose bytes
+    # are a live bearer token. Nothing inside the sandbox opens the crew home's copy:
+    # the in-sandbox CLI reads the STAGED store under ``.kiro/crew-auth-staging``, and
+    # the gateway-side readers resolve the kiro-cli / amazon-q locations, all of which
+    # are fenced elsewhere -- so masking costs no live consumer while closing a
+    # spawned ``sqlite3`` or ``open()``. Named from the canonical filename constant
+    # (a stdlib-only leaf module, so this stays clear of the security module) so the
+    # mask cannot drift from the tool gate that fences the same store.
+    AUTH_SQLITE_DB,
+    *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+)
+
+#: Crew-home CEILINGS: read by in-sandbox code, never writable by it. Exposed
+#: read-only rather than hidden — see the READONLY note above for why hiding a
+#: ceiling inverts its effect.
+_CREW_READONLY_LEAVES: tuple[str, ...] = (
+    # The governance ceiling and its trust root. ``boot_platform()`` resolves both
+    # inside the sandbox for a script cron, and an absent file means "no ceiling".
+    "security_policy.json",
+    "admission_policy.json",
+    "profiles",
+    "app_admission.json",
+    # Opt-out and consent ceilings the config loader reads in-sandbox. A writable
+    # ``denied_commands.json`` lets an auto-approved agent set ``disable_all`` and
+    # defeat the deny gate after a restart; a writable ``computer_use.json`` lets it
+    # turn computer use on for itself.
+    "denied_commands.json",
+    "computer_use.json",
+    "oauth_endpoints.json",
+    "aws_service_consent.json",
+)
+
+#: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
+#: a deliberate exception a reviewer should re-check, not an oversight.
+_CREW_SANDBOX_VISIBLE_LEAVES: tuple[str, ...] = (
+    # Holds this launcher itself (``<config_dir>/run/kirocrew_sandbox_*.py``), so the
+    # child cannot exec if it is masked. Already sealed READ-ONLY through
+    # ``_voice_runtime_parent_paths()``, with only the ``run/voice-runtime`` leaf hidden.
+    "run",
+    # The SEL trust root and its append targets. ``verify_session_pid`` reads
+    # ``trust/sel_hmac.key`` inside the sandbox to resolve the strict session identity,
+    # ``skill_search`` reads ``trust/project-skills.json``, and the in-sandbox MCP
+    # servers append to the log directly — a masked log turns an audit-or-deny write
+    # into a denial of the action it was auditing.
+    "trust",
+    "sel_hmac.key",
+    "security_events.jsonl",
+    "security_events.d",
+    # How an in-sandbox MCP server authenticates back to the dashboard. Masking it
+    # breaks cron triggering, screencast, and the Sage review driver.
+    ".local_secret",
+    # ``mcp_cron`` builds a ``CronService(base_dir=config_dir())`` in-sandbox and both
+    # reads and rewrites the job store through it.
+    "crons.json",
+)
+
+
+def _crew_home_entries(leaves: tuple[str, ...]) -> list[str]:
+    """Expand *leaves* across both data-home spellings."""
+    return [f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in leaves]
+
+
+#: Bind-masked in every mode.
+_CREW_HIDDEN_DIRS: list[str] = _crew_home_entries(_CREW_HIDDEN_LEAVES)
+#: Exposed read-only in every mode.
+_CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
+
+#: The subset of ``_CREW_READONLY_LEAVES`` the launcher may CREATE in order to seal.
+#:
+#: ``mount(2)`` cannot target a path that does not exist, so the READONLY seal below
+#: skips an absent ceiling and leaves the data home writable at that name — which is
+#: the whole hole on a default install, where none of these has been written yet.
+#: Materialising the path first closes it, and that is only sound for a leaf that
+#: clears BOTH of the following.
+#:
+#: 1. An EMPTY document must mean what an ABSENT file means to the reader:
+#:
+#:    * ``profiles`` — an empty dir yields no profile, same as no dir;
+#:    * ``computer_use.json`` — ``computer_use.enable_state.load_state`` reads ``{}``
+#:      as DISABLED, which is what an absent keystone means;
+#:    * ``oauth_endpoints.json`` — ``security._validate_operator_oauth_entries``
+#:      extends trust by nothing for ``{}``;
+#:    * ``aws_service_consent.json`` — ``aws_consent._read_all`` returns ``{}`` for
+#:      both absent and empty, so every service stays unconfirmed.
+#:
+#: 2. A STALE read of that empty document must fail toward refusal. The seal is a
+#:    bind mount, which pins the INODE for the sandbox's lifetime, while every
+#:    dashboard writer publishes through ``atomic_write`` (temp + rename), i.e. a NEW
+#:    inode. So a sandboxed reader keeps seeing the empty document even after the
+#:    operator writes the real one. For the three files above that freezes them at
+#:    "disabled" / "no consent" / "no extra endpoints" — narrower than the truth. The
+#:    empty ``profiles`` dir is exempt from the concern entirely: a directory bind
+#:    shows live contents, so a profile added later is visible.
+#:
+#: DELIBERATELY EXCLUDED, and each for a different one of those two reasons:
+#:
+#:   * ``denied_commands.json`` — clears (1) but fails (2), which is the direction
+#:     that matters: in-sandbox ``mcp_cron`` reads it to decide whether a command is
+#:     denied, so a pinned ``{}`` would report "nothing is denied" for the rest of the
+#:     sandbox's life even after the operator denies a command. Sealing it would trade
+#:     an agent-authored deny list for a stale one, so it keeps the pre-existing gap;
+#:   * ``security_policy.json`` — fails (1). ``governance.load_security_policy`` reads
+#:     the file whenever it exists and fails CLOSED on a parse or version mismatch, so
+#:     a ``{}`` stub raises ``PlatformCompositionError`` out of a function that runs at
+#:     boot AND per app callback;
+#:   * ``app_admission.json`` — fails (1). Absent means ``open_default()`` (admit),
+#:     while present-but-unreadable means deny-all; a stub would refuse every app;
+#:   * ``admission_policy.json`` — already seeded at first run by
+#:     ``platform.admission.seed_default_policy``, so it is not absent to begin with.
+#:
+#: The same ``mount(2)`` limit leaves the ``SENSITIVE_DIRS`` / ``SENSITIVE_FILES``
+#: mask loops skipping their own absent targets. That is a real sibling gap, not one
+#: this list closes: a mask needs the opposite treatment (an empty bind OVER the
+#: name), and ``_CREW_HIDDEN_LEAVES`` has no reader to prove an empty document is
+#: absent-equivalent, so each leaf needs its own argument.
+_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = ("profiles",)
+_CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
+    "computer_use.json",
+    "oauth_endpoints.json",
+    "aws_service_consent.json",
+)
+
+#: What a materialised ceiling holds — the empty JSON object every reader above
+#: already treats as its absent default. NOT a zero-byte file, which is not valid
+#: JSON and would read as CORRUPT rather than as absent.
+_EMPTY_CEILING_DOCUMENT: bytes = b"{}\n"
+
+
+def _sealable_absent_ceilings() -> tuple[list[str], list[str]]:
+    """Resolved (dir, file) ceiling paths that may be created so the seal can apply.
+
+    Resolved through ``config_dir()`` — the LIVE data home — rather than expanded over
+    both ``_CREW_HOME_PREFIXES`` the way the deny lists are. A deny rule covers both
+    spellings because either tree may still hold bytes; creation has the opposite
+    requirement, since a stub in the deprecated ``~/.kirocrew`` of a migrated host is a
+    file nothing will ever read. Whichever spelling ``config_dir()`` resolves to is
+    already in the launcher's ``READONLY_DIRS``: both ``$HOME``-relative prefixes are
+    listed there, and ``_relocated_crew_targets`` adds a data home that escapes
+    ``$HOME``.
+
+    Never raises: an unresolvable data home yields nothing and the seal behaves exactly
+    as it did before this function existed.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for ceiling sealing", exc_info=True)
+        return ([], [])
+    return (
+        [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_DIR_LEAVES],
+        [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_FILE_LEAVES],
+    )
+
+
+class SandboxCeilingUnsealable(RuntimeError):
+    """A governance ceiling could not be made sealable, so the sandbox refuses to launch.
+
+    The seal exists because an unsealed ceiling is a self-elevation hole: a sandboxed
+    process that can write ``computer_use.json`` turns on desktop control for itself.
+    Launching anyway would run the agent with that hole open while every log line said
+    the ceiling was protected, so this is the ``_mount_or_die`` case rather than the
+    best-effort one — a control was requested and could not be established.
+
+    Raised out of ``namespace_argv``, so it surfaces to whichever ``wrap_argv`` caller
+    asked for the spawn. Those callers report a failed operation; none of them falls back
+    to running the command unconfined, which is what makes refusing safe here.
+
+    The two states that reach it are both actionable by an operator, and the message
+    names the path for that reason: a DANGLING SYMLINK squatting a ceiling path (either
+    tampering, or a link whose destination went away), and a data home where creation
+    itself fails (a read-only mount, or a filesystem with no hardlink support).
+    """
+
+
+def _warn_unsealed_ceiling(target: str, exc: "OSError | None") -> None:
+    """Say WHY the spawn is being refused: this ceiling could not be made sealable.
+
+    Called immediately before :class:`SandboxCeilingUnsealable` is raised, so the spawn
+    does NOT proceed — the log line carries the path and the errno that the exception
+    message alone would not, and an operator reading it is the only one who can fix the
+    data home. ``warning`` rather than ``debug`` for that reason: a refused spawn with no
+    explanation is indistinguishable from an unrelated failure.
+
+    Per spawn rather than once per process, matching the launcher's own ``EXPOSE_FILES``
+    pre-read warning — a host where this keeps happening has a real problem, and
+    de-duplicating it would hide how often the control cannot be established.
+    """
+    logger.warning(
+        "sandbox: REFUSING to launch — could not create the governance ceiling %s (%s). "
+        "mount(2) cannot seal a path that does not exist, so proceeding would leave it "
+        "writable inside the sandbox",
+        target,
+        exc if exc is not None else "publish failed",
+    )
+
+
+def _warn_if_alias_backed(target: str) -> None:
+    """Warn when an ALREADY-PRESENT ceiling is reachable under a second name.
+
+    ``MS_RDONLY`` binds a MOUNT, not an inode, so the seal only covers the path it was
+    established on. Two shapes therefore survive it, and both are invisible to the seal
+    loop because the path resolves and reads as present:
+
+    * the ceiling is a **symlink**. The launcher seals the inode it resolves to, but the
+      link NAME lives in the writable data home, so a sandboxed process can unlink it and
+      put a real file of its own there instead;
+    * the ceiling is a **regular file with another hardlink**. The alias is a different
+      path, so it is outside the read-only mount, and a write through it changes the very
+      inode the ceiling exposes.
+
+    Reported, not refused, and deliberately so. Refusing would break the ordinary reasons
+    a config file has a second name — a dotfile manager such as chezmoi or GNU stow, or a
+    snapshot tool holding a hardlink — by turning them into a hard spawn failure, which is
+    a much wider blast radius than the exposure. Neither shape is introduced here either:
+    the ceilings this module publishes end at ``st_nlink == 1`` and are never symlinks, so
+    this is a PRE-EXISTING property of every entry in ``READONLY_DIRS``, reachable only on
+    a host where something else already created the ceiling that way. Closing it needs the
+    data-home root sealed, which is a different change.
+
+    The warning exists because the alternative is worse than the hole: without it the log
+    says the ceiling is sealed while it is writable under another name.
+    """
+    try:
+        info = os.lstat(target)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        logger.warning(
+            "sandbox: the governance ceiling %s is a SYMLINK. The seal covers the file it "
+            "resolves to, but the link itself sits in a writable directory, so a sandboxed "
+            "process can replace the name. Make it a regular file to close that.",
+            target,
+        )
+    elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+        logger.warning(
+            "sandbox: the governance ceiling %s has %d hardlinks. The seal covers this "
+            "path only, so a write through another name reaches the same inode. Remove the "
+            "extra link to close that.",
+            target,
+            info.st_nlink,
+        )
+
+
+def _refuse_if_dangling_symlink(target: str) -> None:
+    """Refuse the spawn when *target* is a symlink that resolves to nothing.
+
+    A RESOLVING symlink is left alone deliberately: it reads as present, so the launcher
+    seals the inode it resolves to. The residual exposure there — the link NAME stays
+    replaceable in a writable parent — is pre-existing for every ceiling, not specific to
+    one this function materialises, and closing it needs the data-home root sealed.
+    """
+    if not os.path.islink(target) or os.path.exists(target):
+        return
+    pointed_at = "(unreadable)"
+    with contextlib.suppress(OSError):
+        pointed_at = os.readlink(target)
+    raise SandboxCeilingUnsealable(
+        f"the governance ceiling {target} is a DANGLING symlink -> {pointed_at}. "
+        "mount(2) cannot seal it and it would leave the path writable inside the "
+        "sandbox. Remove or repoint it, or lower sandbox_level to run without the seal "
+        "deliberately."
+    )
+
+
+def _publish_empty_ceiling(target: str, parent: str) -> bool:
+    """Write the empty document to a sibling temp file, then link it into place.
+
+    Two steps rather than ``open(target, O_CREAT | O_EXCL)`` followed by a write,
+    because the one-step form publishes the NAME before the BYTES: a crash, a full
+    disk, or a signal in between leaves a zero-length file at the ceiling path, and
+    zero length is not valid JSON — the reader would see corrupt where this function
+    means absent. Here the target only ever appears once its content is complete.
+
+    ``os.link`` is the publish because it is the no-clobber one: unlike ``os.replace``
+    it fails with ``EEXIST`` instead of overwriting, so a racing spawn — or an operator
+    writing the real document in the same instant — keeps its file. That is also why
+    the ``os.path.exists`` pre-check upstream is an optimisation and not the guard.
+
+    ``mkstemp`` creates the temp file 0o600 before the first byte, so no separate
+    lockdown call is needed (and none may be added: a lockdown applied after content
+    reaches a published path is the defect ``scripts/check_lockdown_before_publish.py``
+    refuses). The mode needs no reassertion either — a umask can only clear bits, never
+    add them.
+
+    Returns ``False`` on any failure, having published nothing. The caller decides what
+    a failure means; this function's only contract is that the ceiling path is either
+    absent or holds the complete document.
+    """
+    fd = -1
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".kirocrew-ceiling-", suffix=".tmp")
+        # ``os.write`` is not obliged to consume the whole buffer, and a short write is
+        # not an error — it returns a count. Taking that count for success would link a
+        # TRUNCATED document, which reads as corrupt rather than as absent and is the
+        # exact outcome the temp-then-link shape exists to prevent. Loop, and treat zero
+        # progress as an error so a filesystem that accepts nothing cannot spin here.
+        view = memoryview(_EMPTY_CEILING_DOCUMENT)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "short write to a ceiling temp file", tmp)
+            view = view[written:]
+        os.close(fd)
+        fd = -1
+        os.link(tmp, target)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def _materialize_sealable_ceilings() -> list[str]:
+    """Create every absent sealable ceiling; return the paths actually created.
+
+    Runs on the Linux spawn path only, immediately before the launcher builds its
+    ``READONLY_DIRS`` mount sequence, so a ceiling that did not exist a moment ago is
+    a read-only mountpoint by the time the sandboxed command runs.
+
+    **Fail-closed.** If a ceiling cannot be made sealable this raises
+    :class:`SandboxCeilingUnsealable` and the spawn does not happen. That is a
+    deliberate reversal of an earlier best-effort version, which warned and continued:
+    continuing means the launcher's ``os.path.exists`` guard skips the path, so the
+    sandboxed process runs with a writable governance keystone and nothing downstream
+    notices. An unsealed ceiling is the one thing this function exists to prevent, so it
+    refuses for the same reason ``_mount_or_die`` refuses a failed hiding mount.
+
+    Two states trigger it:
+
+    * a **dangling symlink** squatting a ceiling path. ``os.path.exists`` follows
+      symlinks, so it reads as absent to this function AND to the launcher's guard,
+      while ``os.link`` refuses the name as ``EEXIST`` — the sandboxed process's write
+      then follows the link and the host reads the result back through the ceiling path.
+      It is not removed here: ``islink`` followed by ``unlink`` is not atomic, and the
+      dashboard publishes a real keystone over that same name with ``atomic_write``, so
+      a removal racing a validated operator write would delete the operator's new
+      settings. POSIX offers no unlink-only-if-still-a-symlink, so the safe answer is to
+      refuse and let a human resolve it;
+    * a **creation failure** other than ``EEXIST`` — a read-only mount, or a filesystem
+      with no hardlink support.
+
+    ``EEXIST`` is the one benign outcome, in both loops: the racing spawn that got there
+    first, or the operator's real document. Either way the path now exists, so the
+    launcher seals it and there is nothing to report.
+
+    Never TRUNCATES and never REMOVES: an existing ceiling is left byte-for-byte alone,
+    so this can only ever add the absent default.
+    """
+    created: list[str] = []
+    dir_targets, file_targets = _sealable_absent_ceilings()
+
+    for target in dir_targets:
+        _refuse_if_dangling_symlink(target)
+        if os.path.exists(target):
+            # Present, so the launcher will seal it -- but say so when the seal is
+            # reachable around rather than through this path.
+            _warn_if_alias_backed(target)
+            continue
+        if not os.path.isdir(os.path.dirname(target)):
+            continue
+        try:
+            # 0o700 needs no reassertion: a umask can only clear bits, never add them.
+            os.mkdir(target, 0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            _warn_unsealed_ceiling(target, exc)
+            raise SandboxCeilingUnsealable(
+                f"cannot create the governance ceiling {target}: {exc}"
+            ) from exc
+        created.append(target)
+
+    for target in file_targets:
+        parent = os.path.dirname(target)
+        _refuse_if_dangling_symlink(target)
+        if os.path.exists(target):
+            _warn_if_alias_backed(target)
+            continue
+        if not os.path.isdir(parent):
+            continue
+        if _publish_empty_ceiling(target, parent):
+            created.append(target)
+        elif not os.path.exists(target):
+            # Absent after a failed publish, so nothing won the race: the seal really
+            # did not apply. ``exists`` rather than a plumbed-through errno because the
+            # publish is two syscalls and only the OUTCOME decides whether this matters.
+            _warn_unsealed_ceiling(target, None)
+            raise SandboxCeilingUnsealable(
+                f"cannot publish the governance ceiling {target}; it would stay writable "
+                "inside the sandbox"
+            )
+
+    return created
+
+
 _STRICT_DIRS: list[str] = [
     ".kiro/crew-auth-staging",
     ".aws",
@@ -74,7 +605,31 @@ _STRICT_DIRS: list[str] = [
     ".azure",
     ".docker",
     ".kube",
+    # Encrypted secret vault (PR 1 of #2351). The ``.vault`` dir is also a
+    # keystone leaf in ``security._CREW_SECRET_LEAVES`` (which blocks the
+    # agent's in-process tool-call file access), but a spawned ``python -c``
+    # subprocess does an OS ``open()`` that never routes through that gate — so
+    # the vault dir must ALSO be bind-mount-hidden here, exactly as ``.env`` is
+    # in ``_CC_FILES``. Without this a same-UID agent subprocess could read
+    # ``.vault/.vault_key`` and decrypt the store.
+    ".kiro/crew/.vault",
+    ".kirocrew/.vault",
+    # The centrally-distributed governance ceiling's cache
+    # (``platform/policy_distribution.py``). Bind-mount-hidden in every mode for the
+    # reason the vault above is: ``is_sensitive_path`` is the shared read+write gate for
+    # the agent's in-process tool calls, but a spawned ``python -c`` does an OS
+    # ``open()`` that never routes through it. That matters more here than for the
+    # policy FILE, which this cache copies: on a fleet using the environment channel
+    # there is no ``security_policy.json`` on disk at all, so the cache is the only
+    # on-disk copy of the ceiling — and its metadata records the SOURCE, which the
+    # loader trusts when deciding whether the cache is this host's last-known-good.
+    ".kiro/crew/policy_cache",
+    ".kirocrew/policy_cache",
+    ".kiro/crew/run/voice-runtime",
+    ".kirocrew/run/voice-runtime",
 ]
+_STRICT_DIRS += _CREW_HIDDEN_DIRS
+_STRICT_DIRS += [".midway"]
 
 _STANDARD_DIRS: list[str] = [
     ".kiro/crew-auth-staging",
@@ -83,7 +638,24 @@ _STANDARD_DIRS: list[str] = [
     ".config/gcloud",
     ".azure",
     ".docker",
+    # Secret vault — hidden in every mode (see _STRICT_DIRS note above).
+    ".kiro/crew/.vault",
+    ".kirocrew/.vault",
+    # The centrally-distributed governance ceiling's cache
+    # (``platform/policy_distribution.py``). Bind-mount-hidden in every mode for the
+    # reason the vault above is: ``is_sensitive_path`` is the shared read+write gate for
+    # the agent's in-process tool calls, but a spawned ``python -c`` does an OS
+    # ``open()`` that never routes through it. That matters more here than for the
+    # policy FILE, which this cache copies: on a fleet using the environment channel
+    # there is no ``security_policy.json`` on disk at all, so the cache is the only
+    # on-disk copy of the ceiling — and its metadata records the SOURCE, which the
+    # loader trusts when deciding whether the cache is this host's last-known-good.
+    ".kiro/crew/policy_cache",
+    ".kirocrew/policy_cache",
+    ".kiro/crew/run/voice-runtime",
+    ".kirocrew/run/voice-runtime",
 ]
+_STANDARD_DIRS += _CREW_HIDDEN_DIRS
 
 # CC mode: hides all credential dirs including .aws, but selectively exposes
 # .aws/config (needed for credential_process → Bedrock auth). All other .aws
@@ -97,7 +669,700 @@ _CC_DIRS: list[str] = [
     ".azure",
     ".docker",
     ".kube",
+    # Secret vault — hidden in every mode (see _STRICT_DIRS note above).
+    ".kiro/crew/.vault",
+    ".kirocrew/.vault",
+    # The centrally-distributed governance ceiling's cache
+    # (``platform/policy_distribution.py``). Bind-mount-hidden in every mode for the
+    # reason the vault above is: ``is_sensitive_path`` is the shared read+write gate for
+    # the agent's in-process tool calls, but a spawned ``python -c`` does an OS
+    # ``open()`` that never routes through it. That matters more here than for the
+    # policy FILE, which this cache copies: on a fleet using the environment channel
+    # there is no ``security_policy.json`` on disk at all, so the cache is the only
+    # on-disk copy of the ceiling — and its metadata records the SOURCE, which the
+    # loader trusts when deciding whether the cache is this host's last-known-good.
+    ".kiro/crew/policy_cache",
+    ".kirocrew/policy_cache",
+    ".kiro/crew/run/voice-runtime",
+    ".kirocrew/run/voice-runtime",
 ]
+_CC_DIRS += _CREW_HIDDEN_DIRS
+_CC_DIRS += [".midway"]
+
+
+def _relocated_crew_targets(leaves: tuple[str, ...]) -> list[str]:
+    """The RESOLVED crew-home paths for *leaves*, when the data home is not under ``$HOME``.
+
+    Every entry in the dir lists is ``$HOME``-relative and joined with ``Path.home()``, so
+    ``KIROCREW_HOME=/srv/crew`` moves the data home out from under all of them and no rule
+    matches the real governance tree. :func:`_relocated_policy_cache_dirs` already closes
+    that hole for the one directory it was written for; the ceiling and the secret leaves
+    need it for the same reason, so the resolution is shared here instead of restated.
+
+    Returns only the paths that DIFFER from the ``$HOME``-relative spelling the lists
+    already carry, so the default layout gains no duplicate rule.
+
+    ``normpath``, never ``realpath`` — this runs inside ``_build_launcher_script`` and the
+    seatbelt builder, which execute on the event loop for every async spawn, and a
+    link-resolving syscall on a stalled NFS home would freeze the gateway with its
+    liveness heartbeat. A symlinked home therefore reports as relocated and yields a
+    redundant rule for a path that is covered either way, never a missing one.
+
+    Never raises: a data home that cannot be resolved yields nothing and the
+    ``$HOME``-relative entries still apply.
+    """
+    try:
+        home_root = os.path.join(str(Path.home()), _CREW_HOME_DEFAULT)
+        resolved_root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for sandbox masking", exc_info=True)
+        return []
+    out: list[str] = []
+    for leaf in leaves:
+        try:
+            resolved = os.path.normpath(os.path.join(resolved_root, leaf))
+            default = os.path.normpath(os.path.join(home_root, leaf))
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if resolved != default:
+            out.append(resolved)
+    return out
+
+
+def _relocated_policy_cache_dirs() -> list[str]:
+    """The governance cache's RESOLVED path, when it is not under ``$HOME``.
+
+    Every entry in the dir lists above is ``$HOME``-relative and joined with
+    ``Path.home()``, so ``KIROCREW_HOME=/srv/crew`` moves the data home out from under
+    all of them. That limitation is pre-existing and shared with the vault entries, but
+    this one directory must not inherit it: on a fleet using the environment channel
+    there is no ``security_policy.json`` on disk at all, so the cache is the ONLY on-disk
+    copy of the ceiling, and its metadata records the source the next boot trusts. An
+    agent subprocess able to rewrite it on a relocated home could hand itself a ceiling.
+
+    Returns the path only when it differs from the ``$HOME``-relative form the lists
+    already cover, so the default layout gains no duplicate rule.
+
+    **Compared with ``normpath``, not ``realpath``, and that is deliberate.** This runs
+    inside ``_build_launcher_script`` / the seatbelt builder, which run on the event loop
+    for every async spawn — the same reason the launcher pushes its ``isdir`` checks into
+    the child (see the note there): on a stalled NFS home a link-resolving syscall here
+    freezes the gateway and its liveness heartbeat. ``normpath`` is pure string work.
+
+    The cost is precise and one-directional: where the home is a symlink (``/home/u`` →
+    ``/local/home/u`` is ordinary on managed hosts) the two spellings no longer compare
+    equal, so a DEFAULT layout is reported as relocated and the resolved path is masked in
+    addition to the ``$HOME``-relative one. That is a redundant rule for a directory that
+    should be masked either way, never a missing one — the comparison was only ever
+    de-duplication. Never raises: a data home that cannot be resolved yields nothing and
+    the ``$HOME``-relative entry still applies.
+    """
+    try:
+        resolved = os.path.normpath(os.path.join(str(config_dir()), _POLICY_CACHE_LEAF))
+        default = os.path.normpath(
+            os.path.join(str(Path.home()), _CREW_HOME_DEFAULT, _POLICY_CACHE_LEAF)
+        )
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the policy-cache path for sandbox masking", exc_info=True)
+        return []
+    return [] if resolved == default else [resolved]
+
+
+_voice_runtime_paths_lock = threading.Lock()
+_voice_runtime_paths_cache: (
+    tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None
+) = None
+
+
+def _ensure_voice_runtime_directory(path: str) -> None:
+    """Create one gateway-owned runtime directory without following its leaf."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise OSError(f"voice runtime path is not a real directory: {path}")
+    os.chmod(path, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- 0o700 is owner-only and the tightest traversable directory mode; Semgrep's suggested 0o644 would remove directory traversal and grant reads to other users.  # noqa: E501  # fmt: skip
+
+
+def _literal_ancestor_guards(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Return every rename-sensitive ancestor below the filesystem root."""
+    guards: list[str] = []
+    for item in paths:
+        current = os.path.normpath(item)
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            if current not in guards:
+                guards.append(current)
+            current = parent
+    return tuple(guards)
+
+
+def prime_voice_runtime_sandbox_paths() -> str:
+    """Cache and create the canonical agent-denied decoder runtime off-loop.
+
+    ``config_dir()`` deliberately preserves a supported symlinked default data
+    home. Seatbelt rules are path-based, so both that lexical spelling and the
+    canonical target must be denied. Realpath resolution and directory creation
+    happen here. Async agent startup reaches this through
+    :func:`bind_voice_safe_agent_workspace_async`, which performs the work in a
+    worker thread so gateway readiness is never gated on data-home filesystem IO.
+    """
+    global _voice_runtime_paths_cache
+
+    lexical_home = os.path.normpath(str(config_dir()))
+    cached = _voice_runtime_paths_cache
+    if cached is not None and cached[0] == lexical_home:
+        return cached[1]
+    with _voice_runtime_paths_lock:
+        cached = _voice_runtime_paths_cache
+        if cached is not None and cached[0] == lexical_home:
+            return cached[1]
+
+        canonical_home = os.path.realpath(lexical_home)
+        home_info = os.lstat(canonical_home)
+        if not stat.S_ISDIR(home_info.st_mode) or stat.S_ISLNK(home_info.st_mode):
+            raise OSError("Kiro Crew data home does not resolve to a real directory")
+
+        canonical_run = os.path.join(canonical_home, "run")
+        canonical_root = os.path.join(canonical_home, _VOICE_RUNTIME_LEAF)
+        _ensure_voice_runtime_directory(canonical_run)
+        _ensure_voice_runtime_directory(canonical_root)
+
+        lexical_run = os.path.join(lexical_home, "run")
+        lexical_root = os.path.join(lexical_home, _VOICE_RUNTIME_LEAF)
+        roots = tuple(dict.fromkeys((lexical_root, canonical_root)))
+        parents = tuple(dict.fromkeys((lexical_run, canonical_run)))
+        guards = _literal_ancestor_guards(parents)
+        _voice_runtime_paths_cache = (
+            lexical_home,
+            canonical_root,
+            roots,
+            parents,
+            guards,
+        )
+        return canonical_root
+
+
+def _voice_runtime_sandbox_paths() -> tuple[str, ...]:
+    """Return lexical and canonical snapshot roots, priming as a safe fallback."""
+    prime_voice_runtime_sandbox_paths()
+    assert _voice_runtime_paths_cache is not None
+    return _voice_runtime_paths_cache[2]
+
+
+def _voice_runtime_parent_paths() -> tuple[str, ...]:
+    """Return runtime parents that agent processes may read but never write."""
+    prime_voice_runtime_sandbox_paths()
+    assert _voice_runtime_paths_cache is not None
+    return _voice_runtime_paths_cache[3]
+
+
+def _voice_runtime_ancestor_guards() -> tuple[str, ...]:
+    """Return literal paths an agent must not rename around path-based rules."""
+    prime_voice_runtime_sandbox_paths()
+    assert _voice_runtime_paths_cache is not None
+    return _voice_runtime_paths_cache[4]
+
+
+_VOICE_GUARD_REMEDY = "Pick a project subdirectory that does not contain the Kiro Crew data home."
+
+_VoiceGuardRelationship = Literal["contains", "inside", "alias", "cannot-verify"]
+
+
+def _voice_runtime_guard_message(
+    workspace_path: str,
+    runtime_path: str,
+    relationship: _VoiceGuardRelationship,
+    failed_path: str | None = None,
+    failure_reason: str | None = None,
+) -> str:
+    """Build every variant of the voice-runtime workspace refusal.
+
+    Each variant leads with the two concrete absolute paths, keeps its own
+    distinguishing detail, and ends with the same remedy sentence, so a user
+    who picked ``~`` (an ancestor of the default ``~/.kiro/crew`` data home)
+    sees exactly which two paths collide and what to choose instead. The
+    message is operator-facing and may reach logs: it carries only the two
+    paths the caller already knows (plus, on the cannot-verify variant, the
+    path whose filesystem check failed).
+    """
+    if relationship == "contains":
+        return (
+            f"macOS agent workspace {workspace_path!r} overlaps Kiro Crew's "
+            f"protected voice runtime {runtime_path!r}: the workspace contains "
+            f"the voice runtime / data home. {_VOICE_GUARD_REMEDY}"
+        )
+    if relationship == "inside":
+        return (
+            f"macOS agent workspace {workspace_path!r} overlaps Kiro Crew's "
+            f"protected voice runtime {runtime_path!r}: the workspace is the "
+            f"voice runtime / data home or lives inside it. {_VOICE_GUARD_REMEDY}"
+        )
+    if relationship == "alias":
+        return (
+            f"macOS agent workspace {workspace_path!r} aliases Kiro Crew's "
+            f"protected voice runtime {runtime_path!r}: by filesystem identity "
+            "(a case, normalization, symlink, or firmlink alias) one of these "
+            f"paths is the other or an ancestor of the other. {_VOICE_GUARD_REMEDY}"
+        )
+    return (
+        f"cannot verify that macOS agent workspace {workspace_path!r} is "
+        f"separate from Kiro Crew's protected voice runtime {runtime_path!r}: "
+        f"a filesystem check failed on {failed_path!r} ({failure_reason}), "
+        "so the guard cannot prove the paths are disjoint and fails closed "
+        f"rather than start an agent it cannot isolate. {_VOICE_GUARD_REMEDY}"
+    )
+
+
+def _lexical_runtime_overlap(
+    workspace_paths: tuple[str, ...], runtime_paths: tuple[str, ...]
+) -> tuple[str, str, _VoiceGuardRelationship] | None:
+    """First lexical containment hit between workspace and runtime spellings.
+
+    THE shared containment scan: :func:`voice_runtime_workspace_conflict` (the
+    non-raising pre-flight) and :func:`assert_voice_runtime_outside_agent_workspace`
+    (the fail-closed spawn guard) both call this, so the pre-flight cannot
+    silently drift from the guard it mirrors (Design/FP review round 2 — the
+    two previously carried independent copies of this loop).
+
+    Returns ``(workspace_path_to_name, runtime_path, relationship)`` for the
+    first hit, or ``None``. Naming convention is the guard's: refusals always
+    name the workspace as the caller spelled it (``workspace_paths[0]``); a
+    hit found only on a non-original spelling (the realpath of a symlinked
+    workspace) is an ``"alias"`` relationship — formatting the resolved path
+    instead would print the runtime path twice and omit the path the user
+    actually configured.
+    """
+    original = workspace_paths[0]
+    for workspace_path in workspace_paths:
+        for runtime_path in runtime_paths:
+            try:
+                common = os.path.commonpath((workspace_path, runtime_path))
+            except ValueError:
+                continue
+            if common not in (workspace_path, runtime_path):
+                continue
+            if workspace_path != original:
+                return (original, runtime_path, "alias")
+            return (
+                original,
+                runtime_path,
+                "inside" if common == runtime_path else "contains",
+            )
+    return None
+
+
+def voice_runtime_workspace_conflict(workspace: str | os.PathLike[str]) -> str | None:
+    """Pre-flight: describe why *workspace* would be rejected, or ``None``.
+
+    A non-raising lexical version of
+    :func:`assert_voice_runtime_outside_agent_workspace` for validation
+    surfaces (the project endpoint, pickers) that want to warn BEFORE a
+    session exists. Lexical containment only — the descriptor/identity walks
+    stay in the spawn-time guards, which remain authoritative; a ``None`` here
+    is a pre-flight pass, not a security verdict. Darwin-gated to MATCH the
+    guards it pre-flights: every spawn-time guard early-returns off macOS, so
+    a workspace that overlaps the data home spawns fine on Linux/Windows
+    today — refusing it here would remove a working configuration to prevent
+    a macOS-only harm (and with macOS-worded copy).
+
+    Messages come from :func:`_voice_runtime_guard_message` (#7407) and the
+    containment scan is shared with the spawn-time guard
+    (:func:`_lexical_runtime_overlap`), so the pre-flight warning and the
+    spawn-time refusal read identically and cannot drift apart.
+    """
+    if sys.platform != "darwin":
+        return None
+    workspace_paths = tuple(
+        dict.fromkeys(
+            (
+                os.path.abspath(os.fspath(workspace)),
+                os.path.realpath(os.fspath(workspace)),
+            )
+        )
+    )
+    try:
+        runtime_paths = tuple(
+            dict.fromkeys(os.path.abspath(path) for path in _voice_runtime_sandbox_paths())
+        )
+    except OSError:
+        # Pre-flight only: if the runtime paths cannot be resolved here, let
+        # the spawn-time guard (which fails closed) produce the verdict.
+        return None
+    hit = _lexical_runtime_overlap(workspace_paths, runtime_paths)
+    if hit is not None:
+        return _voice_runtime_guard_message(*hit)
+    return None
+
+
+def assert_voice_runtime_outside_agent_workspace(workspace: str | os.PathLike[str]) -> None:
+    """Fail closed when a macOS agent workspace can reach decoder snapshots.
+
+    Kiro's internal macOS sandbox cannot nest inside Kiro Crew's Seatbelt
+    profile, so delegated Kiro agents do not inherit our voice-runtime deny
+    rules. A workspace that is the voice root, lives below it, or contains it
+    would therefore let a same-UID agent replace a verified named Mach-O image
+    before ``posix_spawn`` opens it. Check both lexical and canonical spellings
+    before either ACP agent path delegates isolation to Kiro.
+    """
+    if sys.platform != "darwin":
+        return
+
+    def _identity_in_ancestor_chain(identity: tuple[int, int], path: str) -> bool:
+        current = os.path.abspath(path)
+        while True:
+            info = os.stat(current)
+            if (info.st_dev, info.st_ino) == identity:
+                return True
+            parent = os.path.dirname(current)
+            if parent == current:
+                return False
+            current = parent
+
+    raw_workspace_paths = tuple(
+        dict.fromkeys(
+            (
+                os.path.abspath(os.fspath(workspace)),
+                os.path.realpath(os.fspath(workspace)),
+            )
+        )
+    )
+    raw_runtime_paths = tuple(
+        dict.fromkeys(os.path.abspath(path) for path in _voice_runtime_sandbox_paths())
+    )
+    # Refusals always name the workspace as the caller spelled it. A hit found
+    # only on the canonical (realpath) spelling of a symlinked workspace is an
+    # alias relationship from the caller's own spelling -- formatting the
+    # resolved path instead would print the runtime path twice and omit the
+    # path the user actually configured. The scan itself is shared with the
+    # non-raising pre-flight (_lexical_runtime_overlap), so the two surfaces
+    # cannot drift apart.
+    original_workspace_path = raw_workspace_paths[0]
+    lexical_hit = _lexical_runtime_overlap(raw_workspace_paths, raw_runtime_paths)
+    if lexical_hit is not None:
+        raise RuntimeError(_voice_runtime_guard_message(*lexical_hit))
+
+    # Path spelling is only a fast reject. Compare filesystem identities too,
+    # walking both ancestor directions so case, normalization, symlink, and
+    # firmlink aliases on an existing APFS workspace cannot evade the guard.
+    try:
+        workspace_identities = tuple(
+            (info.st_dev, info.st_ino) for info in (os.stat(path) for path in raw_workspace_paths)
+        )
+        runtime_identities = tuple(
+            (info.st_dev, info.st_ino) for info in (os.stat(path) for path in raw_runtime_paths)
+        )
+        for workspace_identity in workspace_identities:
+            for runtime_path in raw_runtime_paths:
+                if _identity_in_ancestor_chain(workspace_identity, runtime_path):
+                    raise RuntimeError(
+                        _voice_runtime_guard_message(original_workspace_path, runtime_path, "alias")
+                    )
+        for runtime_path, runtime_identity in zip(raw_runtime_paths, runtime_identities):
+            for workspace_path in raw_workspace_paths:
+                if _identity_in_ancestor_chain(runtime_identity, workspace_path):
+                    raise RuntimeError(
+                        _voice_runtime_guard_message(original_workspace_path, runtime_path, "alias")
+                    )
+    except OSError as exc:
+        raise RuntimeError(
+            _voice_runtime_guard_message(
+                raw_workspace_paths[0],
+                raw_runtime_paths[0] if raw_runtime_paths else "<unknown>",
+                "cannot-verify",
+                failed_path=getattr(exc, "filename", None) or "<unknown path>",
+                failure_reason=getattr(exc, "strerror", None) or str(exc),
+            )
+        ) from exc
+
+
+def _open_directory_descriptor(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> int:
+    """Open a directory identity without making its descriptor inheritable."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    return os.open(os.fspath(path), flags, dir_fd=dir_fd)
+
+
+def _directory_ancestor_identities(descriptor: int) -> tuple[tuple[int, int], ...]:
+    """Walk directory ancestors by descriptor, immune to pathname retargeting."""
+    current = os.dup(descriptor)
+    identities: list[tuple[int, int]] = []
+    try:
+        while True:
+            current_info = os.fstat(current)
+            current_identity = (current_info.st_dev, current_info.st_ino)
+            identities.append(current_identity)
+            parent = _open_directory_descriptor("..", dir_fd=current)
+            parent_info = os.fstat(parent)
+            parent_identity = (parent_info.st_dev, parent_info.st_ino)
+            if parent_identity == current_identity:
+                os.close(parent)
+                break
+            os.close(current)
+            current = parent
+        return tuple(identities)
+    finally:
+        os.close(current)
+
+
+def bind_voice_safe_agent_workspace(
+    workspace: str | os.PathLike[str],
+) -> tuple[str, int | None]:
+    """Bind a verified macOS workspace identity for delegated Kiro startup.
+
+    A pathname-only overlap check has an unavoidable check/use window: another
+    sandboxed process can retarget a workspace symlink after ``stat`` and before
+    Kiro initializes its own sandbox. On macOS, open the workspace first and
+    compare directory ancestry entirely through descriptors.
+
+    The descriptor is returned ALONGSIDE the pathname, never baked into it. The
+    child enters it with ``fchdir`` (see ``create_subprocess_limited``'s
+    ``chdir_fd``), so nothing re-resolves the name. Handing the spawn a
+    ``cwd="/dev/fd/<n>"`` pathname instead does not work: only Linux publishes
+    those entries as symlinks to the target, and on macOS -- the only platform
+    that binds here at all -- ``chdir()`` on one is refused (``EACCES`` on one
+    reporting host, ``ENOTDIR`` on macOS 26), which is every delegated spawn on a
+    packaged build.
+
+    The returned descriptor must stay open as long as the caller re-verifies the
+    binding through :func:`bound_agent_workspace_target`. The child's copy is
+    independent, so closing this one does not disturb a running agent.
+
+    Other platforms keep their original pathname and do not inherit a descriptor.
+    """
+    workspace_path = os.fspath(workspace)
+    if sys.platform != "darwin":
+        return workspace_path, None
+
+    workspace_fd = -1
+    runtime_fds: list[int] = []
+    runtime_paths: tuple[str, ...] = ()
+    try:
+        # Resolve the runtime paths before opening the workspace: a workspace
+        # open() failure lands in the OSError handler below, which names the
+        # colliding runtime path in its refusal -- resolving after the open
+        # would print "<unknown>" for exactly the failure a user hits first.
+        runtime_paths = _voice_runtime_sandbox_paths()
+
+        workspace_fd = _open_directory_descriptor(workspace_path)
+        workspace_identity = os.fstat(workspace_fd)
+        workspace_id = (workspace_identity.st_dev, workspace_identity.st_ino)
+        workspace_ancestors = set(_directory_ancestor_identities(workspace_fd))
+
+        for runtime_path in runtime_paths:
+            runtime_fd = _open_directory_descriptor(runtime_path)
+            runtime_fds.append(runtime_fd)
+            runtime_identity = os.fstat(runtime_fd)
+            runtime_id = (runtime_identity.st_dev, runtime_identity.st_ino)
+            runtime_ancestors = set(_directory_ancestor_identities(runtime_fd))
+            if workspace_id in runtime_ancestors or runtime_id in workspace_ancestors:
+                raise RuntimeError(
+                    _voice_runtime_guard_message(
+                        os.path.abspath(workspace_path),
+                        os.path.abspath(runtime_path),
+                        "inside" if runtime_id in workspace_ancestors else "contains",
+                    )
+                )
+
+        return workspace_path, workspace_fd
+    except OSError as exc:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+        raise RuntimeError(
+            _voice_runtime_guard_message(
+                os.path.abspath(workspace_path),
+                os.path.abspath(runtime_paths[0]) if runtime_paths else "<unknown>",
+                "cannot-verify",
+                failed_path=getattr(exc, "filename", None) or "<unknown path>",
+                failure_reason=getattr(exc, "strerror", None) or str(exc),
+            )
+        ) from exc
+    except BaseException:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+        raise
+    finally:
+        for runtime_fd in runtime_fds:
+            os.close(runtime_fd)
+
+
+def _close_bound_agent_workspace(descriptor: int) -> None:
+    """Close a workspace descriptor, swallowing an already-closed race."""
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+async def release_bound_agent_workspace(descriptor: int) -> None:
+    """Close a bound workspace descriptor off-loop before honoring cancellation."""
+    closing = asyncio.create_task(asyncio.to_thread(_close_bound_agent_workspace, descriptor))
+    cancellation: asyncio.CancelledError | None = None
+    while not closing.done():
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError as exc:
+            # A descriptor is a process-lifetime resource.  A second cancellation
+            # must not detach the worker that owns its close and leak it until the
+            # gateway exits, so settle the tiny close before propagating cancel.
+            cancellation = exc
+    closing.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def bind_voice_safe_agent_workspace_async(
+    workspace: str | os.PathLike[str],
+) -> tuple[str, int | None]:
+    """Cancellation-safe off-loop wrapper for workspace identity binding.
+
+    ``asyncio.to_thread`` cannot stop a running worker.  If its awaiter is
+    cancelled after the worker opens the descriptor but before ownership is
+    transferred, a plain await loses the returned fd.  Shield and settle the
+    worker; on cancellation, close any descriptor it produced before re-raising.
+    """
+    binding = asyncio.create_task(asyncio.to_thread(bind_voice_safe_agent_workspace, workspace))
+    cancellation: asyncio.CancelledError | None = None
+    while not binding.done():
+        try:
+            await asyncio.shield(binding)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+
+    if cancellation is None:
+        return binding.result()
+
+    try:
+        _path, descriptor = binding.result()
+    except BaseException:
+        # The caller's cancellation remains authoritative, but retrieving the
+        # worker exception prevents a false "Task exception was never retrieved".
+        raise cancellation
+    if descriptor is not None:
+        try:
+            await release_bound_agent_workspace(descriptor)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    raise cancellation
+
+
+def _bound_agent_workspace_matches(descriptor: int, workspace: str | os.PathLike[str]) -> bool:
+    """Whether *workspace* currently names an already-bound directory identity.
+
+    The caller uses the bound identity after this comparison, never the supplied
+    pathname, so a subsequent symlink retarget cannot change what is authorized.
+    """
+    candidate = _open_directory_descriptor(workspace)
+    try:
+        expected = os.fstat(descriptor)
+        actual = os.fstat(candidate)
+        return (expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino)
+    finally:
+        os.close(candidate)
+
+
+def bound_agent_workspace_target(descriptor: int, workspace: str | os.PathLike[str]) -> str | None:
+    """The bound directory's OWN pathname, or None when *workspace* is not it.
+
+    The identity check and the name read are one call because a caller needs both
+    in the same worker hop, and because returning the caller's own pathname would
+    defeat the check: that string is exactly what a same-UID retarget controls,
+    and a peer handed it re-resolves it after this returns.
+
+    What comes back is the kernel's name for the descriptor that was verified
+    (``/proc/self/fd`` on Linux, ``F_GETPATH`` on macOS), so it carries no symlink
+    component left to swap and it cannot name a descendant the check never covered.
+
+    It does NOT make a peer's own resolution descriptor-bound, and nothing can: a
+    pathname handed to another process is re-resolved by that process, and macOS has
+    no descriptor-addressable path namespace to hand instead (``/dev/fd/<n>`` is
+    exactly what it cannot resolve). A same-UID rename of the canonical directory
+    between this call and that resolution therefore stays open. Callers that own the
+    child's cwd should pin it with ``create_subprocess_limited``'s ``chdir_fd``,
+    which does not go through a name at all; this is for the ACP ``session/new`` cwd,
+    where a string is the only thing the protocol carries.
+
+    Raises OSError when this platform exposes no way to ask, so the caller fails
+    closed instead of falling back to the mutable spelling.
+    """
+    if not _bound_agent_workspace_matches(descriptor, workspace):
+        return None
+    # Local import: hooks imports sandbox at call time, so a module-level
+    # dependency would be circular. `_fd_real_path` is private but already
+    # borrowed this way by apps/builtins/spec_builder/backend/routes.py; issue
+    # #6907 tracks promoting it to a shared home.
+    from kiro_crew.hooks import _fd_real_path
+
+    resolved = _fd_real_path(descriptor)
+    if resolved is None:
+        raise OSError(
+            errno.ENOSYS,
+            "cannot read a bound workspace descriptor's own path on this platform",
+        )
+    return resolved
+
+
+class BoundWorkspaceMismatch(Exception):
+    """A requested session workspace is not the bound directory identity."""
+
+
+async def resolve_bound_session_workspace(
+    descriptor: int, workspace: str | os.PathLike[str]
+) -> str:
+    """Off-loop verify-then-substitute for an ACP session cwd on a bound runtime.
+
+    Both ACP front ends enforce one rule -- prove the requested path still names the
+    bound identity, then hand the peer the DESCRIPTOR's own name instead of the
+    caller's spelling -- so the rule lives here once rather than in two places that
+    can drift apart. Each caller keeps only the mapping to its own error type:
+    :class:`BoundWorkspaceMismatch` when the path is not the bound identity, OSError
+    when the binding cannot be verified at all.
+
+    Off-loop because it opens a directory and reads a descriptor's name; on the loop
+    that is filesystem IO in front of every session start.
+    """
+    resolved = await asyncio.to_thread(bound_agent_workspace_target, descriptor, workspace)
+    if resolved is None:
+        raise BoundWorkspaceMismatch(os.fspath(workspace))
+    return resolved
+
+
+def _is_policy_cache_dir(path: str) -> bool:
+    """Whether *path* is a governance-cache directory, by leaf name.
+
+    Matched on the leaf rather than against a resolved path so it holds for every
+    spelling the dir lists carry — the ``$HOME``-relative default, the legacy
+    ``~/.kirocrew`` entry that the deny lists must keep covering, and the relocated
+    form from :func:`_relocated_policy_cache_dirs` — without a filesystem call on the
+    spawn path.
+    """
+    return os.path.basename(path.rstrip("/" + os.sep)) == _POLICY_CACHE_LEAF
+
+
+def _crew_hidden_sandbox_targets() -> set[str]:
+    """Absolute paths of the crew-home leaves the sandbox masks, both spellings.
+
+    The seatbelt profile needs to tell these apart from the other hidden entries: they
+    take a write deny as well as a read deny, while ``.aws`` must not (a tool refreshing
+    a cached token rewrites it legitimately). On Linux the distinction does not arise --
+    a bind mount blocks both directions in one rule.
+    """
+    home = str(Path.home())
+    targets = {os.path.join(home, rel) for rel in _CREW_HIDDEN_DIRS}
+    targets.update(_relocated_crew_targets(_CREW_HIDDEN_LEAVES))
+    return targets
+
+
+def _is_voice_runtime_dir(path: str) -> bool:
+    """Whether *path* is the gateway-only voice runtime subtree."""
+    normalized = os.path.normpath(path)
+    return normalized.endswith(os.sep + _VOICE_RUNTIME_LEAF) or normalized.endswith(
+        "/" + _VOICE_RUNTIME_LEAF.replace(os.sep, "/")
+    )
+
 
 # CC mode: files to expose read-only inside otherwise-hidden dirs.
 # After hiding the parent dir, these are recreated with original content.
@@ -150,26 +1415,39 @@ _SENSITIVE_ENV_PREFIXES: list[str] = [
 
 # Python interpreter env that must NOT leak into a *foreign* Python subprocess
 # launched under the sandbox (e.g. the MCP servers kiro-cli spawns, such as
-# ord-mcp, which bundle their own interpreter + deps). KiroCrew's runtime may
-# export PYTHONPATH pointing at its own site-packages; a foreign server that
-# inherits it prepends KiroCrew's site-packages to sys.path and imports
-# KiroCrew's fastmcp/cryptography instead of its own -> ABI collision + init
-# hang. Stripped ONLY when the caller passes ``strip_python_env=True`` (the
+# ord-mcp, which bundle their own interpreter + deps, or any Python the agent's
+# shell runs).
+#  - PYTHONPATH / PYTHONHOME: Kiro Crew's runtime may export PYTHONPATH
+#    pointing at its own site-packages; a foreign server that inherits it
+#    prepends Kiro Crew's site-packages to sys.path and imports Kiro Crew's
+#    fastmcp/cryptography instead of its own -> ABI collision + init hang.
+#  - PYTHONPYCACHEPREFIX: the packaged desktop app exports it at
+#    ``<data home>/cache/pycache`` so the embedded interpreter keeps bytecode
+#    out of the signed bundle. Inherited into the agent subtree, every foreign
+#    interpreter (uv-managed pythons, ephemeral venvs the agent's bash spawns)
+#    mirrors its whole stdlib + site-packages under the crew home instead of
+#    writing ``__pycache__`` beside its own sources; each ephemeral root mints
+#    a fresh path-keyed mirror, so the cache grows without bound (multi-GB per
+#    day under heavy subagent use). ``pycache_gc.prune_pycache`` bounds what
+#    the gateway's own tree still writes there.
+# Stripped ONLY when the caller passes ``strip_python_env=True`` (the
 # kiro-cli / agent spawn path). It is deliberately NOT part of
 # ``_SENSITIVE_ENV_PREFIXES`` because KiroCrew's OWN sandboxed Python
 # subprocesses (cron scripts, app backends, code-review workers) import
-# ``kiro_crew`` via PYTHONPATH and would break if it were stripped.
+# ``kiro_crew`` via PYTHONPATH — and on the packaged app must keep writing
+# bytecode outside the signed bundle — so both would break if stripped.
 _PYTHON_ENV_PREFIXES: list[str] = [
     "PYTHONPATH",
     "PYTHONHOME",
+    "PYTHONPYCACHEPREFIX",
 ]
 
 # Gateway-owned credentials must never reach agent-influenced subprocesses.
 # This list feeds the cc/strict launcher scrub, the always-on ``scrub_env``
-# parent scrub, and ``scrub_agent_denied_env`` — the parent-level scrub the ACP
-# spawn paths apply on EVERY tier (incl. the default auto/standard tier, whose
-# launcher does not strip these keys). Loader coverage is pinned by regression
-# test.
+# parent scrub, and the narrower ``scrub_agent_denied_env`` compatibility helper.
+# ACP spawn paths use ``scrub_agent_subprocess_env`` so Windows Kiro delegation
+# has the same parent-side scrub as the POSIX sandbox launchers. Loader coverage
+# is pinned by regression test.
 _AGENT_DENIED_ENV_KEYS: list[str] = [
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
@@ -183,7 +1461,37 @@ _AGENT_DENIED_ENV_KEYS: list[str] = [
     "MICROSOFT_APP_PASSWORD",
     "MICROSOFT_APP_TENANT_ID",
     "WEIXIN_TOKEN",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "JIRA_API_TOKEN",
+    "JIRA_TOKEN_",
     "KIROCREW_OWNER_ID",
+    # The central-governance fetch configuration — see
+    # ``platform/policy_distribution.py``. The URL is listed as well as the header,
+    # deliberately:
+    #
+    # * ``KIROCREW_POLICY_HEADERS`` is a live bearer credential for the fleet's own
+    #   control plane, and with it an agent could read the ceiling document that the
+    #   ``is_sensitive_path`` keystone exists to keep it from reading on disk;
+    # * ``KIROCREW_POLICY_URL`` is credential-bearing in its own right whenever the
+    #   fleet uses a pre-signed object URL, where the signature rides in the query
+    #   string — and even unsigned it names the control plane, which the SEL, the
+    #   policy viewer and ``RefreshOutcome.detail`` all deliberately withhold.
+    #
+    # Spelled as CONCRETE NAMES rather than a ``KIROCREW_POLICY_`` prefix, because this
+    # list has consumers with two different matching rules: the spawn scrubs here use
+    # ``startswith``, but ``cron_script._CRON_ENV_DENY`` tests exact membership and
+    # ``mcp_cron`` builds ``\b``-anchored regexes from it, and a prefix entry silently
+    # matches nothing in either. ``test_governance_distribution`` pins these against
+    # ``POLICY_DISTRIBUTION_ENV_VARS``, which owns the set, so a variable added there
+    # cannot quietly stay agent-readable.
+    "KIROCREW_POLICY_URL",
+    "KIROCREW_POLICY_HEADERS",
+    "KIROCREW_POLICY_REFRESH_SECS",
+    "KIROCREW_POLICY_TIMEOUT_SECS",
+    "KIROCREW_POLICY_MAX_CACHE_AGE_SECS",
+    "KIROCREW_POLICY_ON_UNAVAILABLE",
+    "KIROCREW_POLICY_CACHE_ONLY",
 ]
 
 
@@ -236,6 +1544,35 @@ _WARM_JOIN_TIMEOUT_SECS = 2.0
 # reported transient forever — still gets told which sysctl to raise.
 _PROBE_STEP_NEWUSER = "unshare(CLONE_NEWUSER)"
 _PROBE_STEP_NEWNS = "unshare(CLONE_NEWNS)"
+#: Wire step the probe child sends INSTEAD of "U" when its ``CLONE_NEWUSER`` EINVAL
+#: is explained by the child having been multithreaded, carrying the thread count.
+#: The parent classifies it exactly as it classifies a plain EINVAL -- the step
+#: exists to carry the explanation, not to change the verdict. See
+#: ``_probe_child_thread_count``.
+_PROBE_STEP_MULTITHREADED = "M"
+
+#: Trailing clause of the reason `_probe_parent_sequence` emits for the
+#: `_PROBE_STEP_MULTITHREADED` collapse. A single shared spelling, because callers
+#: that must RECOGNIZE the collapse (a fork child whose verdict is unobtainable is
+#: an unknown reading, not a disagreement) match against the reason text -- a
+#: hand-copied substring would drift the moment the wording changes.
+_PROBE_MULTITHREADED_REASON = (
+    "an os.register_at_fork hook started one, so the kernel's own verdict is "
+    "unobtainable from this child"
+)
+
+
+def _probe_reason_is_multithreaded_collapse(reason: str) -> bool:
+    """Whether a probe reason reports the multithreaded-fork-child collapse.
+
+    True only for the fork path: the collapse text is emitted by
+    `_probe_parent_sequence` when the probe child counted more than one thread,
+    which happens when an ``os.register_at_fork`` hook armed earlier in the
+    calling process starts a thread inside every fork child. The verdict such a
+    child returns is the hook's artifact, not the kernel's answer.
+    """
+    return _PROBE_MULTITHREADED_REASON in (reason or "")
+
 
 # A probe child that vanished mid-handshake is a harness failure, not a kernel
 # verdict, so it must not be cached as "this host has no sandbox". Kept separate
@@ -397,6 +1734,74 @@ def _close_probe_fds(*fds: int) -> None:
             pass
 
 
+_PROBE_CHILD_FD_SWEEP_CAP = 4096
+"""Fallback bound for the probe child's inherited-fd close sweep.
+
+Used only when ``SC_OPEN_MAX`` cannot be read or answers nonsense. When
+sysconf answers, its value (the soft ``RLIMIT_NOFILE``) is trusted as the
+bound: ``os.closerange`` delegates to ``close_range(2)`` on Linux >= 5.9, so
+a wide span costs one syscall rather than a walk, and silently clamping the
+bound would leave a high-numbered lock fd open with no diagnostic that the
+sweep came up short.
+"""
+
+
+def _fd_sweep_ranges(keep: frozenset[int], limit: int | None = None) -> tuple[tuple[int, int], ...]:
+    """Precompute the ``os.closerange`` spans covering ``[0, bound)`` minus *keep*.
+
+    Runs in the PARENT, before ``os.fork()``. The probe child of a threaded
+    process must not allocate or take locks — another thread may own the
+    allocator lock at fork time and vanish, leaving it held forever in the
+    child — so everything that sorts, boxes, or asks ``sysconf`` happens here,
+    and the child is left executing bare ``closerange`` syscalls over the
+    returned pairs (:func:`_close_fd_ranges`).
+
+    The bound is ``SC_OPEN_MAX`` (the soft ``RLIMIT_NOFILE``);
+    :data:`_PROBE_CHILD_FD_SWEEP_CAP` applies only when sysconf cannot answer.
+    ``limit`` exists for tests. Never raises.
+    """
+    if limit is None:
+        try:
+            limit = int(os.sysconf("SC_OPEN_MAX"))
+        except (AttributeError, OSError, ValueError):
+            # AttributeError: os.sysconf does not exist off-POSIX (Windows);
+            # the sweep only runs on Linux, but this helper must keep its
+            # never-raises contract everywhere the tests exercise it.
+            limit = _PROBE_CHILD_FD_SWEEP_CAP
+    if limit <= 0:
+        limit = _PROBE_CHILD_FD_SWEEP_CAP
+    ranges: list[tuple[int, int]] = []
+    low = 0
+    for fd in sorted(k for k in keep if k >= 0):
+        if fd >= limit:
+            break
+        if fd > low:
+            ranges.append((low, fd))
+        low = fd + 1
+    if low < limit:
+        ranges.append((low, limit))
+    return tuple(ranges)
+
+
+def _close_fd_ranges(ranges: tuple[tuple[int, int], ...]) -> None:
+    """Close the precomputed fd spans: the probe child's half of the sweep.
+
+    Runs between ``os.fork()`` and ``os._exit`` in a child that never execs,
+    so ``O_CLOEXEC`` never fires and every inherited descriptor — the
+    ``gateway.lock`` flock fd and the dashboard listen socket included — is
+    still open. Without the sweep, a probe child orphaned by its parent's
+    death (gateway OOM-killed between fork and reap) keeps the lock fd open
+    and pins the data home until someone reclaims it.
+
+    Only ``os.closerange`` is invoked here: the spans were computed pre-fork
+    by :func:`_fd_sweep_ranges` precisely so this post-fork path does no
+    allocation-bearing work beyond iterating a ready tuple. ``closerange``
+    ignores bad fds, so this never raises.
+    """
+    for low, high in ranges:
+        os.closerange(low, high)
+
+
 def _probe_failure(label: str, err: int) -> tuple[bool, bool, str, str]:
     """Shape one failed probe step into ``(ok, transient, reason)``.
 
@@ -444,6 +1849,40 @@ def _probe_child_unshare(libc: ctypes.CDLL, flags: int) -> int:
     if libc.unshare(flags) == 0:
         return 0
     return ctypes.get_errno() or errno.EPERM
+
+
+def _probe_child_thread_count() -> int:
+    """Live threads in the probe child, or 0 when it cannot be determined.
+
+    ``unshare(CLONE_NEWUSER)`` implies ``CLONE_THREAD``, which the kernel refuses
+    with **EINVAL** unless the caller's thread group holds exactly one task. A
+    ``fork()`` child is single-threaded by construction, so this normally reads 1 --
+    but ``os.register_at_fork`` handlers run INSIDE ``os.fork()``, before it
+    returns, and a library can start a thread there. OpenTelemetry's metric SDK does
+    exactly that: its ``PeriodicExportingMetricReader`` registers an
+    ``after_in_child`` hook that restarts its exporter thread in every child.
+
+    Used ONLY to explain an EINVAL, never to reclassify one. EINVAL is genuinely
+    ambiguous here -- a kernel built without ``CONFIG_USER_NS`` returns it too, and a
+    multithreaded child cannot tell the two apart, because it never gets far enough to
+    ask. Calling it transient would be just as wrong as calling it permanent, and it
+    would additionally withhold the ``no_backend`` opt-in (``sandbox_allow_unsandboxed_exec``)
+    from a host that really has no user namespaces. So the classification stays exactly
+    as it was and the REASON names the thread, which is the part a reader cannot infer:
+    a bare "errno 22 (EINVAL)" sends them to check their kernel config, which is the
+    wrong place. Making such a process probe successfully needs a single-threaded
+    child, i.e. a different spawn mechanism, and that is its own change.
+
+    ``st_nlink`` of ``/proc/self/task`` is ``2 + threads`` (each thread is a
+    subdirectory), so this is one ``stat`` and no list: the probe child of a threaded
+    process must not allocate, because another thread may have owned the allocator lock
+    at fork time and no longer exists to release it. Linux-only, like the rest of the
+    probe.
+    """
+    try:
+        return max(0, os.stat("/proc/self/task").st_nlink - 2)
+    except OSError:
+        return 0
 
 
 def _probe_write_identity_maps(pid: int, uid: int, gid: int) -> tuple[str, int] | None:
@@ -556,16 +1995,35 @@ def _probe_reap(pid: int) -> None:
 
 
 def _probe_child_sequence(
-    libc: ctypes.CDLL, c2p_r: int, c2p_w: int, p2c_r: int, p2c_w: int
+    libc: ctypes.CDLL,
+    c2p_r: int,
+    c2p_w: int,
+    p2c_r: int,
+    p2c_w: int,
+    sweep_ranges: tuple[tuple[int, int], ...],
 ) -> None:
     """Probe child: run the launcher's two unshare steps, reporting each on the pipe.
 
     Never returns. It reports raw errnos and classifies nothing, so the entire
     verdict lives in the parent where a test can drive it without forking.
+    ``sweep_ranges`` was computed pre-fork by :func:`_fd_sweep_ranges` so this
+    path performs no allocation-bearing bookkeeping of its own.
     """
     try:
         _close_probe_fds(c2p_r, p2c_w)
+        # Drop every other inherited descriptor before touching namespaces:
+        # an orphaned probe child must not keep the gateway.lock fd (or the
+        # dashboard listen socket) open and pin the home. Only the handshake
+        # ends and the standard streams survive. (#3150)
+        _close_fd_ranges(sweep_ranges)
+        # Read BEFORE the unshare: it is the only moment the count is the one the
+        # kernel judged. Reported only alongside an EINVAL, and only to explain it --
+        # see _probe_child_thread_count for why it must not change the verdict.
+        threads = _probe_child_thread_count()
         err = _probe_child_unshare(libc, _CLONE_NEWUSER)
+        if err == errno.EINVAL and threads > 1:
+            os.write(c2p_w, b"M:%d\n" % threads)
+            os._exit(0)
         os.write(c2p_w, b"U:%d\n" % err)
         if err:
             os._exit(0)
@@ -580,14 +2038,37 @@ def _probe_child_sequence(
 
 
 def _probe_parent_sequence(
-    pid: int, c2p_r: int, p2c_w: int, uid: int, gid: int
+    pid: int,
+    c2p_r: int,
+    p2c_w: int,
+    uid: int,
+    gid: int,
+    death: Callable[[int], str] = _probe_child_death,
 ) -> tuple[bool, bool, str, str]:
-    """Parent half of the probe: drive the handshake and decide the verdict."""
+    """Parent half of the probe: drive the handshake and decide the verdict.
+
+    ``death`` describes a child that stopped reporting. It is injected because the
+    spawned probe's child is owned by a ``Popen`` -- calling ``waitpid`` on it here
+    would race that object's own bookkeeping -- while the forked probe's child is
+    reaped by this module. The verdict logic is identical for both.
+    """
     report = _probe_read_step(c2p_r)
     if report is None:
-        death = _probe_child_death(pid)
-        return (False, True, f"probe child {death}; no {_PROBE_STEP_NEWUSER} result", "")
+        return (False, True, f"probe child {death(pid)}; no {_PROBE_STEP_NEWUSER} result", "")
     step, err = report
+    if step == _PROBE_STEP_MULTITHREADED:
+        # Same classification and same remedy as a plain EINVAL -- deliberately, see
+        # _probe_child_thread_count. Only the reason gains the thread count, because
+        # that is the one part a reader cannot infer from the errno.
+        ok, transient, reason, remedy = _probe_failure(_PROBE_STEP_NEWUSER, errno.EINVAL)
+        return (
+            ok,
+            transient,
+            f"{reason}; the probe child had {err} threads, which alone makes it "
+            "return EINVAL (CLONE_NEWUSER implies CLONE_THREAD) -- "
+            f"{_PROBE_MULTITHREADED_REASON}",
+            remedy,
+        )
     if step != "U":
         return (False, True, f"probe child sent unexpected step {step!r}", "")
     if err:
@@ -605,8 +2086,7 @@ def _probe_parent_sequence(
 
     report = _probe_read_step(c2p_r)
     if report is None:
-        death = _probe_child_death(pid)
-        return (False, True, f"probe child {death}; no {_PROBE_STEP_NEWNS} result", "")
+        return (False, True, f"probe child {death(pid)}; no {_PROBE_STEP_NEWNS} result", "")
     step, err = report
     if step != "N":
         return (False, True, f"probe child sent unexpected step {step!r}", "")
@@ -617,6 +2097,186 @@ def _probe_parent_sequence(
 
 def _probe_unshare_once() -> tuple[bool, bool, str, str]:
     """One launcher-shaped namespace probe: ``(ok, transient, reason)``.
+
+    Runs in a FRESH interpreter when one can be spawned, and falls back to
+    :func:`_probe_unshare_via_fork` otherwise. The two produce the same verdict
+    tuple through the same classifier; only the process the child half runs in
+    differs. See :data:`_PROBE_SHIM_CODE` for why that difference is the whole
+    point.
+    """
+    spawned = _probe_unshare_via_spawn()
+    if spawned is not None:
+        return spawned
+    return _probe_unshare_via_fork()
+
+
+#: Child half of the probe, run in a FRESH interpreter rather than a fork of the
+#: caller. Same wire protocol as :func:`_probe_child_sequence`, so the reviewed
+#: parent half drives either one unchanged.
+#:
+#: WHY A FRESH PROCESS. ``unshare(CLONE_NEWUSER)`` implies ``CLONE_THREAD`` and the
+#: kernel refuses it with EINVAL unless the caller's thread group holds exactly one
+#: task. A fork child inherits that condition: ``os.register_at_fork`` handlers run
+#: INSIDE ``os.fork()`` before it returns, so a dependency that restarts a thread in
+#: every child -- OpenTelemetry's ``PeriodicExportingMetricReader`` does exactly
+#: this -- makes the child multithreaded before the probe can measure anything. The
+#: verdict is then EINVAL, which is classified permanent and cached, and every later
+#: sandboxed spawn on that process fails closed. A release gate lost 40 tests to one
+#: such probe: all of them pass alone, none of them is a metrics test.
+#:
+#: A fresh interpreter starts single-threaded and runs no after-in-child fork hooks,
+#: so its thread count at ``unshare()`` time is 1 regardless of the caller. This does
+#: NOT soften the fail-closed rule: a genuinely single-threaded process that still
+#: gets EINVAL means the host lacks ``CONFIG_USER_NS``, which stays permanent. It
+#: removes the FALSE EINVAL, not the real one.
+#:
+#: It is also the more faithful probe. The real launcher is already a fresh
+#: interpreter -- ``wrap_argv`` returns ``[sys.executable, launcher_path, ...]`` --
+#: which then forks and unshares. So the fork-based probe was strictly MORE
+#: pessimistic than the spawn it predicts, and this makes the two agree.
+#:
+#: Kept deliberately free of ``kiro_crew`` imports and run under ``-I -S``, like
+#: ``_SPAWN_SHIM_CODE``: no site directory, no ``PYTHON*`` environment influence,
+#: nothing to shadow. It writes ONLY wire steps on fd 1.
+_PROBE_SHIM_CODE = r"""
+import ctypes, errno, os
+
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNS = 0x00020000
+
+
+def threads():
+    # st_nlink of /proc/self/task is the thread count plus the two dir entries.
+    try:
+        return max(1, os.stat("/proc/self/task").st_nlink - 2)
+    except OSError:
+        return 1
+
+
+def unshare(libc, flags):
+    ctypes.set_errno(0)
+    if libc.unshare(flags) == 0:
+        return 0
+    return ctypes.get_errno() or errno.EPERM
+
+
+def main():
+    try:
+        # dlopen(NULL): resolve unshare() from the libc ALREADY loaded into this
+        # interpreter. Never ctypes.util.find_library here -- on Linux it EXECUTES
+        # helper processes (ldconfig, then a PATH-resolved gcc/cc/objdump on musl
+        # hosts) to locate libc, and this probe runs before any confinement, so a
+        # workspace-controlled `gcc` on PATH would be same-user code execution.
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.unshare.argtypes = [ctypes.c_int]
+        libc.unshare.restype = ctypes.c_int
+    except BaseException:
+        os._exit(1)
+    n = threads()
+    err = unshare(libc, CLONE_NEWUSER)
+    if err == errno.EINVAL and n > 1:
+        os.write(1, b"M:%d\n" % n)
+        os._exit(0)
+    os.write(1, b"U:%d\n" % err)
+    if err:
+        os._exit(0)
+    if not os.read(0, 1):
+        os._exit(0)
+    os.write(1, b"N:%d\n" % unshare(libc, CLONE_NEWNS))
+    os._exit(0)
+
+
+main()
+"""
+
+#: Ceiling on the spawned probe. The child does two syscalls and one blocking read
+#: whose writer is this process, so anything near this is a wedged interpreter, not
+#: slow work. Exceeding it is reported TRANSIENT: a host that cannot start a Python
+#: in 20 seconds is under momentary pressure, not permanently sandbox-less.
+_PROBE_SPAWN_TIMEOUT_SECONDS = 20.0
+
+_probe_spawn_unavailable_logged = False
+
+
+def _probe_spawned_death(proc: "subprocess.Popen[bytes]") -> str:
+    """Describe how the spawned probe child ended, for a transient reason string."""
+    code = proc.poll()
+    if code is None:
+        return "did not report"
+    if code < 0:
+        return f"was killed by signal {-code}"
+    return f"exited with status {code}"
+
+
+def _probe_unshare_via_spawn() -> tuple[bool, bool, str, str] | None:
+    """Probe in a fresh interpreter. ``None`` means "cannot spawn, use the fork path".
+
+    Returning ``None`` rather than a verdict is deliberate: an interpreter this
+    process cannot start says nothing about the host's namespaces, so it must not
+    become a sandbox verdict.
+    """
+    global _probe_spawn_unavailable_logged
+    if not sys.executable:
+        if not _probe_spawn_unavailable_logged:
+            _probe_spawn_unavailable_logged = True
+            logger.warning(
+                "namespace probe cannot spawn a fresh interpreter (sys.executable is "
+                "empty); falling back to a fork-based probe, which reports EINVAL on a "
+                "multithreaded caller even where the sandbox works"
+            )
+        return None
+
+    uid, gid = os.getuid(), os.getgid()
+    try:
+        # close_fds is subprocess's default and does the job the fork path has to do
+        # by hand: the child gets only its standard streams, so an orphaned probe
+        # cannot hold the gateway lock fd or the dashboard listen socket open (#3150).
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", _PROBE_SHIM_CODE],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as exc:
+        return _probe_failure("probe spawn", exc.errno or 0)
+    except Exception as exc:  # pragma: no cover - defensive
+        return (False, True, f"probe spawn failed: {exc}", "")
+
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        return _probe_parent_sequence(
+            proc.pid,
+            proc.stdout.fileno(),
+            proc.stdin.fileno(),
+            uid,
+            gid,
+            death=lambda _pid: _probe_spawned_death(proc),
+        )
+    finally:
+        # Closing stdin releases a child still waiting on the maps; the wait then
+        # reaps it. Popen owns the pid, so _probe_reap must NOT run here.
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=_PROBE_SPAWN_TIMEOUT_SECONDS)
+        except Exception:  # pragma: no cover - a wedged interpreter
+            proc.kill()
+            try:
+                proc.wait(timeout=_PROBE_SPAWN_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+
+
+def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
+    """The fork-based probe: same verdict, but the child inherits fork hooks.
+
+    Retained as the fallback for a process that cannot spawn an interpreter at all.
+    Its child can be made multithreaded by an ``os.register_at_fork`` handler, which
+    is why :func:`_probe_unshare_via_spawn` is preferred whenever it is available.
 
     Mirrors the sequence ``_build_launcher_script()`` actually performs — fork,
     child ``unshare(CLONE_NEWUSER)``, parent writes the identity UID/GID map,
@@ -659,6 +2319,11 @@ def _probe_unshare_once() -> tuple[bool, bool, str, str]:
         _close_probe_fds(c2p_r, c2p_w)
         return _probe_failure("probe pipe", exc.errno or 0)
 
+    # Compute the child's fd sweep BEFORE forking: sorting, sysconf, and tuple
+    # building all allocate, and post-fork the allocator lock may be held by a
+    # thread that no longer exists in the child. (#3150)
+    sweep_ranges = _fd_sweep_ranges(frozenset({0, 1, 2, c2p_w, p2c_r}))
+
     try:
         pid = os.fork()
     except OSError as exc:
@@ -666,7 +2331,7 @@ def _probe_unshare_once() -> tuple[bool, bool, str, str]:
         return _probe_failure("fork", exc.errno or 0)
 
     if pid == 0:
-        _probe_child_sequence(libc, c2p_r, c2p_w, p2c_r, p2c_w)  # never returns
+        _probe_child_sequence(libc, c2p_r, c2p_w, p2c_r, p2c_w, sweep_ranges)  # never returns
         os._exit(1)  # pragma: no cover - defensive
 
     _close_probe_fds(c2p_w, p2c_r)
@@ -1083,12 +2748,43 @@ def _build_launcher_script(
         env_prefixes = env_prefixes + list(_PYTHON_ENV_PREFIXES)
     hide_ssh = sandbox_level == "strict"
     hidden_dirs = [os.path.join(home, d) for d in dirs]
+    hidden_dirs.extend(_relocated_policy_cache_dirs())
+    hidden_dirs.extend(_relocated_crew_targets(_CREW_HIDDEN_LEAVES))
+    hidden_dirs.extend(_voice_runtime_sandbox_paths())
     hidden_dirs.extend(os.path.abspath(path) for path in extra_hidden_dirs)
-    hidden_dirs = [
-        path
-        for path in hidden_dirs
-        if not _hidden_path_contains_visible_path(path, extra_visible_dirs)
+    unhidden = [
+        path for path in hidden_dirs if _hidden_path_contains_visible_path(path, extra_visible_dirs)
     ]
+    hidden_dirs = [path for path in hidden_dirs if path not in unhidden]
+    # The governance cache is READ-ONLY whenever it is exposed at all, and that is a
+    # property of the directory rather than of the caller's request: `extra_visible_dirs`
+    # otherwise cancels a target's whole rule set, so the one caller that legitimately
+    # needs to READ the ceiling (`apps/backend.py`, which boots in cache-only mode and
+    # resolves the fleet ceiling from this file) would get WRITE with it. That is the
+    # dangerous direction — the metadata records the source the next boot trusts, so a
+    # same-UID process that can rewrite the pair picks the ceiling for every later boot,
+    # and an app backend is arbitrary third-party code. Deciding it here means a future
+    # caller cannot re-open the hole by passing this path.
+    readonly_dirs = [path for path in unhidden if _is_policy_cache_dir(path)]
+    # ``run`` must stay readable because it holds this launcher, but making both
+    # its lexical and canonical spellings read-only prevents an agent from
+    # renaming the hidden voice-runtime mount out from under the path-based rule.
+    readonly_dirs.extend(_voice_runtime_parent_paths())
+    # The crew data home's ceilings. Read-only rather than hidden because in-sandbox
+    # code resolves them (a script cron's ``boot_platform()``, the config loader) and an
+    # absent ceiling reads as the permissive standalone default — masking one would
+    # REMOVE it. A caller's ``extra_visible_dirs`` cannot re-open the write side, for the
+    # reason spelled out for the governance cache above.
+    readonly_dirs.extend(
+        os.path.join(home, target)
+        for target in _CREW_READONLY_TARGETS
+        if os.path.join(home, target) not in hidden_dirs
+    )
+    # A relocated data home escapes every ``$HOME``-relative rule above, which would
+    # leave the ceiling writable on exactly the managed fleets that set it.
+    readonly_dirs.extend(
+        path for path in _relocated_crew_targets(_CREW_READONLY_LEAVES) if path not in hidden_dirs
+    )
     # A caller-supplied hidden path may be a FILE, and the two launcher loops hide
     # each kind differently: a directory gets an empty dir bind-mounted over it, a file
     # gets an empty temp file. The dir loop is guarded by `if os.path.isdir(target)`, so
@@ -1112,6 +2808,7 @@ def _build_launcher_script(
     # macOS is unaffected either way: its rule is `(deny file-read* (subpath …))`, and a
     # subpath rule covers a plain file.
     dirs_json = json.dumps(list(dict.fromkeys(hidden_dirs)))
+    readonly_json = json.dumps(list(dict.fromkeys(readonly_dirs)))
     files_json = json.dumps(
         list(dict.fromkeys([os.path.join(home, f) for f in files] + hidden_dirs))
     )
@@ -1139,17 +2836,35 @@ import sys
 # from the filesystem.
 sys.path[:] = [p for p in sys.path if p not in ("", sys.path[0])]
 import ctypes
-import ctypes.util
 import os
+import stat
 import tempfile
 
 _CLONE_NEWUSER = 0x10000000
 _CLONE_NEWNS   = 0x00020000
+_MS_RDONLY     = 1
+_MS_REMOUNT    = 32
 _MS_BIND       = 4096
 _MS_REC        = 16384
 _MS_PRIVATE    = 1 << 18
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+# dlopen(NULL): resolve mount()/unshare()/prctl() from the libc ALREADY loaded
+# into this interpreter. Never ctypes.util.find_library here -- on Linux it
+# EXECUTES helper processes to locate libc (ldconfig first, then a PATH-resolved
+# gcc/cc/objdump/ld once ldconfig yields no match, i.e. on musl hosts). This
+# module scope runs BEFORE the fork and before either unshare() below, under an
+# environment the SPAWNING CALLER supplies -- so on such a host a
+# caller-controlled `gcc` on PATH would be same-user code execution ahead of the
+# confinement this launcher exists to establish.
+#
+# Same rule, same reason, as the spawned userns probe in ``_PROBE_SHIM_CODE``,
+# which already resolves libc this way; the launcher was the one pre-confinement
+# script still violating it. Not a new code path either: ``find_library``
+# returning None made this call ``CDLL(None)`` anyway, so dlopen(NULL) was
+# already the implicit fallback here. ``ctypes.util`` is deliberately left
+# unimported above so a future reintroduction fails loudly instead of silently
+# reopening the PATH lookup.
+_libc = ctypes.CDLL(None, use_errno=True)
 _libc.mount.argtypes = [
     ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
     ctypes.c_ulong, ctypes.c_void_p,
@@ -1162,9 +2877,45 @@ if _libc.prctl:
     _libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
     _libc.prctl.restype = ctypes.c_int
 
+def _mount_or_die(source, target, flags, what):
+    """``mount(2)`` or refuse to exec, naming *what* and the errno.
+
+    Every mount in this launcher IS a security control -- each one hides a
+    credential path, or (for ``/``) pins mount propagation so the hiding
+    cannot escape. Discarding the return value makes those controls fail
+    OPEN: the path stays visible and the agent runs anyway, believing it is
+    hidden. Nothing downstream notices -- there is no post-mount emptiness
+    check, the launcher has no logger, and the pre-exec hardlink scan only
+    fires when a credential happens to carry an extra link.
+
+    So these refuse, matching what the rest of this launcher already does
+    when a control cannot be established: both ``unshare`` calls, the
+    seccomp-BPF install, and the hardlink scan all ``sys.exit``. What marks
+    those off from the decisions that DO degrade open is a rule, not a list:
+    a failed hiding mount is the one thing this helper exists to prevent,
+    nothing else here is one, and each of those others argues its case at
+    its own site -- the ``EXPOSE_FILES`` pre-read is one of them, named as
+    an example and not as a roster -- no count is kept here, since the count
+    is what goes stale. Read it narrowly: none is a failed hiding mount, NOT
+    the stronger claim that no credential can end up reachable. A degrade
+    elsewhere is never license to degrade a mount.
+
+    ``sandbox_level`` is the explicit opt-out for a host that cannot mount;
+    a silent unhidden credential is not.
+    """
+    if _libc.mount(source, target, None, flags, None) != 0:
+        _err = ctypes.get_errno()
+        sys.exit(
+            "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
+            "establish this control, so the agent would run with the path "
+            "visible. Lower sandbox_level to run without it deliberately."
+            % (what, _err, os.strerror(_err))
+        )
+
 REAL_UID = {uid}
 REAL_GID = {gid}
 SENSITIVE_DIRS = {dirs_json}
+READONLY_DIRS = {readonly_json}
 SENSITIVE_FILES = {files_json}
 EXPOSE_FILES = {expose_json}
 ENV_PREFIXES = {env_prefixes_json}
@@ -1227,7 +2978,8 @@ def main():
             sys.exit(f"sandbox: unshare(NEWNS) failed: errno {{ctypes.get_errno()}}")
 
         # Private mount propagation
-        _libc.mount(None, b"/", None, _MS_REC | _MS_PRIVATE, None)
+        _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
+                      "making mount propagation private on /")
 
         # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
         # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
@@ -1246,8 +2998,11 @@ def main():
             try:
                 if _home_dev is not None and os.stat(_candidate).st_dev == _home_dev:
                     continue  # same fs as HOME — no isolation, race still possible
-                _probe = tempfile.mkdtemp(dir=_candidate, prefix="kirocrew_sb_")
-                os.rmdir(_probe)
+                _probe = tempfile.mkdtemp(dir=_candidate, prefix="kirocrew_sbprobe_")
+                try:
+                    os.rmdir(_probe)
+                except FileNotFoundError:
+                    pass  # an external cleaner won the race — the root still works
                 _tmpfs_src = _candidate
                 break
             except (OSError, ValueError):
@@ -1257,20 +3012,87 @@ def main():
         # available — better to function (with the original regression risk)
         # than to refuse to start.
 
-        # Pre-read files that must survive dir hiding
+        # Tag every bind-mount SOURCE with this process's pid. The kernel pins
+        # a bind source for the mount's lifetime, so these entries cannot be
+        # unlinked here and are orphaned when the sandboxed process exits; the
+        # pid in the name is the liveness key the periodic janitor
+        # (_cleanup_stale_sandbox_mount_sources) probes to reclaim them. exec
+        # preserves the pid, so this pid IS the running agent's pid. The
+        # tmpfs probe above deliberately uses the sibling "kirocrew_sbprobe_"
+        # prefix, OUTSIDE the pid-parsed family, so the janitor never races
+        # its mkdtemp/rmdir window.
+        _src_prefix = "kirocrew_sb_%d_" % os.getpid()
+
+        # Pre-read files that must survive dir hiding.
+        #
+        # An expose source that cannot be READ degrades to "not exposed" with a
+        # stderr warning, the same way the Step 7 hardlink scan degrades open.
+        # This read runs during sandbox SETUP, so letting the OSError propagate
+        # aborts the child before the command runs at all -- and selective
+        # exposure is an OPTIMIZATION (keep ~/.aws/config reachable so
+        # credential_process still resolves inside an otherwise-hidden ~/.aws),
+        # never a security control. Failing the whole spawn because an optional
+        # convenience is unreadable trades a working sandbox for no sandbox.
+        #
+        # `isfile` already covers ABSENT; this covers UNREADABLE, and the two
+        # are not the same test: `stat` can succeed on a path whose `open` is
+        # then denied. Seen in the wild as a filesystem restriction inherited
+        # from the parent process, denying read on a 0600 file the child's own
+        # uid owned -- so DAC bits and uid both looked correct while every
+        # cc-mode spawn on that host died here.
+        #
+        # Catching the error is the only guard that HOLDS. Do not "tighten" this
+        # into a pre-flight `os.access(src_path, os.R_OK)`: measured on the
+        # affected host, `os.stat()` succeeded and `os.access()` reported BOTH
+        # X_OK and R_OK as True while the operation was denied anyway. The
+        # weaker check looks equivalent from the source alone and would
+        # silently restore the abort.
+        #
+        # The warning is not optional. Skipping silently would leave the child
+        # with no ~/.aws/config and no explanation, turning a loud setup failure
+        # into a later auth failure that points nowhere near this line.
         expose_data = {{}}
         for src_path, filename in EXPOSE_FILES:
             if os.path.isfile(src_path):
-                with open(src_path, "rb") as fh:
-                    expose_data[src_path] = fh.read()
+                try:
+                    with open(src_path, "rb") as fh:
+                        expose_data[src_path] = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: WARNING — cannot read %s (%s); it will be "
+                        "ABSENT inside the sandbox. Anything depending on it "
+                        "(e.g. credential_process in ~/.aws/config) will fail."
+                        % (src_path, exc),
+                        file=sys.stderr,
+                    )
 
         # Bind-mount empty dirs over credential paths (per-dir tmpdir to
         # prevent content leaking across mounts via shared backing dir).
         for d in SENSITIVE_DIRS:
             target = d.encode()
             if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-                _libc.mount(per_dir_empty, target, None, _MS_BIND, None)
+                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
+                _mount_or_die(per_dir_empty, target, _MS_BIND,
+                              "hiding credential directory %s" % d)
+
+        # Exposed-but-read-only dirs (the governance cache): bind the real dir over
+        # itself, then remount that bind MS_RDONLY. Both steps are load-bearing --
+        # MS_RDONLY is ignored on the initial MS_BIND, so without the remount this
+        # loop would grant exactly the write access it exists to withhold. Allowed
+        # in our own user+mount namespace because we created the bind ourselves.
+        for d in READONLY_DIRS:
+            target = d.encode()
+            # ``exists``, not ``isdir``: a governance ceiling is a plain file
+            # (``security_policy.json``), and bind-over-self + MS_RDONLY seals a
+            # regular file exactly as it seals a directory. Guarding on ``isdir``
+            # would silently skip every ceiling FILE — the caller asks for it to be
+            # sealed, gets no error, and it stays writable.
+            if os.path.exists(target):
+                _mount_or_die(target, target, _MS_BIND,
+                              "exposing read-only path %s" % d)
+                _mount_or_die(target, target,
+                              _MS_REMOUNT | _MS_BIND | _MS_RDONLY,
+                              "sealing read-only path %s" % d)
 
         # Restore selectively exposed files into the now-empty mounts
         for src_path, filename in EXPOSE_FILES:
@@ -1293,20 +3115,52 @@ def main():
         for f in SENSITIVE_FILES:
             target = f.encode()
             if os.path.isfile(target):
-                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src)
+                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src, prefix=_src_prefix)
                 os.close(fd)
-                _libc.mount(empty_path.encode(), target, None, _MS_BIND, None)
+                _mount_or_die(empty_path.encode(), target, _MS_BIND,
+                              "hiding sensitive file %s" % f)
 
         # .ssh: hide keys but expose known_hosts content (strict only)
         if HIDE_SSH and os.path.isdir(SSH_DIR):
             kh_data = b""
             if os.path.isfile(SSH_KNOWN_HOSTS):
-                with open(SSH_KNOWN_HOSTS, "rb") as fh:
-                    kh_data = fh.read()
+                # Host trust data FAILS CLOSED. This is deliberately NOT the
+                # degrade-open treatment the EXPOSE_FILES pre-read above gets,
+                # and the two sites are NOT symmetric:
+                #
+                #   - an unreadable ~/.aws/config costs REACHABILITY, so
+                #     skipping it trades a convenience for a working sandbox;
+                #   - an unreadable known_hosts costs VERIFICATION. The launcher
+                #     puts StrictHostKeyChecking=accept-new into
+                #     GIT_SSH_COMMAND, gated ONLY on that variable being unset
+                #     -- never on whether this read succeeded. So continuing
+                #     with an empty kh_data points UserKnownHostsFile at an
+                #     absent file while auto-accept is still on: every host then
+                #     reads as NEW and an interceptor's key is accepted. With
+                #     known_hosts present, accept-new REFUSES a CHANGED key.
+                #
+                # A degrade here would therefore convert "refuse a changed key"
+                # into "accept anything". Aborting is the safe direction: no
+                # sandbox at all beats one that has quietly stopped verifying
+                # hosts. Report first so the abort is diagnosable, then re-raise
+                # and let it kill setup.
+                try:
+                    with open(SSH_KNOWN_HOSTS, "rb") as fh:
+                        kh_data = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: FATAL — cannot read %s (%s). Refusing to "
+                        "continue: proceeding without it would leave host-key "
+                        "verification accepting any new key."
+                        % (SSH_KNOWN_HOSTS, exc),
+                        file=sys.stderr,
+                    )
+                    raise
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
-            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-            _libc.mount(ssh_tmp, SSH_DIR.encode(), None, _MS_BIND, None)
+            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
+            _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
+                          "hiding ssh key directory %s" % SSH_DIR)
             if kh_data:
                 with open(os.path.join(SSH_DIR, "known_hosts"), "wb") as fh:
                     fh.write(kh_data)
@@ -1339,6 +3193,25 @@ def main():
                 "{strict_host_key_opt}"
             )
 
+        # Gradle would otherwise leave a daemon running after this sandboxed
+        # command exits, holding our mount namespace open with the credential
+        # paths still masked, plus the inherited seccomp filter and emptied
+        # capability bounding set. Nothing here changes what Gradle keys its
+        # daemon context on, so a later build OUTSIDE the sandbox matches and
+        # adopts that daemon, silently running under restrictions and a
+        # credential view it never asked for. Keyed on the EFFECTIVE LAST
+        # -Dorg.gradle.daemon= directive rather than on mere presence, because
+        # duplicate -D resolves last-wins: a trailing =true would otherwise
+        # survive, while appending when ours is already last just duplicates.
+        if [
+            _t
+            for _t in os.environ.get("GRADLE_OPTS", "").split()
+            if _t.startswith("-Dorg.gradle.daemon=")
+        ][-1:] != ["-Dorg.gradle.daemon=false"]:
+            os.environ["GRADLE_OPTS"] = (
+                os.environ.get("GRADLE_OPTS", "") + " -Dorg.gradle.daemon=false"
+            ).strip()
+
         # ── Step 5: Drop capabilities + set NO_NEW_PRIVS ──
         # Inside the user namespace, the child has CAP_SYS_ADMIN (owner of the
         # NS) which lets it umount the credential bind-mounts. Drop ALL
@@ -1347,6 +3220,23 @@ def main():
 
         _PR_SET_NO_NEW_PRIVS = 38
         _PR_CAPBSET_DROP = 24
+        if not _libc.prctl:
+            # prctl(2) is how BOTH remaining controls are applied: the
+            # capability-bounding drop plus NO_NEW_PRIVS here, and the
+            # seccomp-BPF install in Step 6. Without it the child keeps
+            # CAP_SYS_ADMIN over this mount namespace and can umount the
+            # credential masks, so refuse for the same reason the unknown-arch
+            # branch below does.
+            sys.exit(
+                "sandbox: BLOCKED — libc exposes no prctl(2), so neither the "
+                "capability-bounding drop nor the seccomp-BPF namespace-escape "
+                "filter can be applied. The agent would keep CAP_SYS_ADMIN in "
+                "this mount namespace and could unmount the credential masks, "
+                "so this spawn is refused. To run anyway WITHOUT OS-level "
+                "isolation, set agent.sandbox='off' or "
+                "agent.sandbox_allow_unsandboxed_exec=true in "
+                "~/.kiro/crew/config.json."
+            )
         if _libc.prctl:
             # Linux CAP_LAST_CAP is currently 41 (kernel 6.x); iterate 0..63 for
             # forward-compatibility — dropping a non-existent cap just returns -1.
@@ -1424,8 +3314,29 @@ def main():
                 _DENY_SYSCALLS = (40, 39, 97, 268, 41)
                 _KILL_NR = 129
             else:
-                _DENY_SYSCALLS = ()  # unknown arch — skip seccomp
-                _KILL_NR = None
+                # No syscall table for this arch, so the filter that keeps the
+                # child from undoing the credential masks cannot be built.
+                # Refuse rather than skip: with unshare(2) still permitted the
+                # child can enter a nested user namespace, hold CAP_SYS_ADMIN
+                # over a copy of this mount tree, and umount every mask — the
+                # exact escape Step 6 exists to deny. _inside_kirocrew_sandbox()
+                # and docs/system-specs/modules/security.md both state that a
+                # sandboxed tree is confined "by the outer namespace + seccomp",
+                # so a silent skip makes that claim false while every caller
+                # still reads the spawn as isolated. sandbox_level="off" (or
+                # agent.sandbox_allow_unsandboxed_exec) is the explicit opt-out
+                # for a host that cannot be confined; a silent one is not.
+                sys.exit(
+                    "sandbox: BLOCKED — no seccomp syscall table for machine "
+                    "%r, so the namespace-escape filter (mount/umount2/unshare/"
+                    "setns/pivot_root) cannot be installed. The agent would run "
+                    "able to unshare a new namespace and unmount the credential "
+                    "masks, so this spawn is refused. Supported: x86_64, "
+                    "aarch64. To run anyway WITHOUT OS-level isolation, set "
+                    "agent.sandbox='off' or "
+                    "agent.sandbox_allow_unsandboxed_exec=true in "
+                    "~/.kiro/crew/config.json." % _machine
+                )
 
             if _DENY_SYSCALLS:
                 # Architecture constants for seccomp arch validation
@@ -1510,7 +3421,21 @@ def main():
         # for). On budget exhaustion the scan deliberately degrades OPEN with
         # a stderr warning rather than failing closed: /tmp on a busy host can
         # exceed any fixed budget from ordinary telemetry/cache churn, and
-        # exiting here would break every sandbox spawn on such hosts.
+        # exiting here would break every sandbox spawn on such hosts. The cost,
+        # plainly: an alias past the budget -- or past the quieter depth limit
+        # below -- is never stat'd, so a second path to a credential inode goes
+        # unchecked even though every mount held.
+        #
+        # REGULAR FILES ONLY, and that guard is what keeps the walk rare. Linux
+        # does not allow a hardlink to a directory, so nlink > 1 says nothing
+        # about a directory — and every directory has nlink >= 2 for `.` and
+        # `..`. `SENSITIVE_FILES` deliberately carries every hidden path of BOTH
+        # kinds (the hiding loops classify per entry, see `_build_launcher_script`),
+        # so without this check two ordinary directories — `~/.kiro/crew-auth-staging`
+        # and `~/.gnupg` on the measuring host — seeded the match set on every
+        # spawn. The 100k-entry walk of $CWD and /tmp then ran every time, costing
+        # 1.5s per sandboxed spawn and emitting the truncation warning constantly,
+        # while no credential had an alias at all.
         _protected_inodes = set()
         for _pd in SENSITIVE_DIRS:
             if os.path.isdir(_pd):
@@ -1518,7 +3443,7 @@ def main():
                     for _fname in _files_scan:
                         try:
                             _st = os.stat(os.path.join(_root, _fname))
-                            if _st.st_nlink > 1:
+                            if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
                                 _protected_inodes.add((_st.st_dev, _st.st_ino))
                         except OSError:
                             pass
@@ -1526,7 +3451,7 @@ def main():
         for _pf in SENSITIVE_FILES:
             try:
                 _st = os.stat(_pf)
-                if _st.st_nlink > 1:
+                if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
                     _protected_inodes.add((_st.st_dev, _st.st_ino))
             except OSError:
                 pass
@@ -1601,6 +3526,35 @@ def _ensure_run_dir() -> str:
     return run_dir
 
 
+# Interpreter flags for the namespace launcher. These matter for CONFINEMENT
+# ORDERING, not tidiness: the launcher IS a Python process, and everything the
+# interpreter does at startup happens BEFORE the script reaches ``unshare``. With
+# site processing enabled, ``site`` executes code from env-derived paths at startup
+# -- user-site ``.pth`` files (whose location comes from ``PYTHONUSERBASE``, else
+# ``HOME``) and ``sitecustomize`` (from ``PYTHONPATH``). For a config-declared
+# server ``env`` block that is externally authorable text, so it is arbitrary code
+# running unconfined. No argv[0] pin helps: the interpreter is the pinned binary.
+#   -I (isolated) ignores PYTHON* startup vars and drops the script dir from
+#      sys.path; implies -E and -s.
+#   -S skips ``site`` altogether, which is what closes the class rather than
+#      individual keys -- no .pth and no sitecustomize run at all.
+# Safe because the generated launcher imports stdlib only (sys, os, stat, struct,
+# tempfile, platform, ctypes) and never needs site-packages. The namespace probe
+# and spawn shims already start their interpreters with these exact flags; this
+# launcher was the one Python entrypoint that did not.
+_LAUNCHER_INTERPRETER_FLAGS: tuple[str, ...] = ("-I", "-S")
+
+
+def _launcher_script_of(launcher_argv: list[str]) -> str:
+    """The generated launcher script inside a ``namespace_argv`` result.
+
+    Derived from the flag count rather than hardcoded, so adding a flag cannot
+    silently return a flag token where a path is expected — which would both leak
+    the tempfile and hand the caller ``"-I"`` to ``unlink``.
+    """
+    return launcher_argv[1 + len(_LAUNCHER_INTERPRETER_FLAGS)]
+
+
 def namespace_argv(
     argv: list[str],
     sandbox_level: str = "strict",
@@ -1619,6 +3573,17 @@ def namespace_argv(
     if resolved_argv:
         resolved_argv[0] = _resolve_agent_executable(resolved_argv[0])
 
+    # Give the seal something to mount ON, or refuse the spawn. ``READONLY_DIRS`` is
+    # guarded on
+    # ``os.path.exists`` in the launcher (a ceiling may be a plain file, so the guard
+    # cannot be ``isdir``), and an absent ceiling therefore gets no bind + remount pair
+    # at all — leaving the data home writable at that name for the whole sandbox.
+    # Materialising the sealable subset first is what makes the seal non-vacuous on a
+    # default install. Runs before the script is built so the paths exist by the time
+    # the child mounts, and raises ``SandboxCeilingUnsealable`` rather than launching
+    # with a keystone the seal could not cover.
+    _materialize_sealable_ceilings()
+
     script = _build_launcher_script(
         sandbox_level,
         strip_python_env=strip_python_env,
@@ -1633,7 +3598,7 @@ def namespace_argv(
     os.close(fd)
     platform_compat.chmod_safe(path, 0o700)
 
-    return [sys.executable, path, *resolved_argv]
+    return [sys.executable, *_LAUNCHER_INTERPRETER_FLAGS, path, *resolved_argv]
 
 
 # ── Backend: macOS sandbox-exec ──
@@ -1669,10 +3634,27 @@ def _build_seatbelt_profile(
     files = _CC_FILES if sandbox_level in ("cc", "strict") else []
     expose_files = _CC_EXPOSE_FILES if sandbox_level == "cc" else []
     expose_abs = {os.path.join(home, f) for f in expose_files}
+    crew_hidden = _crew_hidden_sandbox_targets()
     rules: list[str] = []
-    for d in dirs:
-        target = os.path.join(home, d)
-        if _hidden_path_contains_visible_path(target, extra_visible_dirs):
+    for target in (
+        [os.path.join(home, d) for d in dirs]
+        + _relocated_policy_cache_dirs()
+        + _relocated_crew_targets(_CREW_HIDDEN_LEAVES)
+        + list(_voice_runtime_sandbox_paths())
+    ):
+        if _hidden_path_contains_visible_path(
+            target, extra_visible_dirs
+        ) and not _is_voice_runtime_dir(target):
+            # An exposed governance cache stays READ-only: keep the write and hardlink
+            # denies and drop only the read deny. `extra_visible_dirs` otherwise cancels
+            # the target's whole rule set, which would hand the one caller that needs to
+            # read the ceiling (`apps/backend.py` in cache-only mode) the ability to
+            # rewrite it — and the metadata records the source the next boot trusts, so
+            # that is the dangerous direction. Mirrors READONLY_DIRS on Linux.
+            if _is_policy_cache_dir(target):
+                sealed = target.replace('"', '\\"')
+                rules.append(f'(deny file-write* (subpath "{sealed}"))')
+                rules.append(f'(deny file-link (subpath "{sealed}"))')
             continue
         escaped = target.replace('"', '\\"')
         # Check if any exposed files live under this dir
@@ -1685,6 +3667,19 @@ def _build_seatbelt_profile(
             rules.append(f'(deny file-read* (require-all (subpath "{escaped}") {exceptions}))')
         else:
             rules.append(f'(deny file-read* (subpath "{escaped}"))')
+        if _is_policy_cache_dir(target) or _is_voice_runtime_dir(target) or target in crew_hidden:
+            # Linux bind-mounts these roots away, which blocks both directions.
+            # macOS needs an explicit write deny as well as the read rule above:
+            # governance metadata is a trust root, a writable voice-runtime image would
+            # race the gateway's authenticated decoder spawn, and a crew-home secret that
+            # is read-denied but writable can still be OVERWRITTEN -- forging
+            # ``token_signing.key`` needs no read at all. Scoped to those three sets on
+            # purpose: widening it to every hidden entry would also cover .aws, which a
+            # tool rewrites legitimately when it refreshes a cached token.
+            rules.append(f'(deny file-write* (subpath "{escaped}"))')
+            if target in crew_hidden:
+                # A leaf may be a plain file, which no subpath rule addresses.
+                rules.append(f'(deny file-write* (literal "{escaped}"))')
         # Deny creating a HARDLINK whose target is under this dir.
         # Seatbelt's file-read* deny is path-based, so a hardlink at a
         # non-denied path (e.g. /tmp) reads the same inode past the deny rule.
@@ -1692,6 +3687,31 @@ def _build_seatbelt_profile(
         # agent from minting such a hardlink in the first place.  Blanket (no
         # exposed-file exception): the agent never needs to hardlink a
         # credential-dir file, and blocking it is harmless.
+        rules.append(f'(deny file-link (subpath "{escaped}"))')
+
+    # The voice image lives below ``run``. Keep that parent readable (the
+    # sandbox launcher itself is stored there), but deny every write through
+    # both lexical and canonical spellings. Literal ancestor rules prevent a
+    # same-UID agent from renaming a parent around the path-based subtree deny.
+    for target in _voice_runtime_parent_paths():
+        escaped = target.replace('"', '\\"')
+        rules.append(f'(deny file-write* (literal "{escaped}"))')
+        rules.append(f'(deny file-write* (subpath "{escaped}"))')
+        rules.append(f'(deny file-link (subpath "{escaped}"))')
+    for target in _voice_runtime_ancestor_guards():
+        escaped = target.replace('"', '\\"')
+        rules.append(f'(deny file-write* (literal "{escaped}"))')
+    # The crew data home's ceilings: readable (in-sandbox code resolves them) but never
+    # writable, so a sandboxed process cannot hand itself a ceiling. Mirrors
+    # READONLY_DIRS on Linux. Both spellings, because a ceiling may be a file
+    # (``literal``) or a directory (``subpath``), and ``file-link`` stops the agent
+    # minting a writable alias to the same inode.
+    for target in [
+        os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS
+    ] + _relocated_crew_targets(_CREW_READONLY_LEAVES):
+        escaped = target.replace('"', '\\"')
+        rules.append(f'(deny file-write* (literal "{escaped}"))')
+        rules.append(f'(deny file-write* (subpath "{escaped}"))')
         rules.append(f'(deny file-link (subpath "{escaped}"))')
     for f in files:
         target = os.path.join(home, f)
@@ -1741,6 +3761,33 @@ _KIRO_INTERNAL_SANDBOX_KEY = "sandbox"
 # One loud warning per process for the delegation decision (per-spawn logs
 # would spam warm-pool refills); every delegated spawn is still SEL-audited.
 _kiro_delegation_warned = False
+
+
+def _pinned_env_bin() -> str:
+    """Absolute path to ``env``, resolved WITHOUT consulting PATH.
+
+    ``env`` is the process that applies the credential scrub (``env -u KEY ...``)
+    on the delegation paths, where no Seatbelt/namespace layer wraps the child.
+    A bare ``"env"`` token is resolved by the OS through the PATH in the
+    environment we hand ``Popen`` -- and on the script-cron MCP path that PATH can
+    come from a config-declared server ``env`` block. Redirecting ``env`` does not
+    merely run an attacker binary: it means the scrub NEVER RUNS, so the child
+    receives the very credentials (Slack tokens, owner id) the ``-u`` flags exist
+    to strip, and can exfiltrate them. Pinning is therefore load-bearing on these
+    paths even though they intentionally apply no OS confinement of our own.
+
+    ``trusted_system_bin`` ignores ``os.environ`` PATH entirely (fixed system dirs
+    only); the ``/usr/bin/env`` fallback matches the idiom already used by
+    ``sandbox_exec_argv`` and ``cgroup_scope_argv`` so an unusual host layout
+    still yields an absolute path rather than a redirectable bare name.
+
+    Deliberately does NOT pin the inner command: that is the operator's agent or
+    server binary (``kiro-cli``, ``npx``, ...), which legitimately must be found on
+    PATH, and it carries the same config-file trust level as the ``env`` block
+    itself -- an author who can set PATH can already set ``command`` directly, so
+    pinning it would buy nothing while breaking normal installs.
+    """
+    return platform_compat.trusted_system_bin("env") or "/usr/bin/env"
 
 
 def kiro_internal_sandbox_enabled() -> bool:
@@ -1795,22 +3842,28 @@ def _delegate_to_kiro_internal_sandbox(
     sandbox_level: str,
     *,
     strip_python_env: bool = False,
-) -> tuple[list[str], str | None]:
-    """macOS sandbox mutual exclusion: kiro-cli's internal sandbox owns
-    isolation for this spawn; KiroCrew's seatbelt is skipped.
+) -> tuple[list[str], str | None] | None:
+    """Delegate an explicitly trusted kiro-cli spawn to its internal sandbox.
 
     This is NOT the forbidden silent unsandboxed fallback: the child still
-    runs under an OS sandbox (kiro's own), the delegation is config-driven and
-    deterministic (never a reaction to a wrap failure), it is logged loudly
-    once per process, and every delegated spawn is SEL-audited on an
-    audit-or-deny basis — if the audit event cannot be written, the delegation
-    is refused and the spawn falls back to KiroCrew's own seatbelt. The env
-    scrub is applied exactly as the seatbelt wrap would have applied it.
+    runs under kiro-cli's own sandbox. On macOS the delegation is config-driven
+    mutual exclusion with Kiro Crew's seatbelt; on Windows it is restricted to a
+    positive first-party Kiro backend classification because Kiro Crew has no
+    native OS wrapper there. The decision is deterministic (never a reaction to
+    a wrap failure), logged loudly once per process, and every delegated spawn
+    is SEL-audited on an audit-or-deny basis. If the audit event cannot be
+    written, ``None`` tells the caller to continue through the normal sandbox
+    policy, which fail-closes on Windows.
+
+    The POSIX env scrub is applied inline. Windows has no ``env -u`` launcher,
+    so every production caller must pass :func:`scrub_agent_subprocess_env`'s
+    result as the child environment; regression tests pin those call sites.
 
     Deliberately does NOT resolve the real kiro binary: the launcher shim is
     part of kiro's own sandbox mechanism on this path, so bypassing it here
     would defeat the delegated layer.
     """
+
     global _kiro_delegation_warned
     try:
         # circular import (pre-emptive, layering): sandbox.py is a low-level
@@ -1824,11 +3877,14 @@ def _delegate_to_kiro_internal_sandbox(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="delegated",
             resources=(
-                "macOS sandbox mutual exclusion: kiro internal sandbox on -> "
+                "Windows Kiro backend delegation: kiro internal sandbox owns "
+                "this spawn; Kiro Crew has no native Windows sandbox backend"
+                if sys.platform == "win32"
+                else "macOS sandbox mutual exclusion: kiro internal sandbox on -> "
                 "KiroCrew seatbelt off for this kiro-cli spawn"
             ),
             # audit-or-deny: written synchronously; a filesystem failure
@@ -1837,33 +3893,31 @@ def _delegate_to_kiro_internal_sandbox(
         )
     except Exception:
         # Fail closed (security-controls): a security delegation that cannot
-        # be audited does not happen. Fall back to KiroCrew's own seatbelt —
-        # the always-safe, audited-by-default layer. If kiro's internal
-        # sandbox is enabled this spawn will then fail with the nested-
-        # sandbox EPERM rather than run unaudited: safety over availability
-        # while SEL is broken.
+        # be audited does not happen. The caller continues through Kiro Crew's
+        # normal policy: macOS gets its seatbelt; Windows, which has no native
+        # backend, raises SandboxUnavailableError rather than run unaudited.
         logger.warning(
             "SEL audit failed for sandbox delegation — refusing unaudited "
-            "delegation; falling back to KiroCrew's seatbelt",
+            "delegation; falling back to Kiro Crew's sandbox policy",
             exc_info=True,
         )
-        return sandbox_exec_argv(argv, sandbox_level, strip_python_env=strip_python_env)
+        return None
     # SEL audit succeeded — delegation is actually proceeding. Only now
     # consume the warn-once flag (a SEL-failed attempt above fell back to
     # seatbelt and must not burn the warning for the first real delegation).
     if not _kiro_delegation_warned:
         _kiro_delegation_warned = True
         logger.warning(
-            "SECURITY: kiro-cli's internal sandbox is enabled (%s) — delegating "
-            "agent isolation to it and skipping KiroCrew's seatbelt for kiro-cli "
-            "spawns (nested seatbelt is impossible on macOS; exactly one layer "
-            "can be active). To use KiroCrew's sandbox instead, set "
-            '{"sandbox": false} in that file. Env scrubbing still applies.',
-            _KIRO_INTERNAL_SETTINGS_PATH,
+            "SECURITY: delegating this %s kiro-cli spawn to kiro-cli's internal "
+            "sandbox and skipping Kiro Crew's OS wrapper. Env scrubbing still "
+            "applies.",
+            "Windows" if sys.platform == "win32" else "macOS",
         )
+    if sys.platform == "win32":
+        return list(argv), None
     unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env)
     if unset_args:
-        return ["env", *unset_args, *argv], None
+        return [_pinned_env_bin(), *unset_args, *argv], None
     return list(argv), None
 
 
@@ -1913,8 +3967,24 @@ def sandbox_exec_argv(
     # position so the scrub cannot drop it — an in-sandbox wrap_argv
     # passthrough compares it against the requested tier to detect downgrades.
     level_assign = f"{_IN_SANDBOX_LEVEL_VAR}={sandbox_level}"
+    # SECURITY: BOTH wrappers this function prepends are pinned here, at the layer
+    # that prepends them, so no spawn site has to remember to re-pin (the caller's
+    # ``env`` may carry a config-declared PATH, and CPython resolves a slash-less
+    # argv[0] through THAT PATH via os.get_exec_path):
+    #   * the outer ``env`` (argv[0]), which runs first of all;
+    #   * the inner ``sandbox-exec``, which ``env`` itself resolves through the
+    #     PATH in the environment it is handed -- BEFORE the Seatbelt profile is
+    #     applied, so a hostile PATH there is a pre-confinement escape.
+    # ``trusted_system_bin`` ignores PATH entirely rather than reading os.environ:
+    # a gateway's PATH can legitimately lead with agent-writable directories
+    # (a worktree venv's bin, ~/.local/bin), so resolving through it would leave
+    # the hole half-open. Both fall back to their canonical macOS locations,
+    # matching the _probe_sandbox_exec probe, so a host with an unusual layout
+    # still gets an absolute path rather than a redirectable bare name.
+    outer_env = _pinned_env_bin()
+    sandbox_exec = platform_compat.trusted_system_bin("sandbox-exec") or "/usr/bin/sandbox-exec"
     return (
-        ["env", *unset_args, marker, level_assign, "sandbox-exec", "-f", path, *resolved_argv],
+        [outer_env, *unset_args, marker, level_assign, sandbox_exec, "-f", path, *resolved_argv],
         path,
     )
 
@@ -1950,6 +4020,25 @@ def _sandbox_env_unset_args(sandbox_level: str, strip_python_env: bool) -> list[
     return unset_args
 
 
+def _parse_pid_segment(pid_str: str) -> int | None:
+    """Parse a pid segment from a sweep-owned filename, or None to skip.
+
+    Both sweeps (launcher scripts and mount sources) only ever WRITE an ASCII
+    positive decimal pid, so anything else is a foreign or planted name and
+    must fail toward "skip": non-ASCII decimals (``int()`` would accept
+    them), pid ``0`` (``os.kill(0, 0)`` probes the caller's own process group
+    and always reads alive), zero-padded segments, and — belt-and-braces,
+    NAME_MAX keeps real names far shorter than the int/str conversion limit —
+    a ``ValueError`` from ``int()`` itself.
+    """
+    if not pid_str.isascii() or not pid_str.isdecimal() or pid_str.startswith("0"):
+        return None
+    try:
+        return int(pid_str)
+    except ValueError:
+        return None
+
+
 def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     """Remove orphan sandbox files from <config_dir>/run/ and legacy /tmp.
 
@@ -1962,7 +4051,8 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
 
     Also sweeps legacy /tmp/kirocrew_sandbox_*.py files that predate the
     migration to <config_dir>/run/ — these have no PID segment, so only the
-    age threshold applies.
+    age threshold applies — plus the orphaned bind-mount sources the namespace
+    launcher stages on tmpfs (see _cleanup_stale_sandbox_mount_sources).
 
     Called from the periodic cleanup sweep in session.py, offloaded to the
     maintenance executor (blocking I/O).  Safe to call from sync contexts too.
@@ -2002,15 +4092,15 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
                 continue
             # Fresh file — fall back to PID liveness check
             middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
-            pid_str = middle.split("_", 1)[0]
-            if not pid_str.isdigit():
+            pid = _parse_pid_segment(middle.split("_", 1)[0])
+            if pid is None:
                 continue
             # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
             # TERMINATES the target process on Windows (see platform_compat).
             try:
-                alive = platform_compat.pid_exists(int(pid_str))
+                alive = platform_compat.pid_exists(pid)
             except OverflowError:
-                alive = False  # absurd PID digits from a corrupt filename — stale
+                alive = False  # absurd pid digits from a corrupt filename — stale
             if not alive:
                 try:
                     os.remove(filepath)
@@ -2040,7 +4130,361 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
         except OSError:
             pass
 
+    removed += _cleanup_stale_sandbox_mount_sources()
     removed += _cleanup_retired_acp_snapshot_dir()
+    return removed
+
+
+def _mount_source_candidate_roots() -> list[str]:
+    """The tmpfs roots the namespace launcher stages bind-mount sources on.
+
+    Mirrors the launcher's own ``_tmpfs_src`` candidate chain —
+    ``/run/user/$UID``, ``/dev/shm``, then the system default tempdir (the
+    ``_tmpfs_src=None`` fallback). The tempdir entry is the gateway's own
+    ``tempfile.gettempdir()``, which matches the launcher's fallback only while
+    both resolve the same ``TMPDIR``; a launcher spawned with a divergent,
+    persistent ``TMPDIR`` stages its fallback entries somewhere this sweep
+    never visits, and nothing else reclaims them — a real limitation, reached
+    only when NO tmpfs candidate exists at all. ``os.getuid`` is
+    POSIX-only; the launcher itself is Linux-only, so a platform without it
+    simply has no per-user runtime root to sweep.
+    """
+    roots: list[str] = []
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        roots.append(f"/run/user/{getuid()}")
+    roots.append("/dev/shm")
+    roots.append(tempfile.gettempdir())
+    return roots
+
+
+def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool]:
+    """Entry names of sandbox mount sources referenced by a live mount, plus
+    whether the scan positively covered every namespace a PROCESS could be
+    binding one from.
+
+    A bind mount records its source as the ``root`` field (field 4) of a
+    ``/proc/<pid>/mountinfo`` line, and the staged sources are direct children
+    of a tmpfs root, so the basename of that field is the staged entry's name
+    (mkdtemp names carry no spaces, so mountinfo's octal escaping never
+    applies to them). Only prefix-shaped basenames are collected — a foreign
+    mount whose root merely resembles a path cannot pin anything. Keying is by
+    basename, so two identically-named entries on different roots would share
+    a pin; mkdtemp's random suffix makes that vanishingly rare, and the error
+    lands on the retention side.
+
+    The launcher's mounts live in the sandboxed child's PRIVATE namespace —
+    invisible in the gateway's own mountinfo — and that namespace can outlive
+    the launcher pid through any surviving descendant (a build daemon, for
+    example), so every readable pid's mountinfo is consulted. Coverage is
+    what makes the answer usable, and it is established positively:
+
+    - The listing must show pid 1. ``hidepid``/``subset=pid`` procfs hides
+      other users' processes entirely — including a root holder that entered
+      a sandbox namespace — and pid 1 always exists, so its absence proves
+      the listing is filtered and the scan reports incomplete.
+    - A holder can fork a successor and exit between the pid listing and its
+      own mountinfo read (the read then raises FileNotFoundError). The
+      successor was forked BEFORE the exit, so it is visible to the very next
+      listing: the scan re-lists after any pass that observed a vanish, and
+      finishes on a pass that saw none. A pid appearing WITHOUT a vanish
+      needs no rescan — it is either in a namespace whose surviving holders
+      this scan already read, or in a brand-new namespace, which can only
+      bind brand-new (fresh, live-pid) entries that are never reclaim
+      candidates in the same sweep. A scan still churning after
+      ``_PIN_SCAN_MAX_PASSES`` cannot prove coverage and reports incomplete.
+      (A successor recycled onto an already-seen pid NUMBER inside this
+      window escapes the re-listing; that needs the full pid space to wrap
+      within the scan's milliseconds, and the residual error is
+      retention-side only on the next sweep.)
+    - A read failure is forgiven in two cases and counts as a coverage gap
+      otherwise. ``EINVAL`` says that TASK has no ``nsproxy``, which is not yet
+      a statement about the NAMESPACE: a thread-group leader can exit through
+      ``pthread_exit`` while sibling threads keep running, and threads share the
+      nsproxy, so a live namespace can sit behind a zombie leader while
+      ``proc_root`` — which lists only leaders — shows nothing else to scan. So
+      the group is consulted through ``/proc/<pid>/task/<tid>/mountinfo``, with
+      exactly two outcomes per sibling and no third: one that READS contributes
+      pins and nothing else, and one that does not read, for ANY reason,
+      makes coverage unprovable. Departed siblings are counted rather than
+      excused, because one exiting between the listing and its read may have
+      spawned a successor THREAD first, and a thread is invisible to the outer
+      re-listing (which enumerates thread-group leaders only), so no re-listing
+      can recover it. Tasks in one group can also hold DIFFERENT mount
+      namespaces, since a thread may ``unshare(CLONE_NEWNS)``, so a readable
+      sibling never speaks for an unreadable one. When every sibling reads, the
+      leader's own departure still makes this a vanish, because a departing task
+      may have handed its namespace to a PROCESS forked after this pass's
+      listing and only a re-listing can see that. Any OTHER errno on the leader
+      is forgiven only when the pid provably belongs to a DIFFERENT real user
+      (its ``/proc/<pid>`` stats to a uid that is not ours, not root, and not
+      the host's overflow uid) — such a process cannot be binding a source this
+      uid staged, because the sandboxed child keeps this uid and NO_NEW_PRIVS.
+      Root can enter any namespace, and a holder in a foreign user namespace
+      stats as the overflow uid, so those count as coverage gaps.
+
+    A namespace held only by an nsfs fd or a bind-mounted ``ns/mnt`` — zero
+    member processes — has no mountinfo to scan and is out of scope; the
+    launcher never creates one. ``complete=False`` means absence-of-pin was
+    NOT established; the caller must not remove directory entries or destroy
+    contents on the strength of it.
+    """
+    pinned: set[str] = set()
+    complete = True
+    seen: set[str] = set()
+    getuid = getattr(os, "getuid", None)
+    own_uid = getuid() if getuid is not None else None
+    overflow_uid = _overflow_uid()
+
+    def _collect(mountinfo_path: str) -> None:
+        """Add every prefix-shaped bind SOURCE named in one mountinfo to ``pinned``.
+
+        Propagates ``OSError`` exactly as ``open`` would, so each caller decides
+        what an unreadable task means for coverage.
+        """
+        with open(mountinfo_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if _MOUNT_SOURCE_PREFIX not in line:
+                    continue
+                fields = line.split()
+                if len(fields) > 3:
+                    source = os.path.basename(fields[3])
+                    if source.startswith(_MOUNT_SOURCE_PREFIX):
+                        pinned.add(source)
+
+    for _ in range(_PIN_SCAN_MAX_PASSES):
+        try:
+            listed = [n for n in os.listdir(proc_root) if n.isdecimal()]
+        except OSError:
+            return pinned, False
+        if "1" not in listed and "1" not in seen:
+            return pinned, False  # filtered procfs (hidepid/subset) — coverage unprovable
+        new_pids = [n for n in listed if n not in seen]
+        vanished = False
+        for name in new_pids:
+            seen.add(name)
+            try:
+                _collect(os.path.join(proc_root, name, "mountinfo"))
+            except (FileNotFoundError, ProcessLookupError):
+                # May have handed its namespace to a child forked before the
+                # exit — visible to the next listing, so take another pass.
+                vanished = True
+            except OSError as exc:
+                if exc.errno == errno.EINVAL:
+                    # EINVAL says THIS TASK's nsproxy is gone, so this task is a
+                    # member of no mount namespace. That is NOT yet a statement
+                    # about the namespace: a thread-group leader can exit through
+                    # ``pthread_exit`` while sibling THREADS keep running, and
+                    # threads share the nsproxy, so the namespace — and its binds
+                    # on our sources — can still be alive behind a zombie leader.
+                    # ``proc_root`` lists only thread-group LEADERS, so the
+                    # re-listing below can never see those threads. Measured on a
+                    # real zombie leader: ``/proc/<tgid>/mountinfo`` is EINVAL
+                    # while ``/proc/<tgid>/task/<live-tid>/mountinfo`` reads fine.
+                    # So ask the group before concluding anything; one readable
+                    # thread yields the WHOLE namespace's mount table, because
+                    # every thread in the group shares it.
+                    task_dir = os.path.join(proc_root, name, "task")
+                    try:
+                        tids = os.listdir(task_dir)
+                    except FileNotFoundError:
+                        tids = []  # the group is gone entirely
+                    except OSError:
+                        complete = False  # cannot ask — coverage unprovable
+                        continue
+                    unaccounted = 0
+                    for tid in tids:
+                        if tid == name:
+                            continue  # the leader: it already answered EINVAL
+                        try:
+                            _collect(os.path.join(task_dir, tid, "mountinfo"))
+                        except OSError:
+                            unaccounted += 1
+                    # INVARIANT, and there is deliberately no third case: a sibling
+                    # that READS contributes pins and nothing else, and a sibling
+                    # that does not read, for ANY reason, makes coverage unprovable.
+                    #
+                    # Departed siblings are counted too, rather than excused. One
+                    # that exits between the ``tids`` snapshot and its read may have
+                    # spawned a successor THREAD first, and a successor thread is
+                    # invisible to the outer re-listing, which enumerates
+                    # thread-group LEADERS only — so no re-listing can recover it
+                    # and only fail-closed is honest. The cost is transient, never a
+                    # stall: a sibling caught mid-exit is a race, so the next sweep
+                    # sees a settled group, whereas the zombie LEADER this branch
+                    # exists for is a steady state and stays reclaimable.
+                    #
+                    # Tasks in one group can also hold DIFFERENT mount namespaces (a
+                    # thread may ``unshare(CLONE_NEWNS)``, and the launcher's own
+                    # user namespace grants its descendants the CAP_SYS_ADMIN that
+                    # needs), so a readable sibling never speaks for an unreadable
+                    # one.
+                    if unaccounted:
+                        complete = False
+                        continue
+                    # Otherwise this is a VANISH, unconditionally. Reaching this
+                    # branch at all means the LEADER departed, and a departing task
+                    # may have handed its namespace to a process forked after this
+                    # pass's listing, which only a re-listing can see — so a
+                    # sibling that could be read must not be able to cancel it:
+                    # the pins it yields are kept, its success is not evidence.
+                    #
+                    # This terminates: the pid enters ``seen`` above and is never
+                    # re-read, so a stable zombie costs exactly one extra pass,
+                    # while genuine churn exhausts ``_PIN_SCAN_MAX_PASSES`` and
+                    # returns complete=False, which retains rather than removes.
+                    vanished = True
+                    continue
+                try:
+                    st_uid: int | None = os.stat(os.path.join(proc_root, name)).st_uid
+                except OSError:
+                    st_uid = None
+                if (
+                    own_uid is None
+                    or st_uid is None
+                    or overflow_uid is None
+                    or st_uid == own_uid
+                    or st_uid == 0
+                    or st_uid == overflow_uid
+                ):
+                    complete = False
+        if not vanished:
+            return pinned, complete
+    return pinned, False  # still churning after the pass budget — coverage unproven
+
+
+def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) -> int:
+    """Reclaim orphaned bind-mount sources staged by the namespace launcher.
+
+    The launcher stages one empty dir per SENSITIVE_DIRS entry, one empty file
+    per SENSITIVE_FILES entry, and (strict only) an SSH shadow dir holding a
+    known-hosts copy, all named ``kirocrew_sb_<pid>_*`` on a tmpfs root. The
+    kernel pins each source while its bind-mount lives, so the launcher cannot
+    remove them and they orphan when the sandboxed process exits. Left alone
+    they exhaust the runtime tmpfs (``/run/user/$UID``), at which point the
+    systemd user manager cannot allocate transient scope units and every
+    ``systemd-run --scope``-wrapped spawn fails.
+
+    An entry becomes a reclaim candidate when its embedded pid is dead, or
+    past ``_MOUNT_SOURCE_MAX_AGE_SECONDS`` (the backstop for a pid recycled
+    onto an unrelated live process — routine on a ``pid_max=32768`` host).
+    What a candidate's removal may touch is then decided by kind, because a
+    bind source is NOT protected by the kernel against the sweeper: removing
+    it succeeds from this namespace (mountinfo then shows ``//deleted``), a
+    removed source DIRECTORY leaves the live mount's root inode ``S_DEAD`` so
+    every create under the masked path fails from then on, and a non-empty
+    dir's contents are visible inside any namespace still binding it:
+
+    - Plain files: ``os.remove``. A file source's inode is held by the mount
+      like an open descriptor, so the masked view is unaffected.
+    - Dirs, empty or not: removed only when no readable mount namespace
+      references the entry AND the pin scan positively covered every
+      namespace that could bind one (:func:`_mount_pinned_source_names`).
+      The pin scan, not the pid probe, is the deciding evidence: a recycled
+      pid reads live yet has no mount, so its entry is still reclaimed after
+      the age backstop rather than stranded, while a genuine long-lived
+      sandbox is pinned by its own process and kept. A namespace no PROCESS
+      holds has no mountinfo to report a pin — an fd- or bind-pinned
+      namespace with zero members is out of scope, and the launcher never
+      creates one — so the scan cannot go stale in the deleting direction. The
+      fresh-and-alive skip above stays load-bearing for the launcher's own
+      staging window (after ``mkdtemp``, before ``mount``), when its entries
+      are legitimately live and not yet pinned.
+
+    Deliberately conservative about names: only the recognized
+    ``kirocrew_sb_<pid>_`` shape with an ASCII positive pid is touched.
+    Foreign ``tmp*`` names carry no liveness key and are left alone, as are
+    ``kirocrew_sandbox_*`` launcher scripts, the ``kirocrew_sbprobe_*`` tmpfs
+    probe, and prefix matches whose segment is not an ASCII positive decimal
+    (an oversized all-digit segment IS the recognized shape — it probes
+    OverflowError, reads stale, and is reclaimed). Some of these roots are
+    world-writable, so a planted entry — including a deep tree built to make
+    ``rmtree`` recurse — must fail toward "skip", never toward an exception
+    that kills the sweep.
+
+    Returns:
+        Number of entries removed.
+    """
+    now = time.time()
+    if roots is None:
+        roots = _mount_source_candidate_roots()
+    # (pinned set, scan-was-complete) — built lazily, once, on the first
+    # directory candidate (empty ones included: rmdir is gated too).
+    pin_scan: tuple[set[str], bool] | None = None
+    removed = 0
+    dirs_held_back = 0
+    for root in roots:
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.startswith(_MOUNT_SOURCE_PREFIX):
+                continue
+            pid_str, sep, _rest = entry[len(_MOUNT_SOURCE_PREFIX) :].partition("_")
+            pid = _parse_pid_segment(pid_str) if sep else None
+            if pid is None:
+                continue  # foreign / probe / planted names — no liveness key
+            path = os.path.join(root, entry)
+            try:
+                mtime = os.lstat(path).st_mtime
+            except OSError:
+                continue
+            over_age = (now - mtime) > _MOUNT_SOURCE_MAX_AGE_SECONDS
+            # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
+            # TERMINATES the target on Windows (platform_compat).
+            try:
+                alive = platform_compat.pid_exists(pid)
+            except OverflowError:
+                alive = False  # absurd pid digits from a corrupt name — stale
+            if alive and not over_age:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                # ANY dir removal — even rmdir of an empty one — S_DEADs a
+                # live mount's root inode, so the pin scan gates it all.
+                if pin_scan is None:
+                    pin_scan = _mount_pinned_source_names()
+                pinned, scan_complete = pin_scan
+                if entry in pinned or not scan_complete:
+                    dirs_held_back += 1
+                    continue
+                try:
+                    os.rmdir(path)
+                    removed += 1
+                    continue
+                except OSError:
+                    pass
+                try:
+                    shutil.rmtree(path, ignore_errors=True)
+                except Exception:
+                    continue  # e.g. a planted tree deep enough to exhaust recursion
+                # ignore_errors swallows a partial failure — count only a
+                # confirmed removal.
+                if not os.path.lexists(path):
+                    removed += 1
+            else:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+    if dirs_held_back:
+        # An always-closed pin scan is otherwise indistinguishable from a
+        # working one while the dominant (directory) leak class re-accumulates
+        # — surface it so an operator can tell retention from reclamation.
+        scan_complete = pin_scan is not None and pin_scan[1]
+        # WARNING for the incomplete case, INFO for the benign pinned one.
+        # Holding entries back because a live namespace binds them is normal
+        # operation; holding them back because coverage is unprovable is a
+        # FAULT that stops directory reclamation host-wide until the runtime
+        # tmpfs is out of inodes. At INFO it also does not reach a default
+        # deployment's log at all, which is how the leak this guards against
+        # ran unobserved while this very line fired on every sweep.
+        (logger.info if scan_complete else logger.warning)(
+            "sandbox mount-source sweep: %d dir candidate(s) held back (%s)",
+            dirs_held_back,
+            ("pinned by a live mount namespace" if scan_complete else "pin scan incomplete"),
+        )
     return removed
 
 
@@ -2121,10 +4565,10 @@ def configured_sandbox_mode() -> str:
     actually configured. Where ``agent.sandbox`` is an explicit ``"off"`` —
     isolation deferred to kiro-cli's own internal sandbox, which cannot nest
     inside Kiro Crew's (macOS Seatbelt returns EPERM) — a spawn that takes the
-    parameter default asks for a STRICTER tier than the operator configured, and
-    on a host with no backend at all (any Windows host, macOS >= 26)
-    ``wrap_argv`` fail-closes on that request while the main chat path — which
-    passes this value — runs fine.
+    parameter default asks for a STRICTER tier than the operator configured. On
+    a backend-less host an unclassified spawn then fail-closes while a delegated
+    Kiro chat path can run; the reviewed Windows Kiro sites carry explicit
+    classification, but keeping the configured tier remains the cross-platform rule.
 
     Passing the configured value is what keeps a one-shot read from being
     stricter than the long-lived session it accompanies; it can never make it
@@ -2312,8 +4756,7 @@ def _no_backend_guidance() -> str:
             # it, and it is the same binary the desktop app already spawns.
             cli = _bundled_cli_invocation() or "kirocrew"
             where = (
-                " (that path is inside the running app, so run it while Kiro Crew "
-                "is open)"
+                " (that path is inside the running app, so run it while Kiro Crew " "is open)"
                 if cli != "kirocrew"
                 else ""
             )
@@ -2324,20 +4767,28 @@ def _no_backend_guidance() -> str:
             # substitution executed by the paste, turning a diagnostic into a
             # command-injection vector. Mirrors the quoting the desktop side
             # already does in website/electron/sandbox-profile.js.
-            return base + (
-                "This is an AppImage launch, which no profile is attached to yet. "
-                "Run this in a terminal (it needs sudo, so it cannot be done from "
-                f"the app): {cli} sandbox install-profile --path "
-                f"{shlex.quote(appimage)}{where} — then restart the app. Do NOT "
-                "set the sysctl to 0: that disables a kernel-wide protection for "
-                "every application on the machine. "
-            ) + optout
-        return base + (
-            "Run `kirocrew service install` to install the profile and have "
-            "systemd apply it to the gateway unit. Do NOT set the sysctl to 0: "
-            "that disables a kernel-wide protection for every application on the "
-            "machine. "
-        ) + optout
+            return (
+                base
+                + (
+                    "This is an AppImage launch, which no profile is attached to yet. "
+                    "Run this in a terminal (it needs sudo, so it cannot be done from "
+                    f"the app): {cli} sandbox install-profile --path "
+                    f"{shlex.quote(appimage)}{where} — then restart the app. Do NOT "
+                    "set the sysctl to 0: that disables a kernel-wide protection for "
+                    "every application on the machine. "
+                )
+                + optout
+            )
+        return (
+            base
+            + (
+                "Run `kirocrew service install` to install the profile and have "
+                "systemd apply it to the gateway unit. Do NOT set the sysctl to 0: "
+                "that disables a kernel-wide protection for every application on the "
+                "machine. "
+            )
+            + optout
+        )
     return (
         "If this host genuinely lacks a sandbox backend, set "
         "agent.sandbox_allow_unsandboxed_exec=true in "
@@ -2494,6 +4945,37 @@ def _warn_no_isolation(mode: str) -> None:
     )
 
 
+def _command_log_label(argv: list[str]) -> str:
+    """Return a fixed, non-sensitive executable class for diagnostics.
+
+    ``wrap_argv`` is a generic boundary: later argv elements routinely contain
+    user-controlled paths, URLs, and occasionally transport capabilities. Static
+    analysis also correctly treats a list element as able to reach any other
+    element. Never send a value taken from that container to a log or SEL event,
+    even when the runtime expression selects ``argv[0]``. The fixed labels retain
+    enough operational signal without exposing executable paths or arguments.
+    """
+
+    if not argv:
+        return "unknown"
+    name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name == "git":
+        return "git"
+    if name in {"python", "python3", "pythonw", "pythonw3"}:
+        return "python"
+    if name in {"node", "npm", "npx"}:
+        return "node"
+    if name in {"kiro", "kiro-cli", "kirocrew"}:
+        return "kiro"
+    if name in {"bash", "sh", "zsh", "cmd", "powershell", "pwsh"}:
+        return "shell"
+    if name in {"env", "bwrap", "sandbox-exec", "systemd-run"}:
+        return "sandbox-helper"
+    return "other"
+
+
 def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
     """Emit a once-per-process SECURITY warning when mode='off' results in
     no OS-level isolation and no verified delegation.
@@ -2509,7 +4991,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             logger.info(
                 "agent.sandbox='off' with no active delegation; operator opted "
                 "in via sandbox_allow_no_isolation. Command: %s",
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         return
 
@@ -2528,7 +5010,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "security.py checks remain. Set agent.sandbox='auto' or enable "
             "kiro-cli's internal sandbox to restore OS-level confinement. "
             "Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform.startswith("linux"):
         if "linux" in _warned_set:
@@ -2541,7 +5023,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "secrets are readable by it and only the bypassable app-level "
             "security.py checks remain. Set agent.sandbox='auto' to engage "
             "namespace isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform == "win32":
         if "win32" in _warned_set:
@@ -2551,7 +5033,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' on Windows — no OS-level sandbox "
             "backend exists on this platform. The agent subprocess runs with "
             "full filesystem access. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     else:
         if "other" in _warned_set:
@@ -2561,7 +5043,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' for a non-kiro-cli subprocess — "
             "running without OS-level confinement. Set agent.sandbox='auto' "
             "to engage seatbelt isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
 
     _warn_mode_off_unconfined._warned_set = _warned_set  # type: ignore[attr-defined]
@@ -2585,7 +5067,7 @@ def _warn_first_party_unconfined_once(argv: list[str]) -> None:
         "Hostile-input spawn paths are unaffected: they keep failing closed "
         "and still require agent.sandbox_allow_unsandboxed_exec=true. "
         "Command: %s",
-        argv[0] if argv else "unknown",
+        _command_log_label(argv),
     )
 
 
@@ -2622,7 +5104,7 @@ def _first_party_no_backend_passthrough(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="unconfined",
             resources="first-party fixed argv, no sandbox backend (issue #1563 carve-out)",
@@ -2633,7 +5115,7 @@ def _first_party_no_backend_passthrough(
             "unaudited: the argv is package-derived and denying the spawn "
             "would brick built-in tooling whenever SEL hiccups (matches the "
             "mode=off delegation posture). Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
             exc_info=True,
         )
     # Same env scrub as the seatbelt / delegation paths, via the trusted
@@ -2783,6 +5265,26 @@ def _clamp_sandbox_mode(mode: str) -> str:
     return _clamp_sandbox_mode_to_floor(mode, _governance_sandbox_floor())
 
 
+def _floor_mandates_sandbox(floor: str | None) -> bool:
+    """True when an already-read ``sandbox.min_level`` *floor* requires isolation.
+
+    ``None`` means ungoverned.  A governed floor at the LOOSEST tier is a policy
+    that explicitly requires nothing, so testing the raw string for truthiness
+    would read "no isolation required" as "isolation mandatory" and refuse a
+    spawn the operator legitimately opted into — while telling them a floor of
+    ``off`` forbids unsandboxed execution.
+
+    The loosest tier is derived from the enforcer-owned ordinal registry rather
+    than hardcoded, matching :func:`_clamp_sandbox_mode_to_floor`: a renamed or
+    re-ordered scale must not silently invert this test.
+    """
+    if not floor:
+        return False
+    from kiro_crew.platform.governance import _ORDINAL_SCALES
+
+    return floor != _ORDINAL_SCALES["sandbox"][0]
+
+
 def _clamp_sandbox_mode_to_floor(mode: str, floor: str | None) -> str:
     """Clamp *mode* UP to an already-read ``sandbox.min_level`` *floor*, if any.
 
@@ -2838,6 +5340,8 @@ def wrap_argv(
         is_kiro_cli: Explicit executable classification for descriptor-backed
             Kiro snapshots whose launch path no longer has a ``kiro-cli``
             basename. ``None`` retains basename detection for other callers.
+            Windows internal-sandbox delegation requires this to be exactly
+            ``True``; basename inference can never grant that exception.
         first_party_fixed_argv: True ONLY for spawns whose full argv is derived
             inside this package with zero agent/repo/user-config influence;
             every passing site must be allowlisted in
@@ -2858,10 +5362,21 @@ def wrap_argv(
     Raises:
         RuntimeError: When no sandbox backend is available, mode is not "off",
             ``agent.sandbox_allow_unsandboxed_exec`` is False (default), and
-            the first-party carve-out above does not apply.
+            neither the first-party carve-out nor the explicitly classified
+            Windows Kiro internal-sandbox delegation applies.
             This is the fail-closed behavior — the agent subprocess is NOT
             allowed to run without OS-level isolation unless explicitly opted in.
     """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "wrap_argv() performs blocking sandbox preparation and cannot run on "
+            "an event loop; await wrap_argv_async() instead"
+        )
+
     # Governance ordinal floor: a policy/profile may require a MINIMUM sandbox
     # tier (off < standard < cc < strict).  Clamp the requested mode up to that
     # floor before resolving the level — so an enterprise "min_level: cc" makes
@@ -2880,9 +5395,7 @@ def wrap_argv(
         # but the old early return never checked. Now we verify the delegation
         # on macOS kiro-cli spawns; on Linux (where kiro's internal sandbox
         # doesn't apply) or non-kiro spawns, "off" means genuinely unconfined.
-        kiro_spawn_off = (
-            _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
-        )
+        kiro_spawn_off = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
         if sys.platform == "darwin" and kiro_spawn_off and kiro_internal_sandbox_enabled():
             # Delegation is valid: kiro-cli's sandbox IS active. Apply env scrub
             # (same as _delegate_to_kiro_internal_sandbox) but WITHOUT the
@@ -2899,7 +5412,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="delegated",
                     resources=(
@@ -2916,12 +5429,12 @@ def wrap_argv(
                 logger.warning(
                     "SECURITY: SEL audit failed for mode=off delegation; "
                     "proceeding with env scrub but no seatbelt. Command: %s",
-                    argv[0] if argv else "unknown",
+                    _command_log_label(argv),
                     exc_info=True,
                 )
             unset_args = _sandbox_env_unset_args("standard", strip_python_env)
             if unset_args:
-                return ["env", *unset_args, *argv], None
+                return [_pinned_env_bin(), *unset_args, *argv], None
             return list(argv), None
         # Fix #3: Make the degradation loud — both layers are inactive.
         _warn_mode_off_unconfined(argv, kiro_spawn_off)
@@ -2975,7 +5488,7 @@ def wrap_argv(
                 "Applying the stricter tier's env scrub to the passthrough.",
                 requested_level,
                 active_level,
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         # Emit an SEL audit event for this security-relevant passthrough so the
         # decision to spawn without a *fresh* wrap is tamper-evidently recorded,
@@ -3006,7 +5519,7 @@ def wrap_argv(
                 session_key="sandbox",
                 agent="system",
                 source="sandbox.wrap_argv",
-                tool_name=argv[0] if argv else "unknown",
+                tool_name=_command_log_label(argv),
                 tool_kind="subprocess",
                 outcome="allowed",
                 metadata={
@@ -3079,24 +5592,40 @@ def wrap_argv(
     # allow-all outer profile), so exactly one layer can own isolation. When
     # kiro's internal sandbox is enabled, it is that layer for kiro-cli spawns;
     # KiroCrew's sandbox stays on for everything else and whenever kiro's is off.
-    # Checked before backend detection so delegation also applies where our own
-    # probe found no backend. macOS only — Linux namespace isolation is
-    # unaffected.
+    # Windows has no Kiro Crew OS sandbox backend. Official Kiro ACP spawns are
+    # positively classified by their reviewed callers and delegate to Kiro's
+    # built-in sandbox by default; basename inference is deliberately
+    # insufficient to grant this exception. All other Windows spawns retain the
+    # no-backend fail-closed path. Checked before backend detection so this is a
+    # deterministic capability decision, never a fallback after a probe failure.
+    # Linux namespace isolation is unaffected.
     kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
-    if sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled():
+    delegate_to_kiro = (
+        sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
+    ) or (sys.platform == "win32" and is_kiro_cli is True)
+    if delegate_to_kiro:
         if extra_hidden_dirs or extra_visible_dirs:
             # A delegated sandbox cannot enforce KiroCrew-specific path hides.
-            # Keep the outer seatbelt for callers that require extra isolation.
-            return sandbox_exec_argv(
-                argv,
-                sandbox_level,
-                strip_python_env=strip_python_env,
-                extra_hidden_dirs=extra_hidden_dirs,
-                extra_visible_dirs=extra_visible_dirs,
+            # macOS keeps the outer seatbelt. Windows falls through to its
+            # no-backend policy and fail-closes unless explicitly opted in.
+            if sys.platform == "darwin":
+                return sandbox_exec_argv(
+                    argv,
+                    sandbox_level,
+                    strip_python_env=strip_python_env,
+                    extra_hidden_dirs=extra_hidden_dirs,
+                    extra_visible_dirs=extra_visible_dirs,
+                )
+        else:
+            delegated = _delegate_to_kiro_internal_sandbox(
+                argv, sandbox_level, strip_python_env=strip_python_env
             )
-        return _delegate_to_kiro_internal_sandbox(
-            argv, sandbox_level, strip_python_env=strip_python_env
-        )
+            if delegated is not None:
+                return delegated
+            if sys.platform == "darwin":
+                # Preserve macOS's audit-failure fallback: once delegation is
+                # refused, Kiro Crew's own seatbelt remains the safe owner.
+                return sandbox_exec_argv(argv, sandbox_level, strip_python_env=strip_python_env)
 
     backend = detect_backend(config_mode=mode)
 
@@ -3115,8 +5644,11 @@ def wrap_argv(
                 sandbox_level,
                 strip_python_env=strip_python_env,
             )
-        # The launcher script is argv[1] — caller should clean it up
-        return wrapped, wrapped[1]
+        # Caller deletes the generated launcher script. Its position is
+        # ``1 + len(flags)``, NOT a hardcoded 1: the interpreter flags sit between
+        # the executable and the script, so hardcoding leaks the tempfile (and
+        # hands the caller a flag to unlink) the moment that list changes.
+        return wrapped, _launcher_script_of(wrapped)
     if backend == "sandbox-exec":
         if extra_hidden_dirs or extra_visible_dirs:
             return sandbox_exec_argv(
@@ -3147,7 +5679,22 @@ def wrap_argv(
         # This addresses a penetration-test finding — the previous behavior silently
         # returned unmodified argv, allowing the agent subprocess to access all
         # credential paths without any OS-level isolation.
-        if not _allow_unsandboxed_exec():
+        #
+        # ONE read of the opt-in: the gate below and the message that explains a
+        # refusal must describe the same state, and a concurrent config reload
+        # must not let them disagree about the same spawn.
+        opted_in = _allow_unsandboxed_exec()
+        # A governance ``sandbox.min_level`` floor OVERRIDES the config opt-in
+        # (issue #3162).  Before this, the floor did the opposite of what pinning
+        # it implies: it disabled the audited first-party carve-out below while
+        # leaving this broad opt-in untouched, so a governed fleet lost the
+        # constrained path and kept the unconstrained one.  ``config.json`` is not
+        # policy — the floor is — so the flag cannot re-open this on a governed
+        # host.  Derived from the ONE floor read taken at the top of this call,
+        # and via ``_floor_mandates_sandbox`` rather than raw truthiness, because
+        # a pinned floor of the loosest tier requires nothing and must not deny.
+        floor_mandates_sandbox = _floor_mandates_sandbox(governance_floor)
+        if floor_mandates_sandbox or not opted_in:
             # ONE read of the pair: a concurrent re-probe swaps the whole tuple,
             # so failure and remedy can never come from different probes.
             transient, probe_reason, probe_remedy = _last_unshare_failure or (
@@ -3175,9 +5722,7 @@ def wrap_argv(
                 and _classify_unavailable(transient) == "no_backend"
                 and not governance_floor
             ):
-                return _first_party_no_backend_passthrough(
-                    argv, sandbox_level, strip_python_env
-                )
+                return _first_party_no_backend_passthrough(argv, sandbox_level, strip_python_env)
             if transient:
                 # The mechanism follows the retry advice rather than leading it: the
                 # cap case is permanently reported transient, so withholding it here
@@ -3244,6 +5789,37 @@ def wrap_argv(
                 )
             else:
                 guidance = _no_backend_guidance()
+            # When the policy floor is what refused, every guidance above points
+            # at the wrong lever: the operator HAS set the opt-in and the flag is
+            # deliberately powerless here, so naming it would send them down a
+            # dead end.  Replace the remedy rather than appending to it.
+            policy_overrode_opt_in = floor_mandates_sandbox and opted_in
+            if policy_overrode_opt_in:
+                guidance = (
+                    "This host is GOVERNED: an enterprise policy pins "
+                    f"sandbox.min_level={governance_floor!r}, which forbids "
+                    "unsandboxed execution regardless of "
+                    "agent.sandbox_allow_unsandboxed_exec — that flag is set on "
+                    "this host and is deliberately powerless against the policy, "
+                    "so editing config.json cannot resolve this. A governed host "
+                    "also withholds the first-party carve-out, so Kiro Crew's own "
+                    "built-in spawns are refused here too: this host runs no "
+                    "agent subprocess until it has a working sandbox backend "
+                    "(see docs/system-specs/modules/security.md) or the policy "
+                    "owner relaxes sandbox.min_level."
+                )
+                sel_reason = (
+                    "No sandbox backend available and a governance "
+                    f"sandbox.min_level={governance_floor!r} floor forbids "
+                    "unsandboxed exec (the config opt-in is set but overridden)"
+                )
+                refusal = (
+                    "Sandbox backend unavailable and a governance policy forbids "
+                    "unsandboxed execution. "
+                )
+            else:
+                sel_reason = "No sandbox backend available and allow_unsandboxed_exec is not set"
+                refusal = "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
             # Emit SEL audit event for this security-relevant denial so it
             # appears in the tamper-evident audit log (security-review requirement).
             try:
@@ -3253,19 +5829,15 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="denied",
-                    error=(
-                        "No sandbox backend available and allow_unsandboxed_exec "
-                        f"is not set (probe: {probe_reason})"
-                    ),
+                    error=(f"{sel_reason} (probe: {probe_reason})"),
                 )
             except Exception:
                 logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
             raise SandboxUnavailableError(
-                "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
-                "No OS-level sandbox backend is available on this host, and the "
+                refusal + "No OS-level sandbox backend is available on this host, and the "
                 "agent subprocess cannot be safely isolated. "
                 f"Probe detail: {probe_reason}. " + guidance,
                 kind=_classify_unavailable(transient),
@@ -3283,6 +5855,48 @@ def wrap_argv(
         # Opted in: warn (or info) and return unmodified argv
         _warn_no_isolation(mode)
     return argv, None
+
+
+async def wrap_argv_async(
+    argv: list[str],
+    mode: str = "auto",
+    *,
+    strip_python_env: bool = False,
+    extra_hidden_dirs: tuple[str, ...] = (),
+    extra_visible_dirs: tuple[str, ...] = (),
+    is_kiro_cli: bool | None = None,
+    first_party_fixed_argv: bool = False,
+    _prepare: Callable[..., tuple[list[str], str | None]] | None = None,
+) -> tuple[list[str], str | None]:
+    """Cancellation-safe, off-loop sandbox preparation for async spawn paths.
+
+    Sandbox construction probes the host and creates a launcher/profile. It also
+    resolves the protected voice-runtime paths on the first call. None of that
+    filesystem work may run on a gateway event loop. If the caller is cancelled
+    while the worker is finishing, settle it and remove any newly-created
+    launcher/profile before propagating cancellation. ``_prepare`` preserves
+    each caller's module-local test seam; production callers pass their imported
+    :func:`wrap_argv`, and the default is this module's implementation.
+    """
+    options: dict[str, Any] = {"mode": mode}
+    if strip_python_env:
+        options["strip_python_env"] = True
+    if extra_hidden_dirs:
+        options["extra_hidden_dirs"] = extra_hidden_dirs
+    if extra_visible_dirs:
+        options["extra_visible_dirs"] = extra_visible_dirs
+    if is_kiro_cli is not None:
+        options["is_kiro_cli"] = is_kiro_cli
+    if first_party_fixed_argv:
+        options["first_party_fixed_argv"] = True
+    prepare = functools.partial(wrap_argv if _prepare is None else _prepare, argv, **options)
+
+    def _prepare_wrapped() -> tuple[list[str], dict[str, str], str | None]:
+        wrapped, cleanup = prepare()
+        return wrapped, {}, cleanup
+
+    wrapped, _unused_env, cleanup = await shielded_prepare_off_loop(_prepare_wrapped)
+    return wrapped, cleanup
 
 
 # Environment keys always scrubbed from an agent-influenced subprocess'
@@ -3346,6 +5960,18 @@ def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:
     return {
         k: v for k, v in env.items() if not any(k.startswith(p) for p in _AGENT_DENIED_ENV_KEYS)
     }
+
+
+def scrub_agent_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return the full environment scrub required for a Kiro/ACP child.
+
+    This is the parent-side equivalent of the OS launchers' sensitive-variable
+    removal plus ``strip_python_env=True``. It is mandatory for Windows Kiro
+    delegation because Windows cannot express the POSIX ``env -u`` prefix, and
+    keeping it on every platform makes delegated and wrapped ACP spawns inherit
+    the same environment policy.
+    """
+    return scrub_env(env, extra_prefixes=_PYTHON_ENV_PREFIXES)
 
 
 def sandboxed_spawn_argv(
@@ -3458,6 +6084,126 @@ def sandboxed_spawn_argv(
     return wrapped, scrubbed, cleanup
 
 
+async def shielded_prepare_off_loop(
+    prepare: Callable[[], tuple[list[str], dict[str, str], str | None]],
+    *,
+    executor: ThreadPoolExecutor | None = None,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Run a spawn-preparation callable off the loop, shielded from cancellation.
+
+    ``prepare`` must follow the :func:`sandboxed_spawn_argv` contract: it returns
+    ``(wrapped_argv, scrubbed_env, cleanup_path_or_None)`` where the third element
+    is a temp launcher/profile the CALLER must unlink after the child exits.
+
+    Every async caller reaches the sync chokepoint through a worker hop.
+    Cancelling that hop abandons the returned tuple while the worker still
+    materializes the launcher/profile, leaking the temp file forever.  Shielding
+    the hop keeps the worker's result recoverable: on cancellation we wait for
+    the thread to settle, unlink the launcher it created, and re-raise.
+
+    A REPEAT cancellation landing on a bare recovery ``await`` is a
+    ``BaseException`` that would abandon the recovery before the unlink runs,
+    leaking the materialized launcher (#5841).  The settle-then-unlink therefore
+    runs as its own task, shielded from cancellations aimed at this caller; each
+    absorbed repeat is ``uncancel()``-ed so an enclosing ``asyncio.timeout``
+    still reports ``TimeoutError``, and the ORIGINAL cancellation is re-raised
+    once the launcher is gone.
+
+    ``executor`` keeps pool choice with the CALLER, because which pool absorbs a
+    wedged preparation is per-site policy, not a shield concern: the chokepoint
+    can cold-probe the sandbox backend with a synchronous subprocess, and
+    :mod:`kiro_crew.executors` partitions blocking work into named pools so such
+    a probe cannot occupy the workers another subsystem (the orphan-reaping
+    sweep) needs.  Defaulting it to ``None`` — the loop's default pool, via
+    ``asyncio.to_thread`` — would silently collapse that partition for callers
+    that had chosen a pool, so every site that had one passes it explicitly.
+    """
+
+    Prepared = tuple[list[str], dict[str, str], str | None]
+    task: asyncio.Future[Prepared]
+    if executor is None:
+        task = asyncio.ensure_future(asyncio.to_thread(prepare))
+    else:
+        task = asyncio.get_running_loop().run_in_executor(executor, prepare)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+
+        async def _settle_then_unlink() -> None:
+            cleanup: str | None = None
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                _, _, cleanup = await task
+            if not cleanup:
+                return
+            target = cleanup
+
+            def _unlink() -> None:
+                with contextlib.suppress(OSError):
+                    os.unlink(target)
+
+            if executor is None:
+                await asyncio.to_thread(_unlink)
+            else:
+                await asyncio.get_running_loop().run_in_executor(executor, _unlink)
+
+        current = asyncio.current_task()
+        recovery = asyncio.create_task(_settle_then_unlink())
+        while not recovery.done():
+            try:
+                await asyncio.shield(recovery)
+            except asyncio.CancelledError:
+                uncancel = getattr(current, "uncancel", None)  # 3.11+
+                if uncancel is not None:
+                    uncancel()
+            except Exception:
+                logger.warning(
+                    "sandbox launcher cleanup failed after cancellation",
+                    exc_info=True,
+                )
+        raise
+
+
+async def sandboxed_spawn_argv_async(
+    argv: list[str],
+    mode: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    strip_python_env: bool = False,
+    extra_hidden_dirs: tuple[str, ...] = (),
+    extra_visible_dirs: tuple[str, ...] = (),
+    first_party_fixed_argv: bool = False,
+    executor: ThreadPoolExecutor | None = None,
+    _prepare: Callable[..., tuple[list[str], dict[str, str], str | None]] | None = None,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Prepare a sandboxed spawn safely off-loop, retaining caller test seams."""
+    # Preserve the long-standing injectable preparation seam: many focused
+    # callers replace ``sandboxed_spawn_argv`` with a narrow ``(argv, *, env)``
+    # test double. ``None`` means the caller omitted the argument, in which case
+    # the synchronous function supplies its own ``standard`` default. An
+    # explicitly supplied value -- including ``standard`` -- is forwarded.
+    options: dict[str, Any] = {}
+    if mode is not None:
+        options["mode"] = mode
+    if env is not None:
+        options["env"] = env
+    if strip_python_env:
+        options["strip_python_env"] = True
+    if extra_hidden_dirs:
+        options["extra_hidden_dirs"] = extra_hidden_dirs
+    if extra_visible_dirs:
+        options["extra_visible_dirs"] = extra_visible_dirs
+    if first_party_fixed_argv:
+        options["first_party_fixed_argv"] = True
+    return await shielded_prepare_off_loop(
+        functools.partial(
+            sandboxed_spawn_argv if _prepare is None else _prepare,
+            argv,
+            **options,
+        ),
+        executor=executor,
+    )
+
+
 # ── cgroup v2 scope enforcement (fork bomb + memory DoS) ──
 # The RLIMIT preexec (resource_limit_preexec) caps a SINGLE process's FDs, but
 # RLIMIT is the wrong tool for the finding's headline threats: RLIMIT_NPROC is
@@ -3500,6 +6246,11 @@ _CGROUP_MEMORY_FRACTION = 0.65
 # so this is a belt-and-suspenders default, not the normal path.
 _CGROUP_FALLBACK_MAX_MEMORY_MB = 8192
 
+# The slice every agent scope nests under (systemd dash-hierarchy places it at
+# kirocrew.slice/kirocrew-agents.slice inside the user manager). It is also
+# the aggregate enforcement boundary — see ensure_agents_slice_limits().
+_CGROUP_AGENTS_SLICE = "kirocrew-agents.slice"
+
 
 def _default_max_memory_mb() -> int:
     """Return the default cgroup ``memory.max`` in MB: a fixed fraction
@@ -3514,6 +6265,19 @@ def _default_max_memory_mb() -> int:
             return mb
     except (ValueError, OSError, AttributeError):
         pass
+    # Windows has no ``os.sysconf``, so the probe above raises AttributeError and
+    # would leave a FLAT cap that ignores the machine entirely. That is not a
+    # cosmetic gap now that ``apply_windows_resource_ceiling`` consumes this
+    # value: on an 8 GB host the fallback EQUALS physical RAM and on a smaller
+    # one it exceeds it, so the Job object's memory limit could never engage
+    # before the host was exhausted — the ceiling would exist and enforce
+    # nothing. Ask the kernel instead. ``system_memory()`` returns None off
+    # Windows, so POSIX still reaches the fallback below unchanged.
+    mem = platform_compat.system_memory()
+    if mem is not None:
+        mb = int(mem[0] * _CGROUP_MEMORY_FRACTION) // (1024 * 1024)
+        if mb > 0:
+            return mb
     return _CGROUP_FALLBACK_MAX_MEMORY_MB
 
 
@@ -3521,6 +6285,26 @@ def _default_max_memory_mb() -> int:
 # within a process, and the probe shells out, so compute it once.
 _CGROUP_SCOPE_PROBE: tuple[bool, str] | None = None
 _CGROUP_WARNED = False
+
+
+def _warn_cgroup_unavailable(reason: str) -> None:
+    """Emit the one-time SECURITY warning for a host without cgroup enforcement.
+
+    Shared by the per-spawn wrapper and the slice-limit application so a host
+    where delegation is missing produces exactly ONE warning, no matter which
+    site notices first — both react to the same host condition.
+    """
+    global _CGROUP_WARNED
+    if _CGROUP_WARNED:
+        return
+    _CGROUP_WARNED = True
+    logger.warning(
+        "SECURITY: cgroup v2 scope enforcement unavailable (%s); agent "
+        "subprocess fork-bomb / memory-DoS ceilings are NOT enforced on "
+        "this host. RLIMIT_NOFILE still applies. See "
+        "docs/architecture/resource-protection.md.",
+        reason,
+    )
 
 
 def _probe_cgroup_scope() -> tuple[bool, str]:
@@ -3617,25 +6401,299 @@ def _cgroup_limits_from_config() -> tuple[int, int, int, int]:
         # config/security consumers — importing kiro_crew.config.loader at
         # module load would create an import cycle, so it stays function-level
         # (same pattern as resource_limit_preexec below).
-        from kiro_crew.config.loader import _raw_config
+        from kiro_crew.config.loader import ResourceLimitsConfig, _raw_config
 
-        rl = _raw_config().get("resource_limits")
-        if isinstance(rl, dict):
-            p = rl.get("max_processes")
-            if isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0:
-                max_procs = int(p)
-            m = rl.get("max_memory_mb")
-            if isinstance(m, (int, float)) and not isinstance(m, bool) and m > 0:
-                max_mem_mb = int(m)
-            w = rl.get("cpu_weight")
-            if isinstance(w, (int, float)) and not isinstance(w, bool) and 1 <= w <= 10000:
-                cpu_weight = int(w)
-            q = rl.get("max_cpu_percent")
-            if isinstance(q, (int, float)) and not isinstance(q, bool) and q > 0:
-                max_cpu_percent = int(q)
+        # One validated read for the whole block. ResourceLimitsConfig.from_raw
+        # is the only place these keys are coerced, and it is what refuses a
+        # fraction, a NaN/Infinity from json.loads, and a non-number before
+        # ``int()`` can raise on them and abort the remaining fields.
+        rl = ResourceLimitsConfig.from_raw(_raw_config().get("resource_limits"))
+        # ``>= 1``, so 0 lands on the default with everything else out of domain:
+        # TasksMax=0 / MemoryMax=0M are rejected by systemd and the scope would
+        # never start, so this ceiling is never left unset. The SAME two keys
+        # mean "leave inherited" when 0 reaches the rlimit path in
+        # security.apply_resource_limits — ResourceLimitsConfig carries both
+        # domains so neither side can be tightened without seeing the other.
+        if rl.max_processes is not None and rl.max_processes >= 1:
+            max_procs = rl.max_processes
+        if rl.max_memory_mb is not None and rl.max_memory_mb >= 1:
+            max_mem_mb = rl.max_memory_mb
+        # Range-checked at the parse site (1..10000), so any value that arrives
+        # here is usable as-is.
+        if rl.cpu_weight is not None:
+            cpu_weight = rl.cpu_weight
+        # Opt-in: 0 keeps the "emit no CPUQuota" default rather than capping.
+        if rl.max_cpu_percent is not None and rl.max_cpu_percent > 0:
+            max_cpu_percent = rl.max_cpu_percent
     except Exception:
         logger.debug("cgroup limits: config unavailable, using defaults")
     return max_procs, max_mem_mb, cpu_weight, max_cpu_percent
+
+
+# ── aggregate agent-slice soft ceiling (memory.high on kirocrew-agents.slice) ──
+# Per-scope MemoryMax bounds ONE runaway spawn tree, but scopes are created per
+# spawn: several concurrent agent trees, each legitimately under its own 65%
+# cap, can still sum past physical RAM and livelock a swapless host. memory.high
+# on the slice all agent scopes share throttles-and-reclaims the whole subtree
+# once the SUM of agent memory crosses it, keeping the kernel and the gateway
+# (which lives outside the slice) responsive — a soft layer BELOW the slice's
+# hard aggregate memory.max (ensure_agents_slice_limits), which OOM-kills a
+# scope only when throttling was not enough, while each scope's own memory.max
+# still hard-kills an individual runaway. Same trust model as the scope
+# ceilings: unprivileged, enforced by the user manager, requires the memory
+# controller delegated to the user slice (the existing _probe_cgroup_scope
+# check).
+
+# Fraction of physical RAM used for the default slice memory.high. Higher than
+# the per-scope 65% because it bounds the SUM of all agent scopes, and below
+# the slice's hard 80% memory.max so throttling engages before the kernel
+# OOM-kills, with OS + gateway headroom preserved even while the whole fleet
+# is being throttled.
+_SLICE_MEMORY_HIGH_FRACTION = 0.75
+# Fallback slice memory.high (MB) used only when physical RAM can't be read.
+# The slice path is Linux-only, where SC_PHYS_PAGES exists, so this is a
+# belt-and-suspenders default, not the normal path.
+_SLICE_FALLBACK_MEMORY_HIGH_MB = 12288
+
+# Last MemoryHigh value applied to the slice by THIS process ("24576M" /
+# "infinity"), or None before the first reconcile. The desired value is
+# host-derived and constant for the process's life (no config input), so
+# after the first successful apply every later reconcile reduces to a
+# string compare and no-ops. Kept as a reconcile (rather than a one-shot)
+# so an apply that failed transiently is retried on the next spawn.
+_SLICE_MEMHIGH_APPLIED: str | None = None
+# Process-level kill switch: set after a failed apply so a broken systemctl is
+# warned about ONCE and never hammered on every subsequent spawn.
+_SLICE_MEMHIGH_DISABLED = False
+
+
+def _default_slice_memory_high_mb() -> int:
+    """Return the default slice ``memory.high`` in MB: a fixed fraction
+    (:data:`_SLICE_MEMORY_HIGH_FRACTION`) of physical RAM, falling back to
+    :data:`_SLICE_FALLBACK_MEMORY_HIGH_MB` if host RAM can't be determined.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        mb = int(total_bytes * _SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        if mb > 0:
+            return mb
+    except (ValueError, OSError, AttributeError):
+        pass
+    return _SLICE_FALLBACK_MEMORY_HIGH_MB
+
+
+def _ensure_agent_slice_memory_high() -> None:
+    """Reconcile ``MemoryHigh`` on :data:`_CGROUP_AGENTS_SLICE` with the host default.
+
+    The slice is UID-GLOBAL: every gateway instance under this user (live,
+    dev-backend, pods with delegation) parents scopes into the same slice, so
+    the ceiling is deliberately NOT config-driven — a per-instance config key
+    would let one instance (e.g. a dev gateway configured permissively) lift
+    or lower the ceiling that protects the others. The value is always the
+    host-derived default (:func:`_default_slice_memory_high_mb`).
+
+    Runs ``systemctl --user set-property --runtime`` — unprivileged: the user
+    manager owns the slice, and the memory controller is delegated wherever the
+    caller's probe passed. ``--runtime`` is deliberate: the drop-in lives under
+    ``$XDG_RUNTIME_DIR`` and vanishes with the login session, so no persistent
+    unit files accumulate under ``~/.config`` and a stale ceiling can never
+    outlive the login session that set it.
+
+    Never raises: agent spawns must not fail because the ceiling could not be
+    applied. On failure it logs one loud warning and disarms for the rest of
+    the process.
+    """
+    global _SLICE_MEMHIGH_APPLIED, _SLICE_MEMHIGH_DISABLED
+    if _SLICE_MEMHIGH_DISABLED:
+        return
+    desired = f"{_default_slice_memory_high_mb()}M"
+    if desired == _SLICE_MEMHIGH_APPLIED:
+        return
+    try:
+        systemctl = platform_compat.trusted_system_bin("systemctl")
+        if systemctl is None:
+            raise FileNotFoundError("systemctl not found in trusted system dirs")
+        proc = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "set-property",
+                "--runtime",
+                _CGROUP_AGENTS_SLICE,
+                f"MemoryHigh={desired}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "").strip() or "non-zero exit")
+    except Exception as exc:
+        _SLICE_MEMHIGH_DISABLED = True
+        logger.warning(
+            "SECURITY: could not apply MemoryHigh=%s to %s (%s); the AGGREGATE "
+            "agent memory ceiling is NOT enforced on this host — per-scope "
+            "MemoryMax still applies. See "
+            "docs/architecture/resource-protection.md.",
+            desired,
+            _CGROUP_AGENTS_SLICE,
+            exc,
+        )
+        return
+    _SLICE_MEMHIGH_APPLIED = desired
+    logger.info("agent slice %s: MemoryHigh=%s applied", _CGROUP_AGENTS_SLICE, desired)
+
+
+# Last observed value of the slice's memory.events `high` counter, or None
+# before the first successful read. The first read only baselines — the
+# counter is monotonic for the slice cgroup's lifetime, so a nonzero value
+# may predate this process — and climbs are judged against it.
+_SLICE_MEMHIGH_EVENTS_SEEN: int | None = None
+# True while inside a climbing episode that has already been warned about, so
+# sustained throttling logs once per episode instead of on every spawn. Reset
+# when an observation finds the counter stable (episode over) or lower (slice
+# cgroup recreated).
+_SLICE_MEMHIGH_CLIMB_WARNED = False
+
+
+def _slice_memory_events_high() -> int | None:
+    """Return the ``high`` counter from the slice cgroup's ``memory.events``.
+
+    The slice directory comes from :func:`_agents_slice_cgroup_dir`, which
+    understands systemd's dash-hierarchy (``kirocrew-agents.slice`` nests
+    under ``kirocrew.slice`` in the user manager's subtree). ``None`` when it
+    cannot be read: not Linux, no cgroup v2, the slice cgroup not currently
+    materialized (systemd releases an empty slice), or unparseable content.
+    """
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return None
+    return _read_cgroup_counters(slice_dir / "memory.events").get("high")
+
+
+def _check_slice_memory_pressure() -> None:
+    """Warn when the slice's ``memory.events`` ``high`` counter climbs.
+
+    Past ``memory.high`` the kernel throttles-and-reclaims the subtree
+    SILENTLY — agents just slow down; nothing kills and nothing alerts, since
+    per-scope ``MemoryMax`` never fired. The ``high`` counter climbing is the
+    kernel's only signal that the aggregate ceiling is throttling, and
+    surfacing it makes "agents mysteriously slow" diagnosable from the
+    gateway log as ceiling throttling rather than a hang.
+
+    Warned once per climbing episode: the first observed increase logs, later
+    increases stay silent until an observation finds the counter stable,
+    which closes the episode. A DECREASE means the slice cgroup was recreated
+    (an empty slice is released and its counters reset) — re-baseline
+    silently, never warn.
+    """
+    global _SLICE_MEMHIGH_EVENTS_SEEN, _SLICE_MEMHIGH_CLIMB_WARNED
+    current = _slice_memory_events_high()
+    if current is None:
+        return
+    previous = _SLICE_MEMHIGH_EVENTS_SEEN
+    _SLICE_MEMHIGH_EVENTS_SEEN = current
+    if previous is None or current <= previous:
+        # First read, counter stable, or slice cgroup recreated: (re)baseline
+        # and close any open episode.
+        _SLICE_MEMHIGH_CLIMB_WARNED = False
+        return
+    if _SLICE_MEMHIGH_CLIMB_WARNED:
+        return
+    _SLICE_MEMHIGH_CLIMB_WARNED = True
+    logger.warning(
+        "agent slice %s: memory.events high counter climbed %d -> %d — "
+        "aggregate agent memory crossed the slice MemoryHigh ceiling and the "
+        "kernel is throttling the whole agent subtree; agents run slowly "
+        "(not hung) until aggregate memory drops. See "
+        "docs/architecture/resource-protection.md.",
+        _CGROUP_AGENTS_SLICE,
+        previous,
+        current,
+    )
+
+
+# Serializes reconciliation workers. Deliberately a plain blocking mutex held
+# for the whole reconcile body: every schedule spawns its own short-lived
+# worker and workers queue on the mutex, so concurrent spawns never interleave
+# systemctl calls and a failed apply is retried by the next spawn's worker.
+# The desired value is host-derived and process-constant (no config input) —
+# the mutex guards the apply/retry handoff, not value freshness. Redundant
+# workers are near-free (the applied-value check reduces them to a string
+# compare), and thread count is bounded by concurrent agent spawns.
+_SLICE_MEMHIGH_MUTEX = threading.Lock()
+
+
+def _reconcile_slice_memory_high_off_thread() -> None:
+    """Reconcile ``MemoryHigh`` and check slice throttling in a daemon thread.
+
+    The reconciliation reads config and shells out to ``systemctl`` (up to
+    10s), and its caller sits on the agent-spawn path, which runs on the
+    gateway event loop — so it must never execute inline. Fire-and-forget is
+    semantically safe: ``MemoryHigh`` set on a slice applies to members that
+    are already running, so a reconciliation that lands moments after the
+    spawn still bounds it, and every later spawn re-reconciles. The worker
+    also runs :func:`_check_slice_memory_pressure`, so throttle visibility
+    shares the reconcile cadence (per spawn) and its kill switch.
+    """
+    global _SLICE_MEMHIGH_DISABLED
+    if _SLICE_MEMHIGH_DISABLED:
+        return
+
+    def _worker() -> None:
+        with _SLICE_MEMHIGH_MUTEX:
+            _ensure_agent_slice_memory_high()
+            _check_slice_memory_pressure()
+
+    try:
+        threading.Thread(target=_worker, name="agent-slice-memhigh", daemon=True).start()
+    except RuntimeError as exc:
+        # Thread exhaustion. This sits on the agent-spawn path, so it must
+        # never abort the spawn. Disarm like any other reconciliation
+        # failure: per-scope MemoryMax still applies.
+        _SLICE_MEMHIGH_DISABLED = True
+        logger.warning(
+            "SECURITY: could not start the MemoryHigh reconciliation thread "
+            "(%s); the AGGREGATE agent memory ceiling is NOT enforced on this "
+            "host — per-scope MemoryMax still applies.",
+            exc,
+        )
+
+
+def apply_windows_resource_ceiling(pid: int) -> bool:
+    """Windows counterpart to :func:`cgroup_scope_argv`, applied AFTER the spawn.
+
+    ``cgroup_scope_argv`` bounds an agent subprocess and all its descendants by
+    prepending ``systemd-run --user --scope`` with ``TasksMax`` / ``MemoryMax``.
+    That has no Windows equivalent expressible as an argv prefix, so there it
+    returns argv unchanged and logs a one-time loud SECURITY warning — the
+    fork-bomb and memory-DoS ceilings were simply absent on that platform.
+
+    A Job object is the native mechanism (limits cover every process in the job,
+    and a member's descendants join automatically), but it must be applied to a
+    live pid rather than baked into argv. Callers therefore invoke this right
+    after the spawn returns, in ADDITION to the ``cgroup_scope_argv`` call they
+    already make (a no-op on Windows), and while the child is still suspended —
+    see :func:`platform_compat.apply_job_limits` for why that ordering is what
+    makes the ceiling airtight.
+
+    Reads the SAME ``resource_limits`` config as the cgroup path, so one operator
+    setting governs both platforms.
+
+    Returns ``True`` when a ceiling was installed; ``False`` on non-Windows
+    (nothing to do — the cgroup wrapper owns it) or on any failure, which
+    :func:`platform_compat.apply_job_limits` has already logged as a SECURITY
+    warning. Never raises: a missing ceiling must not fail the spawn, matching
+    how an unavailable cgroup scope is handled.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return False
+    max_procs, max_mem_mb, _cpu_weight, _max_cpu_percent = _cgroup_limits_from_config()
+    return platform_compat.apply_job_limits(
+        pid,
+        max_procs=max_procs,
+        max_memory_bytes=max_mem_mb * 1024 * 1024,
+    )
 
 
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
@@ -3654,27 +6712,53 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     the returned argv's eventual PID is the real child — parent PID tracking,
     ``killpg``, and descendant scans are unaffected.
 
+    Every scope is parented under :data:`_CGROUP_AGENTS_SLICE`, and the
+    slice-level soft ceiling (``MemoryHigh``, see
+    :func:`_ensure_agent_slice_memory_high`) — a host-derived constant (75%
+    of RAM) — is ensured before each wrap, throttling the SUM of all
+    concurrent agent trees before the slice's hard ``MemoryMax``
+    (:func:`ensure_agents_slice_limits`) OOM-kills a scope.
+
     Layers OUTSIDE the OS-level sandbox: callers pass the already-``wrap_argv``-ed
     argv here so the child is filesystem-isolated AND cgroup-bounded.
 
     On a host without cgroup v2 delegation (older Linux, no systemd user
     session, macOS), returns *argv* unchanged and logs a one-time loud SECURITY
     warning — the RLIMIT_NOFILE preexec still applies, but the fork-bomb/memory
-    DoS ceiling is NOT enforced there.
+    DoS ceiling is NOT enforced there. The same degradation applies when
+    ``systemd-run`` resolves outside the trusted system directories: prepending
+    an unpinned wrapper name would trade a DoS ceiling for an exec-hijack
+    channel, which is the worse of the two.
+
+    The returned wrapper is an ABSOLUTE path, so callers may hand the result to
+    a spawn whose ``env`` carries a config-declared PATH without that PATH being
+    able to redirect argv[0].
     """
-    global _CGROUP_WARNED
     available, reason = _probe_cgroup_scope()
     if not available:
-        if not _CGROUP_WARNED:
-            _CGROUP_WARNED = True
-            logger.warning(
-                "SECURITY: cgroup v2 scope enforcement unavailable (%s); agent "
-                "subprocess fork-bomb / memory-DoS ceilings are NOT enforced on "
-                "this host. RLIMIT_NOFILE still applies. See "
-                "docs/architecture/resource-protection.md.",
-                reason,
-            )
+        _warn_cgroup_unavailable(reason)
         return argv
+    # SECURITY: the wrapper this function prepends becomes argv[0], and a caller
+    # that hands the result to a spawn with a config-influenced ``env`` has
+    # CPython resolve a slash-less argv[0] through THAT env's PATH
+    # (os.get_exec_path) -- so a bare name here is an exec-hijack channel that
+    # runs BEFORE ``--scope`` establishes confinement. Pin it at the layer that
+    # prepends it, so every caller inherits the protection rather than each
+    # spawn site remembering to re-pin (the same reason ``sandbox_exec_argv``
+    # pins its own wrappers). ``trusted_system_bin`` ignores PATH entirely: a
+    # gateway's PATH can legitimately lead with agent-writable directories, so
+    # resolving through it would leave the hole half-open. An unresolvable
+    # wrapper degrades exactly like a missing cgroup backend -- no ceiling, loud
+    # warning -- rather than emitting an unpinned name.
+    systemd_run = platform_compat.trusted_system_bin("systemd-run")
+    if not systemd_run:
+        _warn_cgroup_unavailable("systemd-run is not in a trusted system directory")
+        return argv
+    # Reconcile the slice-level aggregate ceiling off-thread: this call site
+    # runs on the gateway event loop during agent spawn, and reconciliation
+    # does config reads + a systemctl subprocess. MemoryHigh on a slice
+    # applies to already-running members, so the spawn need not wait for it.
+    _reconcile_slice_memory_high_off_thread()
     max_procs, max_mem_mb, cpu_weight, max_cpu_percent = _cgroup_limits_from_config()
     props = [
         "-p",
@@ -3691,15 +6775,307 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         if max_cpu_percent > 0:
             props += ["-p", f"CPUQuota={max_cpu_percent}%"]
     return [
-        "systemd-run",
+        systemd_run,
         "--user",
         "--scope",
         "-q",
-        "--slice=kirocrew-agents.slice",
+        f"--slice={_CGROUP_AGENTS_SLICE}",
         *props,
         "--",
         *argv,
     ]
+
+
+# ── aggregate ceiling on the parent slice ──
+# The per-scope MemoryMax above bounds ONE spawn tree, but scopes are siblings:
+# N concurrent spawns may collectively request N x 65% of host RAM with no
+# single cgroup ever breaching its own limit. cgroup v2 enforces limits down
+# the tree — a descendant is bounded by the MINIMUM effective limit of itself
+# and all ancestors — so the parent slice every scope already nests under is
+# the natural aggregate boundary. ensure_agents_slice_limits() puts a ceiling
+# on it, yielding a two-level model: slice = aggregate across all concurrent
+# agent work, scope = per-tree (unchanged).
+
+# Aggregate memory.max as a fraction of physical RAM. Must sit ABOVE the
+# per-scope fraction (0.65) — otherwise the slice would shrink a single
+# spawn's existing headroom — and meaningfully below 1.0 so the OS and the
+# gateway keep breathing room even when agent work saturates the ceiling.
+_CGROUP_TOTAL_MEMORY_FRACTION = 0.80
+# Fallback aggregate memory.max (MB) when physical RAM can't be read. Above
+# the per-scope fallback (8192) for the same "never clamp a single scope
+# tighter than its own ceiling" reason as the fraction.
+_CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB = 12288
+# Aggregate pids.max across all concurrent scopes: four fully-loaded scopes'
+# worth (4 x 8192). Bounds the composition blow-up (32 scopes x 8192 tasks =
+# 262144 otherwise) while still allowing several concurrent JVM-scale builds,
+# each of which legitimately needs thousands of threads.
+_CGROUP_DEFAULT_MAX_TOTAL_TASKS = 32768
+
+
+def _default_max_total_memory_mb() -> int:
+    """Default aggregate ``memory.max`` (MB) for the agents slice: a fixed
+    fraction (:data:`_CGROUP_TOTAL_MEMORY_FRACTION`) of physical RAM, falling
+    back to :data:`_CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB` when RAM is unreadable.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        mb = int(total_bytes * _CGROUP_TOTAL_MEMORY_FRACTION) // (1024 * 1024)
+        if mb > 0:
+            return mb
+    except (ValueError, OSError, AttributeError):
+        pass
+    return _CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB
+
+
+def _slice_limits_from_config() -> tuple[int, int]:
+    """Return ``(max_total_memory_mb, max_total_tasks)`` for the agents slice.
+
+    Reads ``resource_limits.max_total_memory_mb`` / ``max_total_processes``
+    from the same config block as the per-scope knobs. ``0`` or junk means
+    "use default" — the aggregate ceiling is never left unset, matching the
+    per-scope rule in :func:`_cgroup_limits_from_config`. The two memory knobs
+    are deliberately independent of one another: per-scope answers "how big may
+    one tree get", aggregate answers "how much may all trees claim together".
+    """
+    total_mem_mb = _default_max_total_memory_mb()
+    total_tasks = _CGROUP_DEFAULT_MAX_TOTAL_TASKS
+    try:
+        # circular import: same constraint as _cgroup_limits_from_config —
+        # config.loader consumers import sandbox, so the import stays local.
+        from kiro_crew.config.loader import ResourceLimitsConfig, _raw_config
+
+        # Same single validated read as the per-scope knobs. This function used
+        # to test ``int(m) >= 1`` directly, which raises on a NaN/Infinity that
+        # json.loads happily produces — and the raise landed in the except below,
+        # discarding a VALID max_total_processes set alongside a junk memory
+        # value. from_raw refuses both before int() sees them, per key.
+        rl = ResourceLimitsConfig.from_raw(_raw_config().get("resource_limits"))
+        if rl.max_total_memory_mb is not None and rl.max_total_memory_mb >= 1:
+            total_mem_mb = rl.max_total_memory_mb
+        if rl.max_total_processes is not None and rl.max_total_processes >= 1:
+            total_tasks = rl.max_total_processes
+    except Exception:
+        logger.debug("slice limits: config unavailable, using defaults")
+    return total_mem_mb, total_tasks
+
+
+_SLICE_LIMITS_APPLIED = False
+
+
+def ensure_agents_slice_limits() -> bool:
+    """Apply the aggregate cgroup ceiling to the agents slice. Idempotent.
+
+    Runs ``systemctl --user set-property --runtime`` on
+    :data:`_CGROUP_AGENTS_SLICE`, setting ``MemoryMax`` (aggregate across ALL
+    concurrent agent scopes), ``MemorySwapMax=0`` (consistent with the
+    per-scope property: a true RSS ceiling, no swap escape), and ``TasksMax``
+    (aggregate fork-bomb ceiling). Called once at gateway startup.
+
+    ``--runtime`` over a shipped unit drop-in, deliberately: the property is
+    re-derived from config and re-applied on every gateway start, so a config
+    change can never leave a stale on-disk artifact behind, and uninstalling
+    leaves nothing to clean up. The property persists on the user manager
+    until logout/reboot — long enough, since the gateway is the long-lived
+    process that re-applies it.
+
+    Gated on the same :func:`_probe_cgroup_scope` capability check as the
+    per-scope wrapper: where delegation is unavailable this is skipped and the
+    single shared SECURITY warning covers both layers — no second warning for
+    the same host condition.
+
+    Blocking (shells out): call off-loop (``asyncio.to_thread``).
+
+    Returns True when the ceiling is in place (now or from an earlier call).
+    """
+    global _SLICE_LIMITS_APPLIED
+    if _SLICE_LIMITS_APPLIED:
+        return True
+    available, reason = _probe_cgroup_scope()
+    if not available:
+        _warn_cgroup_unavailable(reason)
+        return False
+    total_mem_mb, total_tasks = _slice_limits_from_config()
+    # PATH can legitimately lead with agent-writable directories (a worktree
+    # venv's bin, ~/.local/bin), so a bare "systemctl" would let a planted
+    # shim run with the gateway's environment. Resolve from fixed system
+    # directories only; unavailable = ceiling not applied (per-scope ceilings
+    # still hold).
+    systemctl = platform_compat.trusted_system_bin("systemctl")
+    if systemctl is None:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s: no trusted "
+            "systemctl binary — per-scope ceilings still apply.",
+            _CGROUP_AGENTS_SLICE,
+        )
+        return False
+    cmd = [
+        systemctl,
+        "--user",
+        "set-property",
+        "--runtime",
+        _CGROUP_AGENTS_SLICE,
+        f"MemoryMax={total_mem_mb}M",
+        "MemorySwapMax=0",
+        f"TasksMax={total_tasks}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s: %s — "
+            "per-scope ceilings still apply, but N concurrent spawns may "
+            "collectively exceed host RAM.",
+            _CGROUP_AGENTS_SLICE,
+            exc,
+        )
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s (rc=%d): %s — "
+            "per-scope ceilings still apply, but N concurrent spawns may "
+            "collectively exceed host RAM.",
+            _CGROUP_AGENTS_SLICE,
+            proc.returncode,
+            (proc.stderr or "").strip(),
+        )
+        return False
+    _SLICE_LIMITS_APPLIED = True
+    logger.info(
+        "aggregate cgroup ceiling on %s: MemoryMax=%dM MemorySwapMax=0 TasksMax=%d "
+        "(per-scope ceilings unchanged)",
+        _CGROUP_AGENTS_SLICE,
+        total_mem_mb,
+        total_tasks,
+    )
+    return True
+
+
+# cgroup v2 directory of the systemd user manager's subtree (transient
+# --user units always live under user@<uid>.service on the unified
+# hierarchy); ``{uid}`` is filled at resolve time. Module-level so tests can
+# point the resolver at a fabricated tree.
+_USER_MANAGER_CGROUP_BASE = "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def _agents_slice_cgroup_dir() -> Path | None:
+    """Resolve the agents slice's cgroup directory, or None when absent.
+
+    systemd's dash-hierarchy places ``kirocrew-agents.slice`` under
+    ``kirocrew.slice`` inside the user manager's subtree; the direct
+    construction covers that. The shallow scan tolerates a manager that laid
+    the slice out differently (one extra level only — never a recursive walk).
+    The directory exists only while the slice is active (a runtime property or
+    a live scope holds it); None simply means "no agent work to observe".
+    """
+    if sys.platform != "linux":
+        return None
+    base = Path(_USER_MANAGER_CGROUP_BASE.format(uid=os.getuid()))
+    direct = base / "kirocrew.slice" / _CGROUP_AGENTS_SLICE
+    if direct.is_dir():
+        return direct
+    try:
+        for child in base.iterdir():
+            cand = child / _CGROUP_AGENTS_SLICE
+            if cand.is_dir():
+                return cand
+    except OSError:
+        pass
+    return None
+
+
+def _read_cgroup_counters(path: Path) -> dict[str, int]:
+    """Parse a ``memory.events``-style key/value cgroup file into a dict."""
+    counters: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if value.strip().isdigit():
+                counters[key] = int(value)
+    except OSError:
+        pass
+    return counters
+
+
+# Last-seen slice-level OOM counters, so only NEW kills are reported. Seeded
+# lazily from the current values on first read: kills that predate this
+# process must not fire a spurious warning at boot.
+_SLICE_OOM_SEEN: dict[str, int] | None = None
+
+
+def check_agents_slice_pressure() -> str | None:
+    """Report (and log) new OOM kills inside the agents slice, else None.
+
+    With an aggregate ceiling on the slice, a breach OOM-kills SOME scope in
+    it — the kernel picks the victim, not necessarily the spawn that grew.
+    Without attribution the operator-visible failure is "a random subagent
+    died". This turns it into a diagnosable event: which scopes took kills
+    (each scope's own ``memory.events.local oom_kill``), the slice's
+    ``memory.current`` vs ``memory.max`` at observation time, and whether the
+    SLICE ceiling itself engaged (``memory.events.local max`` on the slice —
+    the discriminator between a slice-level breach and a single scope hitting
+    its own per-tree limit).
+
+    Reads a handful of cgroup files; never raises. Polled from the resource
+    pressure sampler's worker thread, so it is already off-loop. The same
+    poll also re-applies the slice ceiling if a user-manager restart dropped
+    the --runtime property (see the self-heal block below).
+    """
+    global _SLICE_OOM_SEEN, _SLICE_LIMITS_APPLIED
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return None
+    # Self-heal: the ceiling is a --runtime property, so a user-manager
+    # restart (logout/reboot) silently drops it while the gateway keeps
+    # running. This sampler already reads the slice each tick — if the
+    # ceiling we applied has vanished (memory.max reads "max"), re-apply it
+    # here instead of waiting for the next gateway start. Only when WE
+    # applied it before: a host that never passed the delegation gate must
+    # not start shelling out from the sampler.
+    if _SLICE_LIMITS_APPLIED:
+        try:
+            if (slice_dir / "memory.max").read_text().strip() == "max":
+                _SLICE_LIMITS_APPLIED = False
+                ensure_agents_slice_limits()
+        except OSError:
+            pass
+    events = _read_cgroup_counters(slice_dir / "memory.events")
+    local = _read_cgroup_counters(slice_dir / "memory.events.local")
+    current = {"oom_kill": events.get("oom_kill", 0), "max": local.get("max", 0)}
+    if _SLICE_OOM_SEEN is None:
+        _SLICE_OOM_SEEN = current
+        return None
+    new_kills = current["oom_kill"] - _SLICE_OOM_SEEN["oom_kill"]
+    slice_max_hits = current["max"] - _SLICE_OOM_SEEN["max"]
+    _SLICE_OOM_SEEN = current
+    if new_kills <= 0:
+        return None
+    victims: list[str] = []
+    try:
+        for child in slice_dir.iterdir():
+            if child.suffix == ".scope" and child.is_dir():
+                child_local = _read_cgroup_counters(child / "memory.events.local")
+                if child_local.get("oom_kill", 0) > 0:
+                    victims.append(child.name)
+    except OSError:
+        pass
+    mem_current = -1
+    try:
+        mem_current = int((slice_dir / "memory.current").read_text().strip())
+    except (OSError, ValueError):
+        pass
+    try:
+        mem_max = (slice_dir / "memory.max").read_text().strip()
+    except OSError:
+        mem_max = "?"
+    message = (
+        f"cgroup OOM kill inside {_CGROUP_AGENTS_SLICE}: {new_kills} new kill(s); "
+        f"slice memory.current={mem_current} memory.max={mem_max}; "
+        f"slice-level aggregate ceiling engaged: "
+        f"{'yes' if slice_max_hits > 0 else 'no (a scope hit its own per-tree limit)'}; "
+        f"scopes with recorded kills: {victims or '(already reaped)'}"
+    )
+    logger.warning("%s", message)
+    return message
 
 
 # ``systemd-run --user`` finds the caller's session bus through these two
@@ -3789,8 +7165,12 @@ def resource_limit_preexec() -> "Callable[[], None] | None":
     gives a child filesystem + credential isolation, and this gives it a
     kernel-enforced ceiling on processes / file descriptors / CPU / memory so a
     fork bomb or runaway allocation in a compromised tool or MCP server cannot
-    exhaust the host out from under the gateway. Every agent-influenced spawn
-    passes the result as ``preexec_fn=`` (see ``docs/architecture/resource-protection.md``).
+    exhaust the host out from under the gateway. Call sites do not use this
+    directly: agent-influenced spawns go through
+    :func:`create_subprocess_limited` / :func:`run_limited` /
+    :func:`popen_limited`, which deliver the same limits AFTER ``exec`` via the
+    spawn shim and fall back to this ``preexec_fn`` only on a host with no
+    usable shim (see ``docs/architecture/resource-protection.md``).
 
     Returns the callable from :func:`kiro_crew.security.apply_resource_limits`,
     or ``None`` on non-POSIX platforms (where there is nothing to enforce and
@@ -3956,11 +7336,13 @@ def build_resource_limit_preexec() -> "Callable[[], None] | None":
             cfg = {}
         raw_limits = (cfg or {}).get("resource_limits")
         limits = dict(raw_limits) if isinstance(raw_limits, dict) else {}
-        # Malformed operator values must not break the spawn — resource-limit
-        # handling elsewhere ignores bad values, so mirror that here and fall
-        # back to the ceiling (bools are ints in Python; exclude them).
-        raw = limits.get("max_open_files")
-        configured = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+        # Malformed operator values must not break the spawn — the shared parse
+        # ignores anything out of domain and returns None, which floors to the
+        # build ceiling here. Going through it keeps this path from being a
+        # second rule for a key security.resource_limit_spec also reads.
+        from kiro_crew.config.loader import ResourceLimitsConfig
+
+        configured = ResourceLimitsConfig.from_raw(raw_limits).max_open_files or 0
         limits["max_open_files"] = max(configured, _BUILD_NOFILE_CEILING)
         _BUILD_RESOURCE_PREEXEC = apply_resource_limits({**(cfg or {}), "resource_limits": limits})
     return _BUILD_RESOURCE_PREEXEC  # type: ignore[return-value]
@@ -4002,6 +7384,13 @@ _PROFILE_OOM_BIAS = {
     RLIMIT_PROFILE_NONE: False,
 }
 
+# The shim's own argv contract, mirrored here so a cached prefix can be extended
+# for one spawn. Kept as literals rather than imported from the shim module: the
+# shim is consumed as a source string captured at import time, never imported from
+# the (agent-writable) package directory at spawn time.
+_SHIM_ARGV_SEPARATOR = "--"
+_SHIM_CHDIR_FD_FLAG = "--chdir-fd="
+
 _SHIM_ARGV_CACHE: dict[str, tuple[str, ...]] = {}
 _SHIM_UNAVAILABLE_LOGGED = False
 
@@ -4033,8 +7422,11 @@ def _rlimit_spec(profile: str) -> str:
     if profile == RLIMIT_PROFILE_BUILD:
         raw_limits = (cfg or {}).get("resource_limits")
         limits = dict(raw_limits) if isinstance(raw_limits, dict) else {}
-        raw = limits.get("max_open_files")
-        configured = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+        # Same shared parse as the post-fork build path above, so the two
+        # spellings of "raise the build NOFILE floor" cannot drift apart.
+        from kiro_crew.config.loader import ResourceLimitsConfig
+
+        configured = ResourceLimitsConfig.from_raw(raw_limits).max_open_files or 0
         limits["max_open_files"] = max(configured, _BUILD_NOFILE_CEILING)
         cfg = {**(cfg or {}), "resource_limits": limits}
     return ",".join(f"{name}:{value}" for name, value in resource_limit_spec(cfg))
@@ -4084,10 +7476,36 @@ def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
         argv.append(f"--rlimits={spec}")
     if bias:
         argv.append("--oom-bias")
-    argv.append("--")
+    argv.append(_SHIM_ARGV_SEPARATOR)
     resolved = tuple(argv)
     _SHIM_ARGV_CACHE[key] = resolved
     return resolved
+
+
+def _shim_prefix_entering_fd(prefix: "tuple[str, ...]", descriptor: int) -> "tuple[str, ...]":
+    """Return *prefix* with ``--chdir-fd`` inserted ahead of its argv separator.
+
+    Copied rather than mutated: the prefix is cached per profile, while the
+    descriptor belongs to a single spawn.
+    """
+    if not prefix or prefix[-1] != _SHIM_ARGV_SEPARATOR:
+        raise RuntimeError("spawn shim prefix is missing its argv separator")
+    return prefix[:-1] + (f"{_SHIM_CHDIR_FD_FLAG}{descriptor}", _SHIM_ARGV_SEPARATOR)
+
+
+def _pass_fds_including(passed: Any, descriptor: int) -> "tuple[int, ...]":
+    """Return *passed* with *descriptor* inherited, leaving its order alone.
+
+    The shim can only ``fchdir`` a descriptor the child actually holds, and
+    ``pass_fds`` is what carries it there: it exempts the fd from
+    ``_close_open_fds`` and clears the ``O_CLOEXEC`` the binder opens with. Owned
+    here rather than left to each caller so the flag and the inheritance cannot
+    drift apart.
+    """
+    existing = tuple(passed or ())
+    if descriptor in existing:
+        return existing
+    return existing + (descriptor,)
 
 
 def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
@@ -4143,6 +7561,98 @@ def _resolve_spawn_target(
     return found
 
 
+def _pinned_spawn_path(
+    env: "Mapping[str, str] | None", *, chdir_fd: int | None = None
+) -> "dict[str, str]":
+    """A copy of *env* whose ``PATH`` keeps only entries safe under a pinned cwd.
+
+    For resolving a command when the child's working directory is pinned by
+    descriptor. Two screens, cheapest first:
+
+    * **Lexical** -- only absolute entries survive. A relative entry (``''``,
+      ``.``, ``tools``) is resolved against the pinned directory, which is the
+      one place the pin says not to trust by name.
+    * **Identity** (when *chdir_fd* is given) -- an absolute entry that IS the
+      pinned directory, or lives anywhere beneath it, is dropped too.
+      ``PATH=/home/me/.kiro/crew/workspace/bin:/usr/bin`` passes the lexical
+      screen unchanged, yet a binary planted behind such an entry wins the
+      child's own later lookup the moment the shim has entered the pinned
+      directory. Entries are compared by ``(st_dev, st_ino)`` ancestry walked
+      over descriptors -- never by pathname -- so a symlink or other alias of
+      the pinned directory cannot dodge the screen. A kept entry is emitted as
+      the OPENED descriptor's own canonical path, never the caller's spelling:
+      the child re-resolves its ``PATH`` strings later, so a spelling that
+      traverses a retargetable symlink could be pointed somewhere else between
+      this screen and that lookup. An entry that cannot be opened, walked, or
+      re-spelled is dropped, fail-closed per entry: an unopenable entry cannot
+      contribute a resolvable binary today, and dropping is the direction that
+      cannot be gamed by making a directory un-``stat``-able.
+
+    When the BOUND descriptor's own identity cannot be read there is nothing to
+    compare entries against, so the lexical screen stands alone for that spawn.
+    That is a deliberate degrade, not a silent fallback: in production
+    ``chdir_fd`` always originates from a real opened directory descriptor, and
+    one that cannot be ``fstat``-ed is one the shim's own ``fchdir`` rejects
+    before any command runs.
+
+    Dropping entries can leave ``PATH`` empty, and that is the intended outcome
+    -- the resolve then raises ``FileNotFoundError`` exactly as an unresolvable
+    command already did, rather than silently searching somewhere else.
+    """
+    source = dict(env if env is not None else os.environ)
+    raw = source.get("PATH") or os.defpath
+    entries = [entry for entry in raw.split(os.pathsep) if entry and os.path.isabs(entry)]
+    bound_identity: "tuple[int, int] | None" = None
+    if chdir_fd is not None:
+        try:
+            bound_info = os.fstat(chdir_fd)
+        except OSError:
+            bound_identity = None
+        else:
+            bound_identity = (bound_info.st_dev, bound_info.st_ino)
+    if bound_identity is not None:
+        # Local import: hooks imports sandbox at call time, so a module-level
+        # dependency would be circular. `_fd_real_path` is private but already
+        # borrowed this way by `bound_agent_workspace_target` above; issue
+        # #6907 tracks promoting it to a shared home.
+        from kiro_crew.hooks import _fd_real_path
+
+        screened: list[str] = []
+        for entry in entries:
+            try:
+                entry_fd = _open_directory_descriptor(entry)
+            except OSError:
+                continue
+            try:
+                ancestors = _directory_ancestor_identities(entry_fd)
+                if bound_identity in ancestors:
+                    # The walk yields the entry's OWN identity first, so one
+                    # membership test covers both "the entry IS the pinned
+                    # directory" and "the entry lives beneath it".
+                    continue
+                # Keep the OPENED descriptor's own canonical path, never the
+                # caller's spelling. The child re-resolves whatever string ends
+                # up in its PATH, so a kept spelling that traverses a symlink
+                # could be retargeted between this screen and that lookup --
+                # the identity verified here must be the identity the child
+                # reaches. A canonical path has no symlink components, and one
+                # inside the pinned directory cannot exist here (its target
+                # would have failed the ancestry test above). Unresolvable ==
+                # dropped: falling back to the mutable spelling would reopen
+                # the window this screen exists to close.
+                resolved_entry = _fd_real_path(entry_fd)
+            except OSError:
+                continue
+            finally:
+                os.close(entry_fd)
+            if resolved_entry is None:
+                continue
+            screened.append(resolved_entry)
+        entries = screened
+    source["PATH"] = os.pathsep.join(entries)
+    return source
+
+
 def _needs_path_search(argv: "Sequence[str]") -> bool:
     """Whether ``argv[0]`` is a bare name, i.e. whether resolution touches disk."""
     name = argv[0]
@@ -4152,6 +7662,7 @@ def _needs_path_search(argv: "Sequence[str]") -> bool:
 async def create_subprocess_limited(
     *argv: str,
     profile: str = RLIMIT_PROFILE_TOOL,
+    chdir_fd: int | None = None,
     **kwargs: Any,
 ) -> asyncio.subprocess.Process:
     """``asyncio.create_subprocess_exec`` with resource limits applied post-exec.
@@ -4164,6 +7675,29 @@ async def create_subprocess_limited(
     The returned ``Process`` describes the command itself, not a wrapper -- the
     shim ``exec``s in place -- so ``pid``, ``returncode``, signal delivery, and
     ``platform_compat.kill_process_tree`` all behave as they did before.
+
+    ``chdir_fd`` pins the child's working directory to a directory IDENTITY
+    rather than to a name: the descriptor is inherited, the shim ``fchdir``s into
+    it and closes it, and only then is the command exec'd. Callers pass it when a
+    pathname re-resolved in the child could be retargeted between the check and
+    the chdir. It is deliberately not spelled ``cwd="/dev/fd/<n>"`` -- that is a
+    Linux-only trick, and macOS refuses ``chdir()`` on those entries (``EACCES`` or
+    ``ENOTDIR`` depending on the OS version). It needs the shim, and is refused rather than quietly downgraded
+    to ``cwd``'s pathname when the shim is missing: entering a name nobody
+    re-verified would reopen the window the descriptor exists to close.
+
+    Setting it also DROPS ``cwd`` from the spawn, since ``Popen`` would otherwise
+    chdir that pathname in the fork child before the shim ever runs, and screens
+    ``PATH`` by directory IDENTITY -- for the search that resolves a bare command
+    name here AND for the child's own environment. Relative entries are dropped
+    (``execvpe`` resolved them against the child's cwd, the directory this
+    descriptor exists to distrust), and so is any absolute entry that is the
+    pinned directory itself or lives beneath it, compared by ``(st_dev, st_ino)``
+    ancestry rather than by pathname. Resolving ``argv[0]`` is not the last
+    lookup that happens: the wrapper this spawns looks its own target up on
+    ``PATH`` after the shim has entered that directory. ``PATH=.:/usr/bin`` --
+    or the same directory spelled absolutely -- would otherwise exec a binary
+    out of the agent's own workspace, ahead of the sandbox meant to contain it.
     """
     if "preexec_fn" in kwargs:
         raise TypeError(
@@ -4174,13 +7708,75 @@ async def create_subprocess_limited(
         raise ValueError("create_subprocess_limited requires a command")
     prefix = spawn_shim_argv(profile)
     if not prefix:
+        if chdir_fd is not None:
+            raise RuntimeError(
+                "a descriptor-pinned working directory requires the post-exec "
+                "spawn shim; refusing to enter an unverified pathname instead"
+            )
         # No shim (Windows, a no-op profile, or a truncated install): keep
         # whatever policy the profile carries on the legacy fork path. Dropping
         # the caps silently would be worse than the fork hazard.
         return await asyncio.create_subprocess_exec(
             *argv, preexec_fn=_preexec_for_profile(profile), **kwargs
         )
-    if not _needs_path_search(argv):
+    search_cwd = kwargs.get("cwd")
+    search_env = kwargs.get("env")
+    if chdir_fd is not None:
+        prefix = _shim_prefix_entering_fd(prefix, chdir_fd)
+        kwargs["pass_fds"] = _pass_fds_including(kwargs.get("pass_fds"), chdir_fd)
+        # THE INVARIANT: while the cwd is pinned by descriptor, NO resolution of a
+        # program name -- not the one below, and not one the child performs later --
+        # may consult a relative PATH entry, the pinned directory, or anything
+        # inside it. Three things enforce it together, and each was a hole on its
+        # own:
+        #
+        # (a) `cwd` leaves the spawn. ``Popen`` chdirs it in the fork child BEFORE it
+        #     execs the shim, so leaving it in place would resolve the very pathname
+        #     the descriptor exists to bypass -- and fail the spawn outright
+        #     (EACCES/ENOENT/ENOTDIR) if that name was removed or retargeted since the
+        #     bind, with the pinned descriptor never reached.
+        # (b) The search below gets no cwd and a PATH screened by directory IDENTITY:
+        #     relative entries are dropped, and so is any absolute entry that IS the
+        #     pinned directory or lives beneath it -- compared by (st_dev, st_ino)
+        #     ancestry, so an alias cannot dodge it; kept entries are re-spelled from
+        #     the verified descriptor, so a retargetable symlink in the caller's
+        #     spelling cannot redirect the child's later lookup. A bare name IS the
+        #     normal shape here -- the macOS sandbox wrapper hands back "env" as
+        #     argv[0] and the Linux cgroup wrapper hands back "systemd-run" -- so the
+        #     search cannot simply be refused, and `execvpe` resolved a relative entry
+        #     against the child's cwd, i.e. the pinned workspace. An absolute entry
+        #     pointing INTO that workspace reaches the same binary by a different
+        #     spelling.
+        # (c) The CHILD gets that same screened PATH. Resolving argv[0] here is
+        #     not the last resolution that happens: `env` looks `sandbox-exec` up on
+        #     PATH itself, inside the child, after the shim has already entered the
+        #     workspace. Narrowing only (b) left `PATH=.:/usr/bin` exec'ing a
+        #     `sandbox-exec` the agent dropped in its own workspace -- ahead of the
+        #     sandbox that was supposed to contain it. One sanitized PATH, used for
+        #     both, is what makes the invariant hold rather than move down a level.
+        #
+        # Those two wrapper names are spelled in prose on purpose: test_spawn_audit
+        # matches its routed-through-the-sandbox tokens against this function's raw
+        # source, comments included, so writing either identifier here would make the
+        # spawn chokepoint read as if it routed on its own behalf.
+        kwargs.pop("cwd", None)
+        pinned_env = search_env
+
+        def _screened_spawn_plan() -> "tuple[dict[str, str], str]":
+            # One worker-thread hop covers the identity screen AND the resolve:
+            # the screen opens and walks PATH entries and the resolve stats
+            # them, so a stalled NFS/autofs entry would block either one, and
+            # neither may freeze the event loop. Returning the screened env
+            # alongside the resolved target keeps clauses (b) and (c) fed from
+            # the SAME value by construction.
+            screened = _pinned_spawn_path(pinned_env, chdir_fd=chdir_fd)
+            if _needs_path_search(argv):
+                return screened, _resolve_spawn_target(argv, screened, None)
+            return screened, argv[0]
+
+        search_env, resolved = await asyncio.to_thread(_screened_spawn_plan)
+        kwargs["env"] = search_env
+    elif not _needs_path_search(argv):
         # Explicit path: nothing to resolve, so no filesystem access and no
         # thread hop -- exec does the work.
         resolved = argv[0]
@@ -4188,9 +7784,118 @@ async def create_subprocess_limited(
         # A PATH search stats every entry, so it runs off the loop. One stalled
         # NFS/autofs entry would otherwise freeze the gateway -- and the search it
         # replaces used to happen in the child, never in this process.
-        resolved = await asyncio.to_thread(
-            _resolve_spawn_target, argv, kwargs.get("env"), kwargs.get("cwd")
-        )
+        resolved = await asyncio.to_thread(_resolve_spawn_target, argv, search_env, search_cwd)
     return await asyncio.create_subprocess_exec(
         *prefix, resolved, *argv[1:], preexec_fn=None, **kwargs
     )
+
+
+def _prepare_limited_spawn(
+    argv: "Sequence[str]", profile: str, kwargs: "dict[str, Any]", caller: str
+) -> "tuple[list[str], Callable[[], None] | None]":
+    """Resolve *argv* into the command to spawn plus the ``preexec_fn`` to pass.
+
+    Shared by :func:`run_limited` and :func:`popen_limited`, which differ only in
+    which ``subprocess`` entry point they hand the result to.
+
+    Two things make this the sync twin of :func:`create_subprocess_limited`
+    rather than a copy of it:
+
+    * The PATH search runs INLINE. The async wrapper hops to a worker thread
+      because ``shutil.which`` stats every ``PATH`` entry and one stalled
+      NFS/autofs mount would freeze the event loop. A synchronous caller is
+      already off the loop, so the hop would buy nothing and cost a thread.
+    * ``shell=True`` is refused. The shim ``exec``s an argv vector, so there is
+      no correct place to put a prefix in front of a shell command STRING;
+      wrapping it anyway would change what the shell parses.
+    """
+    if "preexec_fn" in kwargs:
+        raise TypeError(
+            f"{caller} owns preexec_fn: limits are applied post-exec by the "
+            "spawn shim, not post-fork"
+        )
+    if kwargs.get("shell"):
+        raise TypeError(
+            f"{caller} cannot wrap shell=True: the shim prefixes an argv "
+            "vector, and a shell command is a single string"
+        )
+    if not argv:
+        raise ValueError(f"{caller} requires a command")
+    prefix = spawn_shim_argv(profile)
+    if not prefix:
+        # No shim (Windows, a no-op profile, or a truncated install): keep
+        # whatever policy the profile carries on the legacy fork path. Dropping
+        # the caps silently would be worse than the fork hazard.
+        return list(argv), _preexec_for_profile(profile)
+    if not _needs_path_search(argv):
+        # Explicit path: exec resolves it, so stat-ing it here would only
+        # pre-empt a failure exec reports anyway.
+        resolved = argv[0]
+    else:
+        resolved = _resolve_spawn_target(argv, kwargs.get("env"), kwargs.get("cwd"))
+    return [*prefix, resolved, *argv[1:]], None
+
+
+def run_limited(
+    argv: "Sequence[str]",
+    *,
+    profile: str = RLIMIT_PROFILE_TOOL,
+    **kwargs: "Any",
+) -> "subprocess.CompletedProcess[Any]":
+    """``subprocess.run`` with resource limits applied AFTER ``exec``.
+
+    The synchronous counterpart of :func:`create_subprocess_limited`, and the
+    drop-in replacement for ``subprocess.run(..., preexec_fn=
+    resource_limit_preexec())``. Every keyword argument is forwarded untouched
+    except ``preexec_fn``, which this owns.
+
+    A synchronous spawn wedges the calling worker thread rather than the event
+    loop, so it does not take the whole gateway down the way the async hazard
+    did -- but it is the same ``fork()`` of the same multi-GB, ~118-thread
+    process, and the child still inherits a duplicate of every open fd until it
+    ``exec``s. Taking ``preexec_fn`` out of the picture removes both.
+
+    ``CompletedProcess.args`` and the ``cmd`` of a ``CalledProcessError`` /
+    ``TimeoutExpired`` are the command's own argv, not the shim's. That is
+    maintained here rather than free: the shim source rides in argv as a ~8 KB
+    ``-c`` string, and both exceptions render ``cmd`` into their message, so
+    reporting the spawned argv would put the whole shim in every failure log
+    line.
+    """
+    cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "run_limited")
+    reported = list(argv)
+    try:
+        result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        exc.cmd = reported
+        raise
+    result.args = reported
+    return result
+
+
+def popen_limited(
+    argv: "Sequence[str]",
+    *,
+    profile: str = RLIMIT_PROFILE_TOOL,
+    **kwargs: "Any",
+) -> "subprocess.Popen[Any]":
+    """``subprocess.Popen`` with resource limits applied AFTER ``exec``.
+
+    Same contract as :func:`run_limited`, for callers that need the handle
+    rather than the result -- a long-running child they will ``communicate()``
+    with, poll, or signal later.
+
+    The returned ``Popen`` is the command's own process, not a wrapper's, so
+    ``pid``, ``returncode``, signal delivery, and
+    ``platform_compat.kill_process_tree`` behave as they did before.
+
+    ``Popen.args`` is reset to the command's own argv for the same reason
+    :func:`run_limited` rewrites ``cmd``: ``communicate(timeout=...)`` builds its
+    ``TimeoutExpired`` from ``self.args``, so leaving the shim there would put
+    ~8 KB of shim source into the timeout message. Nothing in CPython reads
+    ``self.args`` functionally -- only ``__repr__`` and that exception.
+    """
+    cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "popen_limited")
+    proc = subprocess.Popen(cmd, preexec_fn=preexec, **kwargs)
+    proc.args = list(argv)
+    return proc

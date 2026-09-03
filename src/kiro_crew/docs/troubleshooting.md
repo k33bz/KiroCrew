@@ -17,7 +17,7 @@ check fails it prints a specific fix command.
 
 ## Common Issues
 
-### "kiro-cli not found in PATH"
+### kiro-cli is not on PATH
 
 `kiro-cli` is the agent backend and is required: `agent.provider` is fixed to
 `acp`, and the gateway spawns `kiro-cli acp --agent <name>` for every session.
@@ -35,6 +35,46 @@ kiro-cli login
 
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
+
+**macOS desktop app:** if a command resolves in Terminal but not inside the
+app, the cause is usually launchd's minimal `PATH`, which a shell rc file
+never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
+relaunch — see the
+[macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
+for the recipe and how to persist it across reboots.
+
+### Dashboard asks for sign-in but `kiro-cli` is already authenticated
+
+Typical on a headless host that authenticates `kiro-cli` with an API key rather
+than `kiro-cli login`. `kirocrew doctor` prints a signed-in state while the
+dashboard's setup gate still asks for a device login, and `/api/models` plus
+usage polling answer 503.
+
+The readiness probe forwards `KIRO_API_KEY` to `kiro-cli whoami`, but only from
+the **gateway's own** environment. Exporting it in a shell after the gateway is
+running does not reach it, and neither launchd nor systemd passes the installing
+shell's environment to the service. Put it where the gateway reads it at boot:
+
+```bash
+P=~/.kiro/crew/.env
+touch "$P" && chmod 600 "$P"
+printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
+kirocrew restart           # or restart however you run the gateway
+```
+
+The `chmod` comes first on purpose: under a standard `022` umask a file created
+by the append alone is `0644`, and the gateway only forces `0600` the next time
+it reads it — so the key would be readable by other local users until then. The
+quoting matters for the same reason if your crew home contains a space. Every
+key in `~/.kiro/crew/.env` is loaded into the gateway's environment at startup;
+a bare `KIRO_API_KEY=` with no value does not count, because falsy values are
+skipped. Do not put the key in the systemd unit or in
+`/etc/kirocrew/kirocrew.env` — both are readable by any local user.
+`kirocrew service install` warns when it sees a key in your shell that the
+service will not inherit.
+
+Releases before 0.3.0 filtered `KIRO_API_KEY` out of the probe entirely, so no
+placement works on those; use `kiro-cli login` or upgrade.
 
 ### Agent config missing or stale
 
@@ -61,6 +101,50 @@ The doctor also runs a live handshake probe against each managed server and
 prints the child's stderr tail on failure, which is usually where the real cause
 (an import error, a bad path) shows up.
 
+### MCP tools missing on an enterprise (work) account
+
+If the probe above reports every server healthy but the tools are still absent in
+sessions — no `spawn_run`, no `cron_add`, no `learn_add` — and your Kiro account
+is a work account signed in through IAM Identity Center, your administrator has
+almost certainly allow-listed MCP servers through an MCP registry. In that mode
+kiro-cli connects only to servers marked `"type": "registry"`, and it drops the
+rest without an error. The local probe cannot see this because it spawns the
+servers directly.
+
+```bash
+kirocrew config set agent.mcp_registry_mode true
+kirocrew restart
+```
+
+Your administrator also has to add `kirocrew-core`, `kirocrew-cron` and
+`kirocrew-computer` to the registry under those exact names. `kirocrew doctor`
+prints an `MCP Governance (enterprise)` section on Identity Center hosts with the
+current state. Full walkthrough, including the registry JSON your administrator
+needs: `docs/guides/enterprise-mcp-governance.md`.
+
+### A remote MCP server shows "Not verified"
+
+Remote MCP servers that authenticate with OAuth — Atlassian, for example — can
+show **Not verified** under Connections → MCP Servers while working perfectly in
+chat. Nothing is wrong with the server. The badge describes what the dashboard
+can see, not what the server can do.
+
+The Kiro CLI runs the OAuth flow and keeps the token in its own credential store;
+Kiro Crew never holds it. The dashboard's status probe therefore connects without a
+token, and the server answers `401`. That single answer covers two situations the
+dashboard cannot tell apart: a server nobody has authorized, and a server already
+authorized through the Kiro CLI. So it reports only what it knows.
+
+To find out which one you have:
+
+- If an agent can call that server's tools in chat, it is authorized and working.
+- If tool calls fail, use the server in chat once. The Kiro CLI starts the OAuth
+  flow on the `401` and Kiro Crew shows the consent link as a banner; approve it
+  there and the calls succeed.
+
+A server that is genuinely broken reads **Error** with the reason next to it, not
+**Not verified**.
+
 ### Dashboard not loading
 
 ```bash
@@ -83,8 +167,11 @@ on another port with `KIROCREW_PORT`.
 
 ### Context window filling up
 
-Kiro Crew auto-compacts at `session.autocompact_pct` context usage (90% by
-default). If compaction fires often:
+Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
+default for a new install — an existing `config.json` keeps whatever value it
+already stores, which for installs created before this default changed is
+`90.0`; check with `kirocrew config get session.autocompact_pct`). If
+compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
@@ -107,7 +194,7 @@ cd website && npm install && npm run build 2>&1 | tail -20
 ```
 
 Node must be `20` or `>= 22`; an older Node fails the Vite build. Python must be
-`>= 3.10`.
+`>= 3.12`.
 
 ### Embedding model download failed
 
@@ -184,10 +271,7 @@ Common problems:
   model: doing so would silently swap your vector space and re-embed your whole
   corpus because of a typo. Embeddings stay unavailable (keyword search still
   works) until the path is fixed.
-- **A log line says the model produces N-dim vectors but `embedding_dim` is M,
-  and refuses to load.** Set `memory.embedding_dim` to the number in the message.
-  The width is checked at load precisely so a mismatch is a loud refusal rather
-  than an unexplained loss of semantic search.
+- **Embedding-model dimension mismatch.** Set `memory.embedding_dim` to the output width named in the error. The width is checked at load so a mismatch is a loud refusal rather than an unexplained loss of semantic search.
 - **You swapped models but nothing re-embedded.** The default vector-space
   identity is derived from the file's name and size, so two different models of
   identical byte size look the same. Set `memory.embed_model_id` explicitly to

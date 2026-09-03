@@ -69,14 +69,14 @@ const ACTIVE_PR_URL = 'https://github.com/kirodotdev/KiroCrew/pull/12'
 const slots = [
   {
     key: 's1', title: 'Active', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
-    source_links: [{ provider: 'github', number: 12, url: ACTIVE_PR_URL, state: 'open', kind: 'change' }],
+    source_links: [{ provider: 'github', number: 12, label: '#12', url: ACTIVE_PR_URL, state: 'open', kind: 'change' }],
     source_links_total: 1,
   },
   {
     key: 's2', title: 'PR session', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
     source_links: [
-      { provider: 'github', number: 634, url: PR_URL, state: 'open', ci: 'passed' },
-      { provider: 'github', number: 701, url: ISSUE_URL, kind: 'issue' },
+      { provider: 'github', number: 634, label: '#634', url: PR_URL, state: 'open', ci: 'passed' },
+      { provider: 'github', number: 701, label: '#701', url: ISSUE_URL, kind: 'issue' },
     ],
     source_links_total: 2,
   },
@@ -143,7 +143,10 @@ const clickChip = (el: HTMLElement, init?: MouseEventInit): boolean => {
 const took = () => vi.fn(() => true)
 
 describe('ChatSidebar – PR chip', () => {
-  beforeEach(() => switchSlotMock.mockClear())
+  beforeEach(() => {
+    switchSlotMock.mockClear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
 
   it('is still an anchor carrying the provider url', () => {
     // Link semantics are load-bearing for the fall-through cases below, for
@@ -258,12 +261,12 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
         key: 's2', title: 'PR states', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
         source_links: [
           // Every chip carries ci: 'running' so the ONLY variable is `state`.
-          { provider: 'github', number: 993, url: url(993), state: 'closed', ci: 'running' },
-          { provider: 'github', number: 994, url: url(994), state: 'merged', ci: 'running' },
-          { provider: 'github', number: 995, url: url(995), state: 'open', ci: 'running' },
+          { provider: 'github', number: 993, label: '#993', url: url(993), state: 'closed', ci: 'running' },
+          { provider: 'github', number: 994, label: '#994', url: url(994), state: 'merged', ci: 'running' },
+          { provider: 'github', number: 995, label: '#995', url: url(995), state: 'open', ci: 'running' },
           // No `state` at all: the provider status has not been read yet, which
           // is NOT terminal — CI must still render.
-          { provider: 'github', number: 996, url: url(996), ci: 'running' },
+          { provider: 'github', number: 996, label: '#996', url: url(996), ci: 'running' },
         ],
         source_links_total: 4,
       },
@@ -301,7 +304,7 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
       { key: 's1', title: 'Other', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z' },
       {
         key: 's2', title: 'PR states', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
-        source_links: [{ provider: 'github', number: 993, url: url(993), state: 'closed', ci }],
+        source_links: [{ provider: 'github', number: 993, label: '#993', url: url(993), state: 'closed', ci }],
         source_links_total: 1,
       },
     ] as unknown as ChatSlot[]
@@ -323,5 +326,156 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
     expect(glyph).not.toBeNull()
     expect(glyph!.classList.contains('animate-spin')).toBe(false)
     expect(glyph!.className.baseVal ?? glyph!.className).not.toMatch(/animate/)
+  })
+})
+
+/**
+ * A chip whose branch cannot merge must not read as "ready".
+ *
+ * The green check answers "did the checks pass", which a conflicted pull request
+ * can satisfy while being unmergeable — so a chip gated on the rollup alone reads
+ * "ready" on work that needs a rebase. The merge pair the backend already ships
+ * (`mergeable` / `mergeStateStatus`, owner-gated like `ci`) is what settles it.
+ *
+ * These cases pin the PRECEDENCE, which is the whole design: exactly one glyph
+ * renders, and a failed rollup outranks a conflict — with both blockers live the
+ * worse outcome is the one worth showing.
+ */
+describe('ChatSidebar – conflicted PR chips', () => {
+  const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
+
+  /** One chip carrying exactly the merge/CI combination under test. */
+  function chipRows(link: Record<string, unknown>): ChatSlot[] {
+    return [
+      { key: 's1', title: 'Other', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z' },
+      {
+        key: 's2', title: 'PR', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+        source_links: [{ provider: 'github', number: 700, label: '#700', url: url(700), state: 'open', ...link }],
+        source_links_total: 1,
+      },
+    ] as unknown as ChatSlot[]
+  }
+
+  const glyph = (label: string) => chip(url(700)).querySelector(`[aria-label="${label}"]`)
+
+  it.each([
+    // GitHub settles the two fields independently, so either one alone is a real
+    // conflict answer: a poll can land `dirty` while `mergeable` is still unknown.
+    ['both merge fields', { mergeable: 'conflicting', mergeStateStatus: 'dirty' }],
+    ['mergeable alone', { mergeable: 'conflicting' }],
+    ['mergeStateStatus alone', { mergeable: 'unknown', mergeStateStatus: 'dirty' }],
+  ])('replaces the passing check with a conflict glyph — %s', (_case, merge) => {
+    renderSidebar({ rows: chipRows({ ci: 'passed', ...merge }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+    // The defect itself: a green check on a branch that cannot land.
+    expect(glyph('Checks passed')).toBeNull()
+  })
+
+  it('shows the failed rollup, not the conflict, when both are live', () => {
+    renderSidebar({ rows: chipRows({ ci: 'failed', mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Checks failed')).not.toBeNull()
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+
+  it('outranks a pending rollup', () => {
+    // Pending is not a verdict; a settled conflict is.
+    renderSidebar({ rows: chipRows({ ci: 'running', mergeable: 'conflicting' }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+    expect(glyph('Checks running')).toBeNull()
+  })
+
+  it('renders on a chip with no rollup at all', () => {
+    // The backend records the merge pair independently of `ci` (each field lands
+    // only once the provider settles it), so a conflict can arrive before any
+    // rollup does. That chip carried no status glyph, which is the same thing it
+    // showed while genuinely mergeable.
+    renderSidebar({ rows: chipRows({ mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+  })
+
+  it.each([
+    // Positive control: proves the fixture and selector work, so the negative
+    // cases below are not passing because nothing rendered.
+    ['a clean branch', { mergeable: 'mergeable', mergeStateStatus: 'clean' }],
+    // `blocked` is the normal state of every open PR on a repo with required
+    // reviews — flagging it would decorate the whole session list and mean nothing.
+    ['a branch blocked on required reviews', { mergeable: 'mergeable', mergeStateStatus: 'blocked' }],
+    // A branch merely behind base still merges; only conflicts are flagged here.
+    ['a behind-base branch', { mergeable: 'mergeable', mergeStateStatus: 'behind' }],
+    // Non-owner clients and payloads predating the merge pair send neither field.
+    ['a payload with no merge fields', {}],
+  ])('keeps the passing check on %s', (_case, merge) => {
+    renderSidebar({ rows: chipRows({ ci: 'passed', ...merge }) })
+    expect(glyph('Checks passed')).not.toBeNull()
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+
+  it.each(['merged', 'closed'])('suppresses the conflict glyph on a %s chip', (state) => {
+    // Terminal states share the CI gate: the providers stop answering the merge
+    // pair, so a carried-forward value must not outlive the lifecycle glyph.
+    renderSidebar({ rows: chipRows({ state, ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+})
+
+describe('ChatSidebar – chip label and provider mark', () => {
+  /** A payload naming a provider this build does not know.
+   *
+   *  Cast because `provider` is typed as the three the serializer produces
+   *  today — which is the point: the type is an assertion about the server, not
+   *  a guarantee about the bytes, and the chip has to stay honest when the two
+   *  disagree. */
+  const foreignRows = [
+    {
+      key: 's1', title: 'Foreign review', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+      source_links: [
+        { provider: 'acme-review', number: 4821, label: 'CR-4821', url: 'https://review.acme.internal/c/4821', state: 'open', kind: 'change' },
+      ],
+      source_links_total: 1,
+    },
+  ] as unknown as ChatSlot[]
+
+  it('renders an unknown provider with a neutral mark, never a vendor logo', () => {
+    // The regression this pins: both mark and label used GitLab as their
+    // implicit `else`, so a chip from any other review system wore GitLab's
+    // tanuki and GitLab's `!` numbering. Misattributing one vendor's work to
+    // another is the one thing a wayfinding chip must not do.
+    renderSidebar({ rows: foreignRows })
+    const el = chip('https://review.acme.internal/c/4821')
+    expect(el.querySelector('[data-provider-mark="gitlab"]')).toBeNull()
+    expect(el.querySelector('[data-provider-mark="github"]')).toBeNull()
+    expect(el.querySelector('[data-testid="jira-provider-mark"]')).toBeNull()
+    expect(el).toHaveTextContent('CR-4821')
+    expect(el).not.toHaveTextContent('!4821')
+  })
+
+  it('keeps each known provider on its own mark', () => {
+    renderSidebar()
+    expect(chip().querySelector('[data-provider-mark="github"]')).not.toBeNull()
+    expect(chip().querySelector('[data-provider-mark="gitlab"]')).toBeNull()
+  })
+
+  /** A payload with no `label` at all: this bundle talking to a gateway that
+   *  predates the field. The chip must still name the object rather than
+   *  printing `undefined`, which is the failure mode that made `kind` optional
+   *  on the wire in the first place. */
+  const unlabelledRows = [
+    {
+      key: 's1', title: 'Older gateway', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+      source_links: [
+        { provider: 'jira', number: 123, repo: 'PROJ', url: 'https://acme.atlassian.net/browse/PROJ-123', kind: 'issue' },
+      ],
+      source_links_total: 1,
+    },
+  ] as unknown as ChatSlot[]
+
+  it('falls back to #number when the payload carries no label', () => {
+    renderSidebar({ rows: unlabelledRows })
+    const el = screen.getByTestId('session-issue-chip-123')
+    expect(el).toHaveTextContent('#123')
+    expect(el.textContent).not.toContain('undefined')
+    // The fallback stays generic on purpose: reaching for `repo` here would be
+    // a second copy of the naming rule, which is what this change removes.
+    expect(el).not.toHaveTextContent('PROJ-123')
   })
 })

@@ -6,28 +6,41 @@
  * or replace one (its own approval UI, its own tool row) without forking the
  * transcript. A host passes extra entries; they win over the defaults.
  *
- * This module must stay free of any store, router, or `pages/`-level import: the
+ * This module must stay free of any store, router, or selector reach: the
  * consumers that most need a shared transcript run outside the dashboard's React
  * root and have no Redux store at all, so a renderer that reaches for a selector
- * is unusable to them. Anything that genuinely needs live app state is supplied
- * BY the host as a registry entry instead.
+ * is unusable to them. Presentational components from `pages/chat/` are fine
+ * (this module already imports several); anything that genuinely needs live app
+ * state is supplied BY the host as a registry entry instead.
  */
 import React, { memo } from 'react'
 import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { i18nT } from '../i18n/t'
+import { isNoteRow } from '../lib/noteContract'
+import { parseOptions } from './protocol'
 import { extractToolFilePath } from '../utils/toolFilePath'
 import { isSafePath } from '../utils/safePath'
+import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
+import { type FileChangeEntry } from '../components/FileChangeChips'
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import NudgeCard from '../pages/chat/NudgeCard'
+import NoticeCard from '../pages/chat/NoticeCard'
+import { ErrorCard } from '../pages/chat/ErrorCard'
+import StopEventCard from '../pages/chat/StopEventCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
+import { REASONING_ROLES } from '../pages/chat/groupDisplayItems'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import PastedChip from '../components/PastedChip'
 import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pasteTokens'
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
+import { turnHadPolicyBlock } from './turnPolicyBlock'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { isRejectedDecision } from '../utils/approvalDecision'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
 export interface MessageRenderContext {
@@ -113,9 +126,10 @@ function formatTs(ts?: string): string | undefined {
 
 /** Prop-driven tool row. The store-connected variant is a host entry. */
 export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = React.useState(false)
   const isDone = message.role === 'tool_result'
-  const isRejected = message.meta?.resolved === 'rejected'
+  const isRejected = isRejectedDecision(message.meta?.resolved)
   const hasPendingPerm = message.role === 'permission' && !message.meta?.resolved
 
   // Prefer the backend-stamped purpose ("Add teams_data dict guard…") over the
@@ -159,11 +173,11 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   }, [message.meta?.input_preview, rawLabel])
 
   return (
-    <div className="animate-scale-in flex items-center gap-1.5 flex-wrap">
+    <div className="animate-scale-in flex items-center gap-2 flex-wrap">
       <button
         onClick={() => setExpanded(e => !e)}
         aria-expanded={expanded}
-        className={`inline-flex items-center gap-1 text-[13px] font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
+        className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
       >
         <Icon size={12} className={iconClass} />
         <span className="truncate">{label}</span>
@@ -173,14 +187,14 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
           onClick={() => onFileOpen(filePath)}
           title={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
           aria-label={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
-          className="inline-flex items-center gap-1 text-[12px] font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
+          className="inline-flex items-center gap-1 text-[12px] leading-5 font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
         >
           {filePath.split('/').pop()}
           <PanelRight size={11} />
         </button>
       )}
       {expanded && message.content && (
-        <pre className="w-full text-[11px] font-mono text-muted bg-bg-elevated rounded-md p-2 mt-1 ml-4 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-border">
+        <pre className="w-full text-[11px] leading-4 font-mono text-muted bg-bg-elevated rounded-md p-2 mt-1 ml-4 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-border">
           {purpose && rawLabel && purpose !== rawLabel ? rawLabel + '\n\n' + message.content : message.content}
         </pre>
       )}
@@ -207,23 +221,28 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'stop_event',
     roles: ['*'],
     match: m => m.kind === 'stop_event' || m.meta?.kind === 'stop_event',
-    render: (m, ctx) => ctx.row(
-      <div className="text-danger text-[13px] font-mono px-3 py-2 rounded-md bg-danger-subtle inline-flex items-center gap-1.5">
-        {m.content}
-      </div>,
-    ),
+    // The shared StopEventCard, which reads `meta.state` and draws the stop's
+    // actual outcome. It deliberately ignores `content`: a stop row's content is
+    // the card's own JSON envelope, mirrored there by the gateway for consumers
+    // that read only `content`
+    // (`{"kind":"stop_event","id":…,"state":"stopping","outcome":null,…}`), so
+    // the hand-rolled row this replaced printed that envelope into the
+    // transcript verbatim. The label is the only human-readable rendering there
+    // has ever been.
+    render: (m, ctx) => ctx.row(<StopEventCard message={m} />),
   },
   {
     id: 'subagent_completion',
     roles: ['*'],
     match: isSubagentCompletionMessage,
-    render: (m, ctx) => (
+    render: (m, ctx) => ctx.row(
       <SubagentCompletionCard
         key={ctx.key}
         message={m}
         onFileOpen={ctx.onFileOpen}
         disclosureKey={ctx.key}
-      />
+      />,
+      true,
     ),
   },
   {
@@ -244,6 +263,10 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'assistant',
     roles: ['assistant', 'streaming'],
     render: (m, ctx) => {
+      // A quiet monitor-loop cycle replies with a bare zero-width space
+      // (U+200B): invisible-only content would draw as an empty bubble.
+      // Same skip as ChatPage's inline chain — see utils/invisibleText.
+      if (isHiddenInvisibleAssistantRow(m)) return null
       const isStreaming = m.role === 'streaming'
       // The footer belongs to a FINISHED reply. It shows once the turn is over,
       // which is either because another user or assistant row follows, or
@@ -253,6 +276,9 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
         let nextRelevant = false
         for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
           if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
+          // A hidden invisible-only row draws nothing, so it cannot host the
+          // footer; pass over it to the row that renders.
+          if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
           if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
         }
         if (!nextRelevant) showFooter = !ctx.running
@@ -270,6 +296,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
             variants={m.variants}
             variantIdx={m.variant_idx}
             turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+            fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+            suppressSteerAck={turnHadPolicyBlock(ctx.messages, ctx.index)}
           />
         </div>,
       )
@@ -296,13 +324,16 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['inject'],
     render: (m, ctx) => {
       const cronLabel = (m.meta?.cronLabel as string) || ''
-      const cleanContent = cronLabel
+      const stripped = cronLabel
         ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
         : m.content
+      // A note's marker is consumed into the pill row, so rendering it too would show the
+      // same choices twice. Non-note inject rows keep it: there it is prose, not syntax.
+      const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
       return ctx.wrapper(
         <>
-          {cronLabel && <span className="text-muted text-[11px] font-medium px-1 mb-0.5"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg border border-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
+          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
           </div>
         </>,
@@ -312,27 +343,25 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
   {
     id: 'error',
     roles: ['error'],
-    render: (m, ctx) => ctx.row(
-      <div className="bg-danger-subtle text-danger text-[13px] px-3 py-2 rounded-md border border-danger/15 self-center animate-scale-in">
-        {m.content}
-      </div>,
-    ),
+    // The shared ErrorCard, deliberately without `onContinue`: omitting the
+    // handler selects its settled (non-continuable) shape, and the app-sdk
+    // surface has no turn to resume, so it must never grow the affordance.
+    render: (m, ctx) => ctx.row(<ErrorCard content={m.content} />),
   },
   {
     id: 'notice',
     roles: ['notice'],
-    render: (m, ctx) => ctx.row(
-      <div className="bg-card text-muted text-[13px] px-3 py-2 rounded-md border border-border self-center animate-scale-in">
-        {m.content}
-      </div>,
-    ),
+    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
   },
   {
     // Grouped and lifecycle-only roles have no row of their own: a thinking or
     // permission message is displayed by the group's own summary UI, and
     // system/done/queued carry state rather than something to read here.
     id: 'undrawn',
-    roles: ['thinking', 'system', 'done', 'queued'],
+    // Reasoning roles derive from the shared classification (see
+    // pages/chat/groupDisplayItems.ts) so this default cannot drift from the
+    // surfaces that DO draw them; the lifecycle roles are local to this entry.
+    roles: [...REASONING_ROLES, 'system', 'done', 'queued'],
     render: () => null,
   },
   {
@@ -349,6 +378,14 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       if (!banner) return null
       return ctx.row(banner)
     },
+  },
+  {
+    // Auto-nudge cycle marker. `onOpenLoop` (jump to the loop popover) is
+    // ChatPage chrome and is deliberately absent here: the card renders its
+    // full content without it, only the affordance is page-specific.
+    id: 'nudge',
+    roles: ['nudge'],
+    render: (m, ctx) => ctx.row(<NudgeCard message={m} disclosureKey={ctx.key} />),
   },
 ]
 
@@ -382,7 +419,7 @@ export function resolveRenderer(
  * is not an extension point today — see the limitation note in
  * docs/app-kit/api-reference.md.
  */
-export const GROUPED_ROLES: readonly string[] = Object.freeze(['thinking', 'permission'])
+export const GROUPED_ROLES: readonly string[] = Object.freeze([...REASONING_ROLES, 'permission'])
 
 /**
  * Host entries sit between the SHAPE-matched defaults and the role-keyed ones.

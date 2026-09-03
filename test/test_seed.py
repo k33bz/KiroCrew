@@ -7,6 +7,7 @@ regression guard for unknown fixture names. Non-empty target, main-home guardrai
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import seed as seed_mod
 
 # A test here spawns a real `python -m kiro_crew gateway --help` child interpreter;
@@ -32,8 +34,40 @@ def test_seed_empty_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     out_file = target / "fixture.yaml"
     assert out_file.is_file(), f"expected {out_file} to exist after seed"
-    # Exact match guards against accidental fixture tampering.
-    assert out_file.read_text(encoding="utf-8").strip() == "schema-version: 2026-04-28"
+    src_file = Path(str(seed_mod._fixtures_root())) / "empty" / "fixture.yaml"
+    assert out_file.read_bytes() == src_file.read_bytes()
+    assert "schema-version:" in out_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    not seed_mod.pinned_fs.supports_pinned_tree_walk(),
+    reason="descriptor-relative fixture copy is POSIX-only",
+)
+def test_pinned_fixture_copy_publishes_completion_manifest_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "home"
+    destination.mkdir()
+    copied: list[str] = []
+    real_copy = seed_mod.pinned_fs.copy_file_pinned
+
+    def _record(*args, **kwargs):
+        copied.append(str(kwargs.get("dst_name")))
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(seed_mod.pinned_fs, "copy_file_pinned", _record)
+    dst_fd = os.open(destination, seed_mod.pinned_fs.dir_flags())
+    try:
+        seed_mod.copy_fixture_into_dir_fd("minimal", dst_fd)
+        assert seed_mod.FIXTURE_MANIFEST not in copied
+        assert not (destination / seed_mod.FIXTURE_MANIFEST).exists()
+        copied.append("<setup>")
+        seed_mod.publish_fixture_manifest("minimal", dst_fd)
+    finally:
+        os.close(dst_fd)
+
+    assert copied[-2:] == ["<setup>", seed_mod.FIXTURE_MANIFEST]
+    assert (destination / seed_mod.FIXTURE_MANIFEST).is_file()
 
 
 def test_seed_unset_home_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -561,11 +595,11 @@ def test_seed_non_empty_rail_succeeds_with_replace(
     assert not (target / "subdir").exists()
     # Fixture content present.
     assert (target / "fixture.yaml").is_file()
-    assert (target / "fixture.yaml").read_text(encoding="utf-8").strip() == (
-        "schema-version: 2026-04-28"
-    )
+    src_file = Path(str(seed_mod._fixtures_root())) / "empty" / "fixture.yaml"
+    assert (target / "fixture.yaml").read_bytes() == src_file.read_bytes()
 
 
+@requires_symlinks
 def test_seed_replace_refuses_symlinked_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -591,6 +625,7 @@ def test_seed_replace_refuses_symlinked_target(
     assert (real_dir / "precious.txt").read_text(encoding="utf-8") == "must survive"
 
 
+@requires_symlinks
 def test_seed_refuses_symlinked_nonempty_target_without_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -880,6 +915,7 @@ def test_seed_regular_file_target_rejected(
     assert target_file.read_text(encoding="utf-8") == "some stale log the user left behind"
 
 
+@requires_symlinks
 def test_seed_empty_symlink_target_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -935,6 +971,7 @@ def test_seed_double_resolve_target_called_once_per_role(
     assert (target / "fixture.yaml").is_file()
 
 
+@requires_symlinks
 def test_seed_symlink_to_file_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -971,6 +1008,7 @@ def test_seed_symlink_to_file_rejected(
     assert link.is_symlink()
 
 
+@requires_symlinks
 def test_seed_dangling_symlink_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

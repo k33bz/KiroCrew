@@ -24,6 +24,7 @@
 test_harness.py                    # spawns real gateways; PGID + socketpair plumbing
 test_sandbox_argv.py               # OS sandbox is POSIX-only
 test_sandbox_cc_mode.py            # OS sandbox is POSIX-only
+test_sandbox_hardlink_scan.py      # OS sandbox is POSIX-only (launcher uses getuid)
 test_sandbox_nested_tier.py        # OS sandbox is POSIX-only (launcher uses getuid; env at /usr/bin)
 test_pid_lifecycle.py              # process-group semantics
 test_pid_sweep_helpers.py          # process-group semantics
@@ -47,3 +48,4 @@ test_file_raw.py                   # 0o600/0o644 mode-bit assertions
 test_file_download.py              # 0o600/0o644 mode-bit assertions
 test_dashboard_file_io.py          # 0o600/0o644 mode-bit assertions
 test_dev_fleet_app.py              # POSIX app-runner assumptions
+test_file_office_preview.py        # FILE_READ_SCHEMA rejects C:\ paths (POSIX-only pattern)

@@ -37,6 +37,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
+import { ApiError } from '../api/client'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
@@ -52,8 +53,11 @@ interface QueueStackProps {
 }
 let queueProps: QueueStackProps | null = null
 
+/** The pins contract ChatPage hands the side panel, which routes it to the
+ *  Pins tab body. Captured at the SidePanel boundary because that is the seam
+ *  ChatPage owns — the tab body itself is ActivityViewer's to render. */
 interface PinsPanelProps {
-  onJumpToMessage: (messageTs: string, mid?: string) => void
+  onJumpToPin: (messageTs: string, mid?: string) => void
   onUnpin: (id: string) => void
 }
 let pinsProps: PinsPanelProps | null = null
@@ -65,6 +69,22 @@ interface UserMessageProps {
 }
 let userMsgProps: UserMessageProps | null = null
 
+interface ChatInputProps {
+  onAgentClick?: (rect: DOMRect) => void
+}
+let chatInputProps: ChatInputProps | null = null
+
+interface AgentDropdownListProps {
+  onSelect: (name: string) => void
+}
+interface DefaultAgentRowProps {
+  agentName: string
+  isDefault: boolean
+  onSetDefault: () => void
+}
+let agentDropdownProps: AgentDropdownListProps | null = null
+let defaultAgentRowProps: DefaultAgentRowProps | null = null
+
 vi.mock('../components/QueueStack', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/QueueStack')>()
   return {
@@ -72,9 +92,6 @@ vi.mock('../components/QueueStack', async (importOriginal) => {
     default: (props: QueueStackProps) => { queueProps = props; return null },
   }
 })
-vi.mock('../pages/chat/PinnedMessagesPanel', () => ({
-  PinnedMessagesPanel: (props: PinsPanelProps) => { pinsProps = props; return null },
-}))
 
 // --- Child components stubbed to keep the render tree small ------------------
 // (Same set the other ChatPage suites stub; the transcript CARDS are left real
@@ -89,8 +106,14 @@ vi.mock('../pages/chat', async () => {
       userMsgProps = props
       return React.createElement('div', { 'data-testid': 'user-msg' }, props.content)
     },
-    AssistantMessage: ({ content }: { content: string }) =>
-      React.createElement('div', { 'data-testid': 'assistant-msg' }, content),
+    // The two props the memoized renderMessage derives from the paging cursor, so a
+    // test can see a STALE closure: both go quiet when the flag is read from one.
+    AssistantMessage: ({ content, forkIndex, onLoadEarlier }: { content: string; forkIndex?: number; onLoadEarlier?: () => void }) =>
+      React.createElement('div', {
+        'data-testid': 'assistant-msg',
+        'data-fork-index': forkIndex === undefined ? 'none' : String(forkIndex),
+        'data-can-page': onLoadEarlier ? 'yes' : 'no',
+      }, content),
   }
 })
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -101,14 +124,30 @@ vi.mock('../components/MarkdownRenderer', () => ({
 }))
 vi.mock('../components/TypewriterText', () => ({ default: () => null }))
 vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
-vi.mock('../components/AgentDropdownList', () => ({ default: () => null }))
+vi.mock('../components/AgentDropdownList', () => ({
+  default: (props: AgentDropdownListProps) => {
+    agentDropdownProps = props
+    return <div data-testid="agent-dropdown" />
+  },
+  ManageAgentsFooter: () => null,
+  DefaultAgentRow: (props: DefaultAgentRowProps) => { defaultAgentRowProps = props; return null },
+}))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-vi.mock('../components/ChatInput', () => ({ default: () => null }))
+vi.mock('../components/ChatInput', () => ({
+  default: (props: ChatInputProps) => {
+    chatInputProps = props
+    return null
+  },
+}))
 vi.mock('../components/WelcomeView', () => ({ default: () => null }))
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
+vi.mock('../pages/chat/SidePanel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../pages/chat/SidePanel')>()
+  return { ...actual, default: (props: PinsPanelProps) => { pinsProps = props; return null } }
+})
 vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => ({ contentWidth: 'compact' }),
@@ -119,12 +158,8 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   },
 }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
-vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
-vi.mock('../hooks/useFilteredDropdown', () => ({
-  useFilteredDropdown: () => ({
-    filtered: [], query: '', setQuery: vi.fn(),
-    selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn(),
-  }),
+vi.mock('../hooks/useAgents', () => ({
+  useAgents: () => ({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }], defaultAgent: 'kirocrew' }),
 }))
 vi.mock('../hooks/useVoiceInput', () => ({
   useVoiceInput: () => ({ recording: false, transcribing: false, toggle: vi.fn() }),
@@ -144,8 +179,8 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: false,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -188,6 +223,18 @@ vi.mock('../api/client', () => ({
     },
   }),
   fileReadUrl: (p: string) => `/api/file?path=${encodeURIComponent(p)}`,
+  // Mirrors the real class shape so a rejection carries the same fields the
+  // production error does, rather than a hand-rolled object.
+  ApiError: class ApiError extends Error {
+    status: number
+    body: string
+    constructor(status: number, message: string, body = '') {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.body = body
+    }
+  },
 }))
 
 Object.defineProperty(window, 'matchMedia', {
@@ -298,6 +345,9 @@ beforeEach(() => {
   queueProps = null
   pinsProps = null
   userMsgProps = null
+  chatInputProps = null
+  agentDropdownProps = null
+  defaultAgentRowProps = null
   sessionStorage.clear()
   setItemSpy.mockClear()
   window.history.replaceState({}, '', '/chat')
@@ -315,6 +365,71 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+describe('ChatPage agent-switch failure feedback', () => {
+  it('stores the failure message; the picker still closes as it always has', async () => {
+    const switchRequest = apiSpy('chatSlotAgent')
+    // A failure the endpoint really produces, carried in the production error
+    // type, so this pins the actual plumbing rather than a shape we invented.
+    switchRequest.mockRejectedValueOnce(
+      new ApiError(400, 'invalid agent name', JSON.stringify({ error: 'invalid agent name' })),
+    )
+    const { store } = renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.onAgentClick).toBeTypeOf('function'))
+    act(() => {
+      chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect)
+    })
+    await waitFor(() => expect(screen.getByTestId('agent-dropdown')).toBeInTheDocument())
+
+    act(() => { agentDropdownProps!.onSelect('reviewer') })
+
+    await waitFor(() => {
+      expect(switchRequest).toHaveBeenCalledWith('chat-1', 'reviewer')
+      expect(store.getState().chat.agentSwitchNotice?.message).toBe('invalid agent name')
+    })
+    // Unchanged from before this fix: the `onSelect` call site closes the
+    // dropdown synchronously without awaiting the switch, so it has always
+    // closed on failure too. Pinned so that stays a deliberate choice — the
+    // notice is what tells the user the switch did not take.
+    expect(screen.queryByTestId('agent-dropdown')).not.toBeInTheDocument()
+  })
+
+  it('closes the picker when the switch succeeds', async () => {
+    const switchRequest = apiSpy('chatSlotAgent')
+    switchRequest.mockResolvedValueOnce(undefined)
+    const { store } = renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.onAgentClick).toBeTypeOf('function'))
+    act(() => {
+      chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect)
+    })
+    await waitFor(() => expect(screen.getByTestId('agent-dropdown')).toBeInTheDocument())
+
+    act(() => { agentDropdownProps!.onSelect('reviewer') })
+
+    await waitFor(() => expect(screen.queryByTestId('agent-dropdown')).not.toBeInTheDocument())
+    expect(store.getState().chat.agentSwitchNotice).toBeNull()
+  })
+})
+describe('ChatPage default-agent footer row', () => {
+  it('points the row at the session\'s own agent and writes that one', async () => {
+    const setDefault = apiSpy('setDefaultAgent')
+    setDefault.mockResolvedValue(undefined)
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.onAgentClick).toBeTypeOf('function'))
+    act(() => { chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect) })
+    await waitFor(() => expect(defaultAgentRowProps).not.toBeNull())
+
+    // An agent-less slot resolves to the configured default agent (the
+    // useAgents mock above returns defaultAgent: 'kirocrew'), not the
+    // literal 'default' placeholder the pre-fix fallback rendered.
+    expect(defaultAgentRowProps!.agentName).toBe('kirocrew')
+    act(() => { defaultAgentRowProps!.onSetDefault() })
+    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew'))
+  })
+})
+
 describe('ChatPage renderMessage — role dispatch', () => {
   it('renders a thinking row as a reasoning block and drops an empty one', async () => {
     renderChatPage([
@@ -323,8 +438,9 @@ describe('ChatPage renderMessage — role dispatch', () => {
     ])
     // The trace is folded behind its own disclosure, so the label is what
     // reaches the transcript — the point being that it is NOT an ordinary
-    // assistant bubble.
-    await waitFor(() => expect(shown()).toContain('Thinking'))
+    // assistant bubble. A block that merely mounts is settled, so it carries
+    // the finished-form label, not the in-progress one.
+    await waitFor(() => expect(shown()).toContain('Thought process'))
     expect(screen.queryByTestId('assistant-msg')).not.toBeInTheDocument()
     // The empty thinking row still occupies a display slot but renders nothing.
     expect(rows()).toHaveLength(2)
@@ -612,11 +728,11 @@ describe('ChatPage queued-message controls', () => {
 })
 
 describe('ChatPage pinned-messages panel', () => {
-  /** Opens the pins panel and returns once its props have been recorded. */
+  /** Opens the side panel (which hosts the Pins tab) and returns once the pins
+   *  contract ChatPage passes it has been recorded. */
   async function openPins(messages: ChatMessage[], opts: RenderOpts = {}) {
     renderChatPage(messages, opts)
-    const toggle = await screen.findByLabelText('Open pinned messages')
-    fireEvent.click(toggle)
+    fireEvent.click(await screen.findByLabelText('Open activity panel'))
     await waitFor(() => expect(pinsProps).not.toBeNull())
   }
 
@@ -630,7 +746,7 @@ describe('ChatPage pinned-messages panel', () => {
       msg('assistant', 'reply', { ts: 'a1' }),
     ])
 
-    act(() => pinsProps!.onJumpToMessage('u1', 'm-1'))
+    act(() => pinsProps!.onJumpToPin('u1', 'm-1'))
     await waitFor(() => expect(highlighted()).not.toBeNull())
 
     // The highlight is time-boxed, not sticky.
@@ -641,14 +757,14 @@ describe('ChatPage pinned-messages panel', () => {
   it('falls back to timestamp matching when the pin carries no message id', async () => {
     await openPins([msg('user', 'legacy pin target', { ts: 'u1' })])
 
-    act(() => pinsProps!.onJumpToMessage('u1'))
+    act(() => pinsProps!.onJumpToPin('u1'))
     await waitFor(() => expect(highlighted()).not.toBeNull())
   })
 
   it('reports an unavailable pin when the message is absent and no history remains', async () => {
     await openPins([msg('user', 'something else', { ts: 'u1' })])
 
-    act(() => pinsProps!.onJumpToMessage('missing-ts', 'm-gone'))
+    act(() => pinsProps!.onJumpToPin('missing-ts', 'm-gone'))
     expect(await screen.findByText(UNAVAILABLE)).toBeInTheDocument()
   })
 
@@ -710,6 +826,48 @@ describe('ChatPage per-message pin toggle', () => {
     await act(async () => { userMsgProps!.onTogglePin!() })
     expect(await screen.findByText('Could not pin the message. Try again.')).toBeInTheDocument()
   })
+  it("a session's FIRST pin opens the panel, so the pin has a visible destination", async () => {
+    // Tab CREATION is no longer asserted here: Pins is a content-managed pinned
+    // view, so SidePanel's reconcile adds it from pin content (SidePanel is
+    // mocked to null in this file, so it cannot run). What ChatPage still owns is
+    // opening the panel once, on the first pin.
+    const { store } = renderChatPage([msg('user', 'pin me', { ts: 'u1', meta: { mid: 'm-1' } })])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+    expect(store.getState().chat.activityOpen).toBe(false)
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(store.getState().chat.activityOpen).toBe(true))
+  })
+
+  it('a LATER pin does not re-open the panel', async () => {
+    // Only the first pin is a reveal; re-opening a panel the user closed on every
+    // subsequent pin would fight them.
+    pinsListMock.mockResolvedValue({ pins: [PIN] })
+    const { store } = renderChatPage([
+      msg('user', 'already pinned', { ts: 'u1', meta: { mid: 'm-1' } }),
+      msg('user', 'pin me too', { ts: 'u2', meta: { mid: 'm-2' } }),
+    ])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(pinsCreateMock).toHaveBeenCalled())
+    expect(store.getState().chat.activityOpen).toBe(false)
+  })
+
+  it('a first pin made from an open search does not open the panel over it', async () => {
+    // Pinning is not a navigation request. Someone who searched the transcript to
+    // FIND the message they are pinning would otherwise lose the find pane and
+    // its results on the very click that acts on a result.
+    const { store } = renderChatPage([msg('user', 'pin me', { ts: 'u1', meta: { mid: 'm-1' } })])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+    // Cmd+F is the real entry point (document-level handler in useMessageSearch).
+    act(() => { fireEvent.keyDown(document, { key: 'f', metaKey: true }) })
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(pinsCreateMock).toHaveBeenCalled())
+    expect(store.getState().chat.activityOpen).toBe(false)
+  })
+
 })
 
 describe('ChatPage URL prompt hand-off', () => {
@@ -750,5 +908,106 @@ describe('ChatPage URL prompt hand-off', () => {
     await waitFor(() => expect(window.location.search).toBe(''))
     expect(prefillWrites()).toHaveLength(0)
     expect(createSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('ChatPage search scope disclosure', () => {
+  /** Open the find pane the real way -- the Cmd+F handler in useMessageSearch --
+   *  and type a term, so the count span renders. */
+  const openSearchAndType = (term: string) => {
+    act(() => { fireEvent.keyDown(document, { key: 'f', metaKey: true }) })
+    fireEvent.change(screen.getByPlaceholderText('Find in chat…'), { target: { value: term } })
+  }
+
+  it('qualifies the scope while the paging cursor does not describe the active slot', async () => {
+    // switchSlot.pending nulls the cursor key while leaving slotHasMore describing
+    // the outgoing slot, so false here is not this slot's answer (chatSlice:3575).
+    const { store } = renderChatPage([msg('assistant', 'hello there', { ts: 'a1' })], {
+      chat: { slotMessages: {} },
+    })
+    await waitFor(() => expect(shown()).toContain('hello there'))
+    expect(store.getState().chat.slotHasMore).toBe(false)
+    act(() => { store.dispatch({ type: 'chat/switchSlot/pending', meta: { arg: 'chat-1', requestId: 'r-scope' } }) })
+    expect(store.getState().chat.slotCursorKey).toBeNull()
+
+    openSearchAndType('zzz-no-match')
+    await waitFor(() => expect(shown()).toMatch(/in loaded history/i))
+  })
+
+  it('reads as complete once the cursor DOES describe the active slot', async () => {
+    // Opposite direction: the qualifier must not become unconditional, or every
+    // fully-loaded chat claims its search was partial.
+    const { store } = renderChatPage([msg('assistant', 'hello there', { ts: 'a1' })])
+    await waitFor(() => expect(shown()).toContain('hello there'))
+    expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+
+    openSearchAndType('zzz-no-match')
+    await waitFor(() => expect(shown()).toContain('No results'))
+    expect(shown()).not.toMatch(/in loaded history/i)
+  })
+})
+
+/** `renderMessage` is memoized, and a switch BACK to an already-loaded chat is the
+ *  one path that restores the paging cursor while leaving every one of its deps
+ *  untouched. Activating another slot leaves the URL slug behind, so ChatPage's own
+ *  slug effect switches straight back: `switchSlot.pending` installs the target's
+ *  CACHED array — a new reference, so the renderer is rebuilt while the cursor is
+ *  still null — and `fulfilled` then restores the cursor while `sameTranscript`
+ *  skips the `messages` write. With the cursor flag missing from the dep list the
+ *  rebuilt renderer keeps `cursorIsForActiveSlot === false`, so Fork/Plan stay shut
+ *  on a chat that is fully loaded and holds a valid cursor. */
+describe('ChatPage fork affordance — cursor recovery on a switch back', () => {
+  const A = () => msg('assistant', 'alpha transcript', { ts: 'a1' })
+  const B = () => msg('assistant', 'bravo transcript', { ts: 'b1' })
+  /** What the memoized renderer currently believes, read off the row it produced. */
+  const row = () => screen.getAllByTestId('assistant-msg').slice(-1)[0]
+
+  /** Activate another slot through the real reducers. ChatPage's slug effect then
+   *  drives the switch back on its own, which is the sequence under test. */
+  const activateOtherSlot = (store: { dispatch: (a: unknown) => void }) => {
+    act(() => { store.dispatch({ type: 'chat/switchSlot/pending', meta: { arg: 'chat-2', requestId: 'r-to-b' } }) })
+    act(() => {
+      store.dispatch({
+        type: 'chat/switchSlot/fulfilled',
+        meta: { arg: 'chat-2', requestId: 'r-to-b' },
+        payload: { key: 'chat-2', messages: [B()], running: false, hasMore: false, queue: [], nextBefore: 0, total: 1 },
+      })
+    })
+  }
+
+  it('re-opens Fork once the cursor lands on a switch back to an identical transcript', async () => {
+    const { store } = renderChatPage([A()], { chat: { slotMessages: {} } })
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+    expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+    expect(row().getAttribute('data-fork-index')).not.toBe('none')
+
+    activateOtherSlot(store)
+
+    // The slug effect's switch back has landed: cursor valid, nothing left to page.
+    await waitFor(() => {
+      expect(store.getState().chat.activeSlot).toBe('chat-1')
+      expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+    })
+    expect(store.getState().chat.slotHasMore).toBe(false)
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+
+    // Fork is operable again, and the cursor-gated paging handler came back with it.
+    expect(row().getAttribute('data-fork-index')).not.toBe('none')
+    expect(row().getAttribute('data-can-page')).toBe('yes')
+  })
+
+  it('keeps Fork shut while the cursor genuinely still names the chat we left', async () => {
+    // Opposite direction, so the fix cannot buy an operable Fork by making the trust
+    // predicate unconditional: a frozen fetch holds the switch back genuinely in flight.
+    const { store } = renderChatPage([A()], { chat: { slotMessages: {} } })
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+
+    apiMocks.chatSlotDetail = vi.fn(() => new Promise(() => {}))
+    activateOtherSlot(store)
+
+    await waitFor(() => expect(store.getState().chat.slotCursorKey).toBeNull())
+
+    expect(row().getAttribute('data-fork-index')).toBe('none')
+    expect(row().getAttribute('data-can-page')).toBe('no')
   })
 })

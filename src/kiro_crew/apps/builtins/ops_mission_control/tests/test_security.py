@@ -11,11 +11,13 @@ than a mock. A rename of ``SECRETS_FILENAME`` that forgot to update
 so this is the test that catches it.
 """
 
+import contextlib
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from kiro_crew import security
 from kiro_crew.apps.builtins.ops_mission_control.backend import secrets
@@ -299,6 +301,197 @@ class TestSecretBackend(unittest.TestCase):
         self.assertEqual(self.backend.get("pagerduty", "api_token"), "")
 
 
+class TestSecretStoreLockdownOrdering(unittest.TestCase):
+    """The store's write must never publish a token file it has not protected.
+
+    Ports the previous-store-survival recipe from
+    ``test/test_aws_consent.py::TestGrantIsOnTheKeystoneFloor``: every failure
+    inside ``atomic_write`` happens BEFORE the rename, so a transient lockdown
+    or write failure can no longer reach — let alone delete — the previous,
+    healthy store (the old post-publish ``restrict_to_owner`` + unlink-on-
+    OSError shape destroyed every stored provider token on one lockdown failure).
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.backend = secrets.KeystoneFileBackend(self.tmp / "secrets.json")
+
+    def test_write_lockdown_precedes_content(self):
+        """Measured by the file's SIZE at lockdown time — zero means no token
+        byte existed yet. A post-write stat passes on the buggy ordering too,
+        so it would not be a regression test."""
+        from unittest import mock
+
+        from kiro_crew import platform_compat
+
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring(target):
+            sizes.append(os.stat(target).st_size)
+            return real_restrict(target)
+
+        with mock.patch("kiro_crew.platform_compat.restrict_to_owner", _measuring):
+            self.backend.put("pagerduty", "api_token", "u+secretvalue")
+
+        self.assertTrue(sizes, "premise: the lockdown ran at all")
+        self.assertEqual(
+            sizes[0], 0,
+            f"the file already held payload bytes when it was locked down: {sizes[0]} bytes",
+        )
+
+    def test_a_failed_lockdown_preserves_the_previous_store(self):
+        """One transient lockdown failure must not delete every stored token."""
+        from unittest import mock
+
+        self.backend.put("pagerduty", "api_token", "u+secretvalue")
+        before = (self.tmp / "secrets.json").read_bytes()
+
+        def _refuse(_target):
+            raise OSError("cannot resolve the invoking user's SID")
+
+        with mock.patch("kiro_crew.platform_compat.restrict_to_owner", _refuse):
+            with self.assertRaises(OSError):
+                self.backend.put("datadog", "api_key", "x" * 32)
+
+        self.assertEqual(
+            (self.tmp / "secrets.json").read_bytes(), before,
+            "the previous store was altered",
+        )
+        self.assertEqual(
+            self.backend.get("pagerduty", "api_token"), "u+secretvalue",
+            "a failed new write destroyed the previously stored token",
+        )
+
+    def test_a_failed_payload_write_preserves_the_previous_store(self):
+        """Same property for an ordinary write failure (disk full creating the
+        temp file), which never even reaches the lockdown."""
+        import types
+        from unittest import mock
+
+        self.backend.put("pagerduty", "api_token", "u+secretvalue")
+        before = (self.tmp / "secrets.json").read_bytes()
+
+        def _no_space(*_a, **_kw):
+            raise OSError("no space left on device")
+
+        # Scope the failure to atomic_write's own tempfile binding — patching
+        # the shared stdlib module attribute would hand a spurious ENOSPC to
+        # every other mkstemp caller alive in this worker.
+        with mock.patch(
+            "kiro_crew.atomic_write.tempfile", types.SimpleNamespace(mkstemp=_no_space)
+        ):
+            with self.assertRaises(OSError):
+                self.backend.put("datadog", "api_key", "x" * 32)
+
+        self.assertEqual(
+            (self.tmp / "secrets.json").read_bytes(), before,
+            "the previous store was altered",
+        )
+        self.assertEqual(
+            self.backend.get("pagerduty", "api_token"), "u+secretvalue",
+            "a transient write failure destroyed the previously stored token",
+        )
+
+
+class TestSecretStoreNeverPublishesOverAFailedRead(unittest.TestCase):
+    """The BASE read of a read-modify-write may not fail open.
+
+    ``_read`` collapses every failure to ``{}``, which is right for ``get`` and
+    ``configured_fields`` — a lookup that cannot load answers "not configured",
+    the Settings page still renders, and the fail-closed ``has_secrets`` check
+    refuses the provider. It is wrong as the base of ``put``/``delete``, which
+    rewrite the WHOLE file: there ``{}`` means "delete every provider token
+    already stored", and one transient EACCES/EIO published it.
+
+    This is the store's LAST unguarded loss path. The class above proved a failed
+    WRITE cannot reach the previous store; a failed READ went around it, because
+    the write that followed was perfectly successful — it just wrote nothing.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.store = self.tmp / "secrets.json"
+        self.backend = secrets.KeystoneFileBackend(self.store)
+
+    def _unreadable_store(self):
+        """Fail ONLY the secret file's read, as a transient EACCES would.
+
+        Scoped by path: a blanket ``read_text`` failure would also break the home
+        resolution and lock paths, and the test would pass for the wrong reason.
+        """
+        real_read_text = Path.read_text
+
+        def _guarded(path_self, *args, **kwargs):
+            if Path(path_self) == self.store:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", _guarded)
+
+    def test_a_read_that_failed_never_truncates_the_store(self):
+        """The durable harm, asserted directly: the stored token must survive.
+
+        A provider token is not derivable from anything else on the box, so this
+        file is the only copy — truncating it means the operator has to mint new
+        credentials at PagerDuty and Datadog, and every poll fails closed until
+        they do.
+        """
+        self.backend.put("pagerduty", "api_token", "u+thisisthestoredtoken")
+        before = self.store.read_bytes()
+
+        with self._unreadable_store():
+            with contextlib.suppress(OSError):
+                self.backend.put("datadog", "api_key", "a" * 32)
+            with contextlib.suppress(OSError):
+                self.backend.delete("pagerduty")
+
+        self.assertEqual(
+            self.store.read_bytes(), before,
+            "a failed read was published back over the store",
+        )
+        self.assertEqual(
+            self.backend.get("pagerduty", "api_token"), "u+thisisthestoredtoken",
+            "a failed read destroyed a token that was still on disk",
+        )
+
+    def test_an_unreadable_store_refuses_the_save(self):
+        """A save that was not recorded must not answer as though it were."""
+        with self._unreadable_store():
+            with self.assertRaises(OSError):
+                self.backend.put("datadog", "api_key", "a" * 32)
+
+    def test_an_unreadable_store_refuses_the_revocation(self):
+        """The revocation half, which loses no data and still lies.
+
+        On an unreadable store the lenient read reported the provider absent, so
+        ``delete`` returned False and ``delete_secret`` audited ``not_found`` —
+        telling the operator there was nothing to revoke while the live token was
+        still on disk and still working.
+        """
+        self.backend.put("pagerduty", "api_token", "u+thisisthestoredtoken")
+        with self._unreadable_store():
+            with self.assertRaises(OSError):
+                self.backend.delete("pagerduty")
+
+    def test_a_missing_store_is_still_a_first_write(self):
+        """Absent is the one failure where ``{}`` is the truth. The guard must
+        not turn the very first credential save into an error."""
+        self.assertFalse(self.store.exists())
+        self.backend.put("pagerduty", "api_token", "u+thefirsttoken")
+        self.assertEqual(self.backend.get("pagerduty", "api_token"), "u+thefirsttoken")
+
+    def test_a_corrupt_store_still_repairs_on_write(self):
+        """Existing tolerance, pinned so the unreadable-file guard is not
+        mistaken for a licence to start failing on corruption too. A document
+        that parsed to nothing usable has no stored token left to lose."""
+        self.store.write_text("{ not json", encoding="utf-8")
+        self.backend.put("pagerduty", "api_token", "u+afterthecorruption")
+        self.assertEqual(self.backend.get("pagerduty", "api_token"), "u+afterthecorruption")
+
+
 class TestDescribeSecrets(unittest.TestCase):
     def test_never_returns_a_value(self):
         import tempfile
@@ -339,15 +532,23 @@ class TestCrossPlatform(unittest.TestCase):
     def test_preexec_fn_comes_from_the_shim_not_a_raw_callable(self):
         """``preexec_fn`` is unsupported on Windows — passing ANY callable raises.
 
-        ``resource_limit_preexec()`` returns ``None`` off POSIX, so routing through it is
-        what makes these spawns portable. A hand-rolled ``preexec_fn=lambda: ...`` would
-        work locally and raise ValueError on every Windows spawn.
+        Both spawns route through the shim wrappers (``create_subprocess_limited``
+        for the async git spawn, ``run_limited`` for the sync gh spawn), which
+        deliver the resource caps after ``exec`` and pass no ``preexec_fn`` at all
+        off POSIX — that routing is what makes these spawns portable. Matched as a
+        CALL (trailing paren), not a bare name, so a docstring or comment that
+        merely mentions a wrapper cannot satisfy the pin. Any ``preexec_fn=`` that
+        does appear must come from the shim accessor: a hand-rolled
+        ``preexec_fn=lambda: ...`` would work locally and raise ValueError on
+        every Windows spawn.
         """
+        wrapper_calls = ("create_subprocess_limited(", "run_limited(", "popen_limited(")
         for name, src in self._sources().items():
-            if "preexec_fn" not in src:
-                continue
             with self.subTest(file=name):
-                self.assertIn("resource_limit_preexec", src)
+                self.assertTrue(
+                    any(w in src for w in wrapper_calls),
+                    f"{name}: spawns must route resource limits through a shim wrapper",
+                )
                 for line in src.splitlines():
                     if "preexec_fn=" in line:
                         self.assertIn(
@@ -474,25 +675,41 @@ class TestTheScheduleIsWriteProtectedButReadable(unittest.TestCase):
         verb-independent, because a narrow allowlist is bypassable by a quoted redirect, `cp`,
         or any novel write verb.
 
-        Spelled with POSIX separators (`as_posix`), which is what the gate matches and what a
-        bash command carries. A native `WindowsPath` renders all-backslash and matches nothing —
-        a whole-gate limitation on `security`'s home-anchored patterns, not specific to this
+        Spelled with POSIX separators, which is what the gate matches and what a bash command
+        carries. A native `WindowsPath` renders all-backslash and matches nothing — a
+        whole-gate limitation on `security`'s home-anchored patterns, not specific to this
         leaf, so pinning it here would assert a fix this file does not own.
+
+        Iterates the HOME FORMS rather than `self._path()`, the same way the incidents-index
+        equivalent below does, and the difference is load-bearing rather than stylistic. The
+        bash gate is a STRING matcher over `_CREW_HOME_PREFIXES` (`.kiro/crew`, `.kirocrew`),
+        so it recognises a command only by the home spelling the command carries. The tool
+        gate on the two tests above is not: `is_sensitive_write_path` resolves through
+        `config_dir()`, so it DOES follow a non-default `KIROCREW_HOME`.
+
+        That asymmetry means a custom-`KIROCREW_HOME` install (a pod, `dev-backend.sh`) has
+        this file protected against the agent's file tools but not against a bash redirect
+        naming the resolved path. It is a `security` gate limitation, not this app's, so it is
+        recorded here rather than half-fixed at this leaf. Handing `self._path()` to the bash
+        gate does not test it either way: under test isolation that path is a tmp dir, so the
+        assertion passed only while the suite was reading the operator's REAL home, and it
+        reported a guarantee it had not checked.
         """
-        path = Path(self._path()).as_posix()
-        for cmd in (
-            f"echo 'who: attacker' > {path}",
-            f"cp /tmp/evil.yaml {path}",
-            f"tee {path}",
-            f"""python -c "open('{path}','w').write('x')" """,
-            f"sed -i s/alice/attacker/ {path}",
-            f"mv /tmp/evil.yaml {path}",
-        ):
-            with self.subTest(cmd=cmd[:40]):
-                self.assertTrue(
-                    security.is_sensitive_bash_command(cmd),
-                    f"shell write not blocked: {cmd!r}",
-                )
+        for home in ("~", "$HOME", "/home/alice", "/Users/alice"):
+            path = f"{home}/.kiro/crew/apps/ops-mission-control/data/rotation.yaml"
+            for cmd in (
+                f"echo 'who: attacker' > {path}",
+                f"cp /tmp/evil.yaml {path}",
+                f"tee {path}",
+                f"""python -c "open('{path}','w').write('x')" """,
+                f"sed -i s/alice/attacker/ {path}",
+                f"mv /tmp/evil.yaml {path}",
+            ):
+                with self.subTest(cmd=cmd[:40]):
+                    self.assertTrue(
+                        security.is_sensitive_bash_command(cmd),
+                        f"shell write not blocked: {cmd!r}",
+                    )
 
     def test_the_registered_path_is_not_a_bare_filename(self):
         """A bare `rotation.yaml` entry matches NOTHING, which is the trap here.

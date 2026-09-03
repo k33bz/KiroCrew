@@ -9,7 +9,7 @@
  * being called (or starts being called with the wrong shape) fails here.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
 import DevFleetPage from '../pages/DevFleetPage'
@@ -85,6 +85,19 @@ async function openRowMenu() {
 
 describe('DevFleetPage row rendering helpers', () => {
   beforeEach(() => { vi.restoreAllMocks() })
+
+  it('surfaces the inferred main checkout once above the fleet', async () => {
+    installFetch({
+      ...fleetOf(MAIN_ROW),
+      main_repo: '/Users/dev/work/KiroCrew',
+      main_repo_inferred: true,
+    })
+    renderPage()
+    const note = await screen.findByTestId('inferred-main-checkout')
+    expect(note).toHaveTextContent('The primary checkout this fleet is discovered from')
+    expect(note).toHaveTextContent('/Users/dev/work/KiroCrew')
+    expect(screen.getAllByTestId('inferred-main-checkout')).toHaveLength(1)
+  })
 
   it('renders each relative-time bucket for the UPDATED column', async () => {
     // relTime() has four buckets past "just now"; the row strips the " ago"
@@ -290,6 +303,100 @@ describe('DevFleetPage remove worktree', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete anyway' }))
     await waitFor(() => expect(screen.getByText('worktree is locked')).toBeInTheDocument())
     expect(removeBodies[0]).toContain('"force":true')
+  })
+
+  it('discards untracked scratch when the only dirt is untracked files', async () => {
+    // dirty_tracked === false && dirty_untracked > 0 -> the row is removable by
+    // discarding those files, so the remove POST must authorize it.
+    const removeBodies: string[] = []
+    installFetch(fleetOf(MAIN_ROW, readyRow()), (u, opts) => {
+      if (u.includes('/worktree/remove')) { removeBodies.push(String(opts?.body)); return res({ ok: true }) }
+      if (u.includes('/worktree?name=')) return res({
+        branch: 'feat/a', own_commits: 1, real_dirty: true,
+        dirty_tracked: false, dirty_untracked: 3, dirty_untracked_paths: ['a.py', 'b.md', 'c.mjs'],
+      })
+      return null
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    fireEvent.click(screen.getByLabelText('Expand'))
+    await waitFor(() => expect(screen.getByText('Remove')).toBeInTheDocument(), { timeout: 4000 })
+    fireEvent.click(screen.getByText('Remove'))
+
+    const dialog = await screen.findByRole('dialog')
+    // COMPOSITION GUARD (UX blocker): this tree carries unmerged commits AND
+    // untracked scratch, and the request still sends force -- so the confirm
+    // must state BOTH stakes. If the discard sentence ever replaces the
+    // unmerged-work warning again, a permanent branch deletion reads as
+    // harmless cleanup and this assertion fails.
+    expect(within(dialog).getByText(/removing DELETES permanently/i)).toBeInTheDocument()
+    expect(within(dialog).getByText(/also discards untracked files/i)).toBeInTheDocument()
+    // and it names the files it would destroy
+    expect(within(dialog).getByText(/a\.py, b\.md, c\.mjs/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete anyway' }))
+    await waitFor(() => expect(screen.getByText('Removed wt-a')).toBeInTheDocument())
+    const body = JSON.parse(removeBodies[0])
+    // The exact displayed list travels with the request -- consent covers those
+    // specific files, and the server refuses unless the set still matches.
+    expect(body.discard_untracked_paths).toEqual(['a.py', 'b.md', 'c.mjs'])
+  })
+
+  it('does NOT discard when a tracked file is modified (guard must not regress)', async () => {
+    // dirty_tracked === true is unfinished work — no discard is offered, so the
+    // remove POST omits discard_untracked_paths and the backend keeps protecting it.
+    const removeBodies: string[] = []
+    installFetch(fleetOf(MAIN_ROW, readyRow()), (u, opts) => {
+      if (u.includes('/worktree/remove')) { removeBodies.push(String(opts?.body)); return res({ ok: true }) }
+      if (u.includes('/worktree?name=')) return res({
+        branch: 'feat/a', own_commits: 1, real_dirty: true,
+        dirty_tracked: true, dirty_untracked: 0, dirty_untracked_paths: [],
+      })
+      return null
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    fireEvent.click(screen.getByLabelText('Expand'))
+    await waitFor(() => expect(screen.getByText('Remove')).toBeInTheDocument(), { timeout: 4000 })
+    fireEvent.click(screen.getByText('Remove'))
+
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete anyway' }))
+    await waitFor(() => expect(screen.getByText('Removed wt-a')).toBeInTheDocument())
+    const body = JSON.parse(removeBodies[0])
+    // No discard is offered for tracked dirt, so the field must be ABSENT
+    // entirely (undefined serializes away) -- not sent as false.
+    expect('discard_untracked_paths' in body).toBe(false)
+  })
+
+  it('does NOT offer a discard when the untracked list is truncated', async () => {
+    // The server caps the path list at 20 and refuses a partial consent, so a
+    // count (35) that exceeds the returned paths (20) is an INCOMPLETE list: the
+    // UI must not offer the affordance at all. Sending it would promise a
+    // destruction the backend rejects, and the confirm must not claim discard.
+    const removeBodies: string[] = []
+    const paths20 = Array.from({ length: 20 }, (_, i) => `scratch${i}.tmp`)
+    installFetch(fleetOf(MAIN_ROW, readyRow()), (u, opts) => {
+      if (u.includes('/worktree/remove')) { removeBodies.push(String(opts?.body)); return res({ ok: true }) }
+      if (u.includes('/worktree?name=')) return res({
+        branch: 'feat/a', own_commits: 1, real_dirty: true,
+        dirty_tracked: false, dirty_untracked: 35, dirty_untracked_paths: paths20,
+      })
+      return null
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    fireEvent.click(screen.getByLabelText('Expand'))
+    await waitFor(() => expect(screen.getByText('Remove')).toBeInTheDocument(), { timeout: 4000 })
+    fireEvent.click(screen.getByText('Remove'))
+
+    const dialog = await screen.findByRole('dialog')
+    // Unmerged work is still disclosed; the discard sentence must be absent.
+    expect(within(dialog).getByText(/removing DELETES permanently/i)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/also discards untracked files/i)).toBeNull()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete anyway' }))
+    await waitFor(() => expect(screen.getByText('Removed wt-a')).toBeInTheDocument())
+    const body = JSON.parse(removeBodies[0])
+    expect('discard_untracked_paths' in body).toBe(false)
   })
 
   it('reports a transport failure on the removal', async () => {
@@ -738,7 +845,17 @@ describe('DevFleetPage prune failures', () => {
     await waitForRow('wt-a')
     fireEvent.click(screen.getByText('Prune merged'))
     await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument())
-    fireEvent.click(screen.getByLabelText('Select wt-a'))
+    // The dialog is opened by an async handler (pruneShipped awaits the
+    // candidates fetch before committing setPruneSelected + setPruneDialog).
+    // A click dispatched while that commit's work is still pending is lost:
+    // the controlled checkbox's change never reaches React, its DOM state is
+    // reverted on the next commit, and the run fires with the row still
+    // selected. Drain the pending work first, then assert the deselect
+    // actually landed before acting on it.
+    await act(async () => {})
+    const checkbox = screen.getByLabelText('Select wt-a') as HTMLInputElement
+    fireEvent.click(checkbox)
+    await waitFor(() => expect(checkbox).not.toBeChecked())
     fireEvent.click(screen.getByText('Remove selected'))
     await waitFor(() => expect(screen.getByText('Nothing selected')).toBeInTheDocument())
     expect(runCalls).toBe(0)
@@ -832,6 +949,184 @@ describe('DevFleetPage make live', () => {
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: /Make live/i }))
   }
+
+  it('offers Cancel cutover on the live main row while a cutover is staged, and cancels without a restart handshake', async () => {
+    // A staged cutover is cancelled by re-confirming the LIVE checkout as the
+    // live target — the backend re-pins the pointer and nothing restarts, so
+    // the flow must not enter the restart overlay or the identity handshake.
+    const bodies: string[] = []
+    let healthPolled = false
+    installFetch(
+      {
+        ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+        gateway_service_active: false,
+        staged_target: '/w/wt-staged',
+        staged_cancel_available: true,
+        manual_restart: 'kirocrew restart',
+      },
+      (u, opts) => {
+        if (u.includes('/make-live') && isPost(opts)) {
+          bodies.push(String(opts?.body))
+          return res({ ok: true, cancelled: true, target: '/w/main', notice: 'Staged cutover cancelled. main stays the live target and no restart is needed.' })
+        }
+        if (u.includes('/health')) { healthPolled = true; return res({}) }
+        return null
+      },
+    )
+    renderPage()
+    await waitForRow('wt-staged')
+    fireEvent.click(screen.getByText('Cancel staged cutover').closest('button') as HTMLButtonElement)
+    const dialog = await screen.findByRole('dialog')
+    // The dialog names the staged worktree the operator is backing out of
+    // (in the title and the body, so either match satisfies the check).
+    expect(within(dialog).getAllByText(/wt-staged/).length).toBeGreaterThan(0)
+    fireEvent.click(within(dialog).getByRole('button', { name: /Cancel staged cutover/i }))
+    // The backend-authored notice surfaces, the POST carried the LIVE row's
+    // path, and no restart overlay or health handshake ever started.
+    await waitFor(() => expect(screen.getByText(/no restart is needed/i)).toBeInTheDocument())
+    expect(bodies).toHaveLength(1)
+    expect(JSON.parse(bodies[0]).path).toBe('/w/main')
+    // The cancel is bound to the confirmed stage so a concurrent re-stage is
+    // refused server-side instead of silently discarded.
+    expect(JSON.parse(bodies[0]).expected_staged).toBe('/w/wt-staged')
+    expect(screen.queryByText('Restarting — reconnecting…')).toBeNull()
+    expect(healthPolled).toBe(false)
+  }, 15000)
+
+  it('hides the cancel control when no cutover is staged', async () => {
+    installFetch(fleetOf(MAIN_ROW, readyRow()))
+    renderPage()
+    await waitForRow('wt-a')
+    expect(screen.queryByText('Cancel staged cutover')).toBeNull()
+    const menu = await openRowMenu()
+    expect(menu.queryByText('Cancel staged cutover')).toBeNull()
+  })
+
+  it('offers Cancel staged cutover in a live feature row\u2019s menu', async () => {
+    // The live checkout is not always main: after a cutover to a feature
+    // worktree, a NEW stage (e.g. back onto main) must be cancellable from the
+    // feature row that is currently live.
+    installFetch({
+      ...fleetOf(
+        { ...MAIN_ROW, is_live: false, is_staged: true, path: '/w/main' },
+        readyRow({ is_live: true }),
+      ),
+      gateway_service_active: false,
+      staged_target: '/w/main',
+      staged_cancel_available: true,
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    const menu = await openRowMenu()
+    expect(menu.getByText('Cancel staged cutover')).toBeInTheDocument()
+  })
+
+  it('hides the cancel control when the backend would refuse the pointer-only cancel', async () => {
+    // A stage can outlive the host state it was created in: if the service
+    // manager becomes drivable after staging, /make-live refuses the
+    // pointer-only cancel (staged_cutover_pending) because the stage also
+    // carries a service definition. The backend reports that predicate as
+    // staged_cancel_available; when it is false (or absent — older backend),
+    // the control must not render a promise the POST cannot keep.
+    installFetch({
+      ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+      gateway_service_active: true,
+      staged_target: '/w/wt-staged',
+      staged_cancel_available: false,
+    })
+    renderPage()
+    await waitForRow('wt-staged')
+    expect(screen.queryByText('Cancel staged cutover')).toBeNull()
+  })
+
+  it('restart confirm names the staged worktree it will boot while a stage is pending', async () => {
+    // A restart with a stage pending COMPLETES the cutover — the opposite of
+    // the cancel beside it. The confirm must say which checkout comes up.
+    installFetch({
+      ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+      gateway_service_active: true,
+      staged_target: '/w/wt-staged',
+      staged_cancel_available: false,
+    })
+    renderPage()
+    await waitForRow('wt-staged')
+    fireEvent.click(screen.getByLabelText('Restart gateway'))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/comes back up on .wt-staged./)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/Applies the last Pull\+Build/)).toBeNull()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  })
+
+  it('hides Make live on the already-staged row', async () => {
+    // On a staged row "Make live" only re-stages, and beside the cancel it
+    // misreads as "complete the cutover now".
+    installFetch({
+      ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+      gateway_service_active: false,
+      staged_target: '/w/wt-staged',
+      staged_cancel_available: true,
+    })
+    renderPage()
+    await waitForRow('wt-staged')
+    const menu = await openRowMenu()
+    expect(menu.queryByText('Make live')).toBeNull()
+    expect(menu.getByText('Cancel staged cutover')).toBeInTheDocument()
+  })
+
+  it('offers the cancel on the STAGED row itself and still posts the live path', async () => {    // The staged row wears the "Restart pending" badge, so it is where an
+    // operator who staged the wrong worktree looks first. Its menu offers the
+    // same cancel; the POST still names the LIVE checkout (re-confirming it
+    // is the cancel) bound to the confirmed stage.
+    const bodies: string[] = []
+    installFetch(
+      {
+        ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+        gateway_service_active: false,
+        staged_target: '/w/wt-staged',
+        staged_cancel_available: true,
+      },
+      (u, opts) => {
+        if (u.includes('/make-live') && isPost(opts)) {
+          bodies.push(String(opts?.body))
+          return res({ ok: true, cancelled: true, target: '/w/main', notice: 'Staged cutover cancelled.' })
+        }
+        return null
+      },
+    )
+    renderPage()
+    await waitForRow('wt-staged')
+    const menu = await openRowMenu()
+    fireEvent.click(menu.getByText('Cancel staged cutover'))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: /Cancel staged cutover/i }))
+    await waitFor(() => expect(bodies).toHaveLength(1))
+    expect(JSON.parse(bodies[0]).path).toBe('/w/main')
+    expect(JSON.parse(bodies[0]).expected_staged).toBe('/w/wt-staged')
+  }, 15000)
+
+  it('collapses Restart and Cancel staged cutover into one overflow menu when both apply', async () => {    // Reachable on a foreground-eligible host: Restart is offered via the
+    // foreground last resort (gateway_service_active true) while the staged
+    // cancel is also accepted (staged_cancel_available true). Rendering both
+    // as siblings would put a third button beside Pull+Build, breaking the
+    // two-button row cap — they collapse into a single overflow trigger.
+    installFetch({
+      ...fleetOf({ ...MAIN_ROW, path: '/w/main' }, readyRow({ name: 'wt-staged', path: '/w/wt-staged', is_staged: true })),
+      gateway_service_active: true,
+      staged_target: '/w/wt-staged',
+      staged_cancel_available: true,
+    })
+    renderPage()
+    await waitForRow('wt-staged')
+    // Neither gateway action renders as an inline button…
+    expect(screen.queryByText('Cancel staged cutover')).toBeNull()
+    expect(screen.queryByLabelText('Restart gateway')).toBeNull()
+    // …both live in the main row's overflow menu (first More-actions trigger:
+    // rows render main first).
+    fireEvent.click(screen.getAllByLabelText('More actions')[0])
+    const menu = within(await screen.findByRole('menu'))
+    expect(menu.getByText('Restart')).toBeInTheDocument()
+    expect(menu.getByText('Cancel staged cutover')).toBeInTheDocument()
+  })
 
   it('refuses a cutover to a worktree whose path the backend did not report', async () => {
     let posts = 0
@@ -1006,4 +1301,148 @@ describe('DevFleetPage post-action refresh', () => {
     await waitFor(() => expect(urls.length).toBeGreaterThan(before + 1))
     expect(screen.getByText('wt-a')).toBeInTheDocument()
   })
+})
+
+describe('DevFleetPage prune discard-untracked', () => {
+  beforeEach(() => { vi.restoreAllMocks() })
+
+  /** Open the prune dialog against a candidates/kept payload and wait for it. */
+  async function openPrune(payload: Record<string, unknown>, extra?: RouteHandler) {
+    installFetch(fleetOf(MAIN_ROW, readyRow()), (u, opts) => {
+      const e = extra?.(u, opts)
+      if (e) return e
+      if (u.includes('/prune-candidates')) return res(payload)
+      return null
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    fireEvent.click(screen.getByText('Prune merged'))
+    await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument())
+  }
+
+  const scratchOnlyKept = { name: 'wt-scratch', code: 'merged_dirty', dirty: true, dirty_tracked: false, dirty_untracked: 2, dirty_untracked_paths: ['probe.py', 'note.md'] }
+  const trackedKept = { name: 'wt-tracked', code: 'merged_dirty', dirty: true, dirty_tracked: true, dirty_untracked: 0, dirty_untracked_paths: [] }
+  const unverifiableKept = { name: 'wt-unver', code: 'dirty_check_failed', dirty: true }
+  // Untracked-only, but the server capped the returned paths (20) below the true
+  // count (35): an INCOMPLETE list the backend refuses to accept as consent.
+  const truncatedScratchKept = { name: 'wt-trunc', code: 'merged_dirty', dirty: true, dirty_tracked: false, dirty_untracked: 35, dirty_untracked_paths: Array.from({ length: 20 }, (_, i) => `s${i}.tmp`) }
+  // A clean kept row (no dirt) is force-checkable but is NOT scratch-only, so
+  // ticking it must add to force_names without a discard_untracked_paths entry.
+  const cleanKept = { name: 'wt-clean', code: 'merged', dirty: false, dirty_tracked: false, dirty_untracked: 0, dirty_untracked_paths: [] }
+
+  it('enables the override for a scratch-only kept row but not for tracked-dirty or unverifiable rows', async () => {
+    await openPrune({ ok: true, candidates: [], kept: [scratchOnlyKept, trackedKept, unverifiableKept], scanned: 3 })
+    // Scratch-only: checkable, because ticking it discards exactly those files.
+    expect(screen.getByLabelText('Force remove wt-scratch')).not.toBeDisabled()
+    // Modified tracked file: unfinished work the override must not destroy.
+    expect(screen.getByLabelText('Force remove wt-tracked')).toBeDisabled()
+    // git status failed: dirt is unverifiable, so the override is refused.
+    expect(screen.getByLabelText('Force remove wt-unver')).toBeDisabled()
+  })
+
+  it('sends a scratch-only kept row in force_names and a discard_untracked_paths map entry', async () => {
+    const runBodies: string[] = []
+    await openPrune(
+      { ok: true, candidates: [], kept: [scratchOnlyKept], scanned: 1 },
+      (u, opts) => {
+        if (u.includes('/prune-run')) { runBodies.push(String(opts?.body)); return res({ ok: true, total: 1 }) }
+        if (u.includes('/prune-status')) return res({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-scratch', ok: true }],
+          items: { 'wt-scratch': { status: 'done', error: null } },
+        })
+        return null
+      },
+    )
+    // Tick the scratch-only override, then Remove + confirm the force dialog.
+    // The dialog is opened by an async handler; drain that commit before
+    // toggling the controlled checkbox, then observe it before submitting.
+    await act(async () => {})
+    const box = screen.getByLabelText('Force remove wt-scratch') as HTMLInputElement
+    fireEvent.click(box)
+    await waitFor(() => expect(box).toBeChecked())
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    await waitFor(() => expect(runBodies.length).toBe(1))
+    const body = JSON.parse(runBodies[0])
+    expect(body.force_names).toEqual(['wt-scratch'])
+    // The map keys the row name to the EXACT displayed path list, so the server
+    // can re-check the set is unchanged before discarding.
+    expect(body.discard_untracked_paths).toEqual({ 'wt-scratch': ['probe.py', 'note.md'] })
+  }, 15000)
+
+  it('renders the discard-untracked hint when a scratch-only kept row is present', async () => {
+    await openPrune({ ok: true, candidates: [], kept: [scratchOnlyKept], scanned: 1 })
+    expect(screen.getByText(/held up only by untracked scratch/i)).toBeInTheDocument()
+  })
+
+  it('does not render the discard-untracked hint when every kept row has tracked dirt', async () => {
+    await openPrune({ ok: true, candidates: [], kept: [trackedKept], scanned: 1 })
+    expect(screen.queryByText(/held up only by untracked scratch/i)).toBeNull()
+  })
+
+  it('disables the override for an untracked-only kept row whose path list is truncated', async () => {
+    // dirty_tracked === false, but the returned list (20) is short of the true
+    // count (35): the server refuses a partial consent, so this is NOT a valid
+    // scratch-only row and the override must stay disabled.
+    await openPrune({ ok: true, candidates: [], kept: [truncatedScratchKept], scanned: 1 })
+    expect(screen.getByLabelText('Force remove wt-trunc')).toBeDisabled()
+    // A truncated list is not a scratch-only row, so its hint is absent too.
+    expect(screen.queryByText(/held up only by untracked scratch/i)).toBeNull()
+  })
+
+  it('posts a discard_untracked_paths map keyed by name to the exact path array for a ticked scratch-only row', async () => {
+    const runBodies: string[] = []
+    await openPrune(
+      { ok: true, candidates: [], kept: [scratchOnlyKept], scanned: 1 },
+      (u, opts) => {
+        if (u.includes('/prune-run')) { runBodies.push(String(opts?.body)); return res({ ok: true, total: 1 }) }
+        if (u.includes('/prune-status')) return res({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-scratch', ok: true }],
+          items: { 'wt-scratch': { status: 'done', error: null } },
+        })
+        return null
+      },
+    )
+    await act(async () => {})
+    const box = screen.getByLabelText('Force remove wt-scratch') as HTMLInputElement
+    fireEvent.click(box)
+    await waitFor(() => expect(box).toBeChecked())
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    await waitFor(() => expect(runBodies.length).toBe(1))
+    const body = JSON.parse(runBodies[0])
+    expect(body.force_names).toEqual(['wt-scratch'])
+    // The map's value is EXACTLY the row's displayed path array, under its name.
+    expect(body.discard_untracked_paths).toEqual({ 'wt-scratch': ['probe.py', 'note.md'] })
+  }, 15000)
+
+  it('adds a ticked non-scratch kept row to force_names with NO discard_untracked_paths entry', async () => {
+    // A clean kept row is force-checkable but carries no scratch to discard, so
+    // it goes into force_names alone and contributes nothing to the map.
+    const runBodies: string[] = []
+    await openPrune(
+      { ok: true, candidates: [], kept: [cleanKept], scanned: 1 },
+      (u, opts) => {
+        if (u.includes('/prune-run')) { runBodies.push(String(opts?.body)); return res({ ok: true, total: 1 }) }
+        if (u.includes('/prune-status')) return res({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-clean', ok: true }],
+          items: { 'wt-clean': { status: 'done', error: null } },
+        })
+        return null
+      },
+    )
+    await act(async () => {})
+    const box = screen.getByLabelText('Force remove wt-clean') as HTMLInputElement
+    fireEvent.click(box)
+    await waitFor(() => expect(box).toBeChecked())
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    await waitFor(() => expect(runBodies.length).toBe(1))
+    const body = JSON.parse(runBodies[0])
+    expect(body.force_names).toEqual(['wt-clean'])
+    expect(body.discard_untracked_paths).toEqual({})
+  }, 15000)
 })

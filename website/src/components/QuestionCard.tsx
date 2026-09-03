@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, memo } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, MessageSquare } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 interface QuestionOption {
   label: string
   description?: string
@@ -35,6 +37,8 @@ interface QuestionCardProps {
 }
 
 function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange }: QuestionCardProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const ime = useImeGuard()
   const [selections, setSelections] = useState<Record<number, Set<string>>>({})
   const [customInputs, setCustomInputs] = useState<Record<number, string>>({})
   const reduceMotion = useReducedMotion()
@@ -147,7 +151,18 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
   const allCollapsed = questions.every((_, i) => collapsed[i])
 
   return (
-    <div className="border border-accent/30 rounded-xl bg-card shadow-md overflow-hidden animate-scale-in">
+    /* Height-capped, and the question stack scrolls inside that cap. The card
+       mounts in a static block above the composer, so an uncapped card taller
+       than the remaining column height grows PAST the top of the viewport and is
+       clipped there: the first questions become unreadable and unreachable
+       because nothing between them and the window edge scrolls. Folding helps
+       only once you can reach a chevron. The cap is viewport-relative so the
+       composer and the conversation keep their share on a short window, with an
+       absolute ceiling so a tall window does not stretch the card to fill it. */
+    <div className="border border-accent/30 rounded-xl bg-card shadow-md overflow-hidden animate-scale-in flex flex-col max-h-[min(60vh,32rem)]">
+      {/* The scroller holds ONLY the questions; the action row below stays out of
+          it so Submit / Dismiss are reachable without scrolling to the end. */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
       {questions.map((q, qIdx) => {
         const isCollapsed = !!collapsed[qIdx]
         const summary = answerOf(qIdx)
@@ -222,8 +237,14 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                     setCustomInputs(prev => ({ ...prev, [qIdx]: e.target.value }))
                     setSelections(prev => ({ ...prev, [qIdx]: new Set() }))
                   }}
-                  onKeyDown={e => { if (e.key === 'Enter' && allAnswered && !busy) handleSubmit() }}
-                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus:border-accent focus:outline-none"
+                  {...ime.bindComposition()}
+                  onKeyDown={e => {
+                    if (e.key !== 'Enter') return
+                    // Rule 1: single-line input; the readiness test stays outside.
+                    if (ime.isComposing(e)) return
+                    if (allAnswered && !busy) handleSubmit()
+                  }}
+                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus-visible:border-accent focus:outline-none"
                 />
                 </motion.div>
               )}
@@ -231,7 +252,8 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
           </div>
         )
       })}
-      <div className="px-4 py-3 border-t border-border flex justify-end items-center gap-2">
+      </div>
+      <div className="px-4 py-3 border-t border-border flex justify-end items-center gap-2 shrink-0">
         {/* One click to get the whole card out of the way. Only for a card that
             actually stacks — on a single question the per-question chevron is
             the same gesture, so a second control would be noise. */}

@@ -14,6 +14,9 @@ type Slot = {
   title?: string
   running?: boolean
   pending_approval?: boolean
+  /** The agent asked something and is waiting on the answer: sorted and marked
+   *  with the owed decisions rather than with idle sessions. */
+  needs_input?: boolean
   messages?: number
   agent?: string
   last_activity_ts?: string
@@ -41,7 +44,7 @@ export default function SessionGridView({
   onClose: () => void
   /** Down to a single session pane → return to the native single-chat surface on
    *  that session (the grid never shows a 1-pane chrome). */
-  onCollapse: (slot: string) => void
+  onCollapse: (slot: string, anchorTs?: string, anchorMid?: string) => void
   seedSlot?: string | null
 }) {
   const grid = useSessionGrid(seedSlot)
@@ -83,6 +86,7 @@ export default function SessionGridView({
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the three fields read are listed individually; `useSessionGrid` returns a fresh object literal every render, so depending on `grid` itself would rebind the document listener on every render while covering nothing these deps miss
   }, [grid.focusedId, grid.leaves, grid.splitLeaf])
 
   const { data: slots = [] } = useQuery<Slot[]>({
@@ -100,6 +104,7 @@ export default function SessionGridView({
     grid.pruneAgainst(slots.map((s) => s.key))
     // Depend on the stable pruneAgainst callback (useCallback []), not the whole grid
     // object (new literal each render) — avoids re-scheduling the effect every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above: `grid` is a new literal every render and `pruneAgainst` is the only member this effect calls
   }, [slots, grid.pruneAgainst])
 
   // Fork source = the focused session pane, else the first session pane in the grid.
@@ -130,6 +135,7 @@ export default function SessionGridView({
           onRemove={() => grid.closeLeaf(leaf.id)}
           onSplitRight={() => grid.splitLeaf(leaf.id, 'right')}
           onSplitDown={() => grid.splitLeaf(leaf.id, 'down')}
+          onOpenFull={onCollapse}
         />
       )
     }
@@ -221,6 +227,10 @@ function PlaceholderPane({
     )
     .sort((a, b) => {
       if (!!a.pending_approval !== !!b.pending_approval) return a.pending_approval ? -1 : 1
+      // An unanswered agent question ranks with the other owed decisions, above
+      // running sessions: this list is what a user picks a pane's session from,
+      // and the ones waiting on them are the ones worth opening first.
+      if (!!a.needs_input !== !!b.needs_input) return a.needs_input ? -1 : 1
       if (!!a.running !== !!b.running) return a.running ? -1 : 1
       return (b.last_activity_ts || '').localeCompare(a.last_activity_ts || '')
     })
@@ -239,7 +249,8 @@ function PlaceholderPane({
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder={i18nT('components.sessionGridView.search_sessions')}
-          className="flex-1 min-w-0 bg-bg-elevated border border-border rounded px-2 py-1 text-[13px] text-text placeholder:text-muted outline-none focus:border-accent"
+          aria-label={i18nT('components.sessionGridView.search_sessions')}
+          className="flex-1 min-w-0 bg-bg-elevated border border-border rounded px-2 py-1 text-[13px] text-text placeholder:text-muted outline-none focus-visible:border-accent"
         />
         <button onClick={onSplitRight} title={i18nT('components.sessionGridView.split_right_d')} aria-label={i18nT('components.sessionGridView.split_right')} className={ctrlBtn}>
           <SplitGlyph />
@@ -288,7 +299,7 @@ function PlaceholderPane({
             >
               <Circle
                 size={10}
-                className={`shrink-0 ${s.pending_approval ? 'fill-warn text-warn' : s.running ? 'fill-ok text-ok' : 'fill-muted text-muted'}`}
+                className={`shrink-0 ${s.pending_approval ? 'fill-warn text-warn' : s.needs_input ? 'fill-info text-info' : s.running ? 'fill-ok text-ok' : 'fill-muted text-muted'}`}
               />
               <span className="truncate flex-1">{s.title || s.key}</span>
               <span className="text-[11px] text-muted shrink-0">{s.messages ?? 0} {i18nT('components.sessionGridView.msgs')}</span>

@@ -60,6 +60,33 @@ export default [
       // the module may contain ONLY paint data, so the filename IS the
       // boundary and its consumer (FolderGlyph.tsx) stays fully covered.
       'src/components/folderColorPaint.ts',
+      // Pierre's shared render configuration: injected stylesheet text
+      // (`unsafeCSS` templates of selectors, lengths and `var(--…)` references),
+      // theme ids the library matches on, and an extension→grammar map. None of
+      // it is read as words. Same named-boundary idiom as `folderColorPaint.ts`
+      // above — the module may contain ONLY render config, and every Pierre
+      // surface that shows copy (DiffBlock, MarkdownPanel, FileBrowserRail)
+      // stays fully covered.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added here will not be reported. Verified copy-free rather than
+      // assumed — it imports neither `i18nT` nor `useTranslation`.
+      'src/pierre/config.ts',
+      // Injected stylesheet text for the chat file-change chips: selectors,
+      // lengths and keyframes handed to the CSS parser, with the two layout
+      // numbers and the animation duration the rules interpolate. Extracted from
+      // `FileChangeChips.tsx` precisely so the component -- which does carry
+      // user-visible copy -- stays fully covered here.
+      //
+      // Stated as a false-negative class, per this file's convention: copy added
+      // to this module will not be reported. Keep it stylesheet-only; anything a
+      // person reads belongs in the component with `i18nT`.
+      'src/components/fileChangeChipsCss.ts',
+      // Synthesizes the `diff --git` / `---` / `+++` headers Pierre needs to
+      // identify a file in a bare patch body: git wire format handed to Pierre's
+      // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
+      // panel -- which does carry copy -- stays fully covered.
+      'src/components/unifiedPatchHeaders.ts',
       // Per-shell env-var export command builders for SettingRef's env popover:
       // every string is CLI syntax handed to a terminal (`export`, `$env:`,
       // `set`, `=1`), never user-visible copy — translating a fragment would
@@ -132,6 +159,29 @@ export default [
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
       'src/lib/mcpAppSrcdoc.ts',
+      // Per-app scoped CSS, injected as `<style>{APP_CSS}</style>`. Each module is
+      // ONE template literal of stylesheet text handed to the CSS parser -- selectors,
+      // lengths and `var(--…)` references. None of it is read as words, and the
+      // diff-scoped `added-lines` check reports the whole template against whoever
+      // touches a rule inside it, so any narrow-viewport or theming edit to an app's
+      // stylesheet trips a zero-tolerance gate it can never satisfy.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added to one of these modules will not be reported -- keep them
+      // stylesheet-only, and put anything a person reads in the component with
+      // `i18nT`. Verified copy-free rather than assumed: none of these four
+      // imports `i18nT` or `useTranslation`.
+      //
+      // Listed as EXACT PATHS, not a `src/apps/*/styles.ts` glob, for the reason
+      // stated above for the srcdoc pair: the false-negative note is only true of
+      // files that exist today. A glob would put every future app's stylesheet
+      // outside this gate sight-unseen, including one where someone later writes
+      // `content: "…"` copy or misfiles a string. One config line per new app is
+      // the cost of keeping the ratchet's shape.
+      'src/apps/crew-companion/styles.ts',
+      'src/apps/design-critique/styles.ts',
+      'src/apps/file-explorer/styles.ts',
+      'src/apps/md-notebook/styles.ts',
       // The PPTX Maker board-preview builder — the same category as
       // `sketchSrcdoc.ts` directly above, and listed by the same exact-path rule
       // rather than a shared glob. Every literal in it is handed to a PARSER: the
@@ -206,6 +256,23 @@ export default [
       // module parser-facing only, and keep it DOM-free, which is the property
       // that makes that easy to check.
       'src/hooks/themeCss.ts',
+      // The Kiro-ghost avatar generator's art tables. Every literal in the module
+      // is SVG handed to the SVG parser: the shipped mark's `d` path data, the
+      // per-part fragments built from it, and the hex tile colors. Translating any
+      // of them would not change a word anyone reads — it would emit a malformed
+      // path and render a blank avatar.
+      //
+      // Verified copy-free rather than assumed, and by a MECHANICAL boundary: the
+      // module's only import is a TYPE from `@dicebear/core`, it imports no `i18nT`
+      // / `useTranslation`, and it does not touch the DOM — every export is data in,
+      // SVG `string` out. Its consumer `components/CrewAvatar.tsx` stays fully
+      // gated, and that component renders the avatar `alt=""` / `aria-hidden`
+      // precisely because the crew name is shown as real translated text beside it.
+      //
+      // Stated as a false-negative class, per this file's convention: any
+      // user-visible copy ever added to THIS path will not be reported — keep the
+      // module parser-facing only, and keep it DOM-free.
+      'src/lib/kiroGhostAvatar.ts',
       // Same rationale, different convention: this app keeps its seed prompts in a
       // dedicated `lib/prompts.ts` rather than a `*Prompt.ts` file. Also prompt
       // payload sent over the wire, never rendered.
@@ -289,6 +356,11 @@ export default [
               // a trailing `=`, so this still reports real copy.
               String.raw`^[?&][a-z_]+=$`,
 
+              // The same server contract with a FIXED flag value baked in, e.g.
+              // `&resolve=1`. The value class is a single digit or lowercase word
+              // (`=1`, `=true`) — never a sentence — so prose still cannot match.
+              String.raw`^[?&][a-z_]+=[a-z0-9]+$`,
+
               // A catalog KEY assembled at runtime, e.g.
               // `apps.crewCompanion.state.${slot}`. Translating a key would break the
               // lookup it performs — the value it resolves to is what gets translated.
@@ -341,6 +413,73 @@ export default [
               //      flagged, so it lands in the baseline. Accepted: a false positive
               //      costs one baseline entry, a false negative hides copy forever.
               '^(?![a-z]+(?: [a-z]+)+$)[\\s\\-a-z0-9:/\\[\\]().%#]+$',
+              // Tailwind ARBITRARY-VARIANT clusters, e.g. the shared touch-target
+              // overrides in utils/touchActions.ts:
+              // `[@media(hover:none)]:opacity-100 [@media(hover:none)]:[&_button]:p-2.5`.
+              // The class shape above cannot cover these: its char class forbids
+              // `@`, `&` and `_`, which are exactly what an arbitrary variant is
+              // made of. Such constants live at module level under ALL-CAPS names,
+              // so `i18n-strict` looks inside them.
+              //
+              // Deliberately NARROWER than the general class shape: every
+              // space-separated token must BEGIN with a bracketed `@`-variant
+              // (`[@media(...)]:` or `[@supports(...)]:`), so admitting this shape
+              // admits no new prose — copy never opens with `[@`. A cluster
+              // merely containing such a token alongside a plain word still
+              // fails, because every token must match end to end.
+              String.raw`^\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+(?:\s+\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+)*$`,
+              // Tailwind ARBITRARY-VALUE clusters whose bracketed value carries a
+              // comma or underscore, e.g. the notification glass surfaces in
+              // components/notifications/NotificationFeed.tsx:
+              // `bg-[color-mix(in_srgb,var(--card)_72%,transparent)] backdrop-blur-2xl`
+              // or `shadow-[0_8px_24px_rgba(0,0,0,.10),0_1px_3px_rgba(0,0,0,.06)]`.
+              // The general class shape above cannot cover these: its char class
+              // forbids `,` and `_`, which are exactly what Tailwind's arbitrary-value
+              // syntax uses to encode CSS commas and spaces inside `[...]`. Such
+              // strings sit in plain `const` ternaries (not JSX attributes), so the
+              // attribute exemption does not reach them either.
+              //
+              // Deliberately NARROWER than "allow , and _ anywhere", on two axes:
+              // (a) the first lookahead rejects any two ADJACENT bare lowercase
+              // words — the prose shape (`connection lost [retry_pending]`)
+              // that would otherwise ride in on a single bracketed token; a
+              // class cluster never has two adjacent bare words, every
+              // utility next to a bare `border`/`isolate` carries a hyphen,
+              // digit, colon or bracket. (b) the second lookahead requires at
+              // least one space-free `[...]` token containing a `,` or `_` —
+              // and `,`/`_` are admitted ONLY inside brackets; outside them
+              // the char class is the general class shape's. A sentence
+              // merely containing a bracket still fails, because its commas
+              // live outside the brackets.
+              //
+              // Known false negative, stated: a SINGLE bare word plus
+              // bracketed-value tokens (`saved bg-[color-mix(a,b)]`) would be
+              // missed — the same single-word residue the general class shape
+              // already accepts, caught by the en-XA render gate instead.
+              String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=[^\[]*\[[^\]\s]*[,_][^\]\s]*\])(?:[\s\-a-z0-9:/().%#]|\[[\-a-z0-9:/().%#,_]*\])+$`,
+              // A GATEWAY WIRE MARKER whose tag is bracketed ALL-CAPS, e.g.
+              // `[SYSTEM] Sub-agent synthesis:`. These are matched byte-for-byte
+              // with `startsWith` against Python constants in
+              // src/kiro_crew/dashboard/state.py and the matched prefix is then
+              // SLICED OFF, so no character reaches the screen — translating one
+              // silently stops its card from rendering in that locale. Real site:
+              // the `PREFIXES` table in pages/chat/RecoveryCard.tsx, an ALL-CAPS
+              // module constant, so `i18n-strict` looks inside it.
+              //
+              // Deliberately narrow: the string must OPEN with `[`, the tag must be
+              // ALL-CAPS (`[A-Z]+`), no second `[` may follow, AND it must END in a
+              // colon — the shape a wire marker whose instruction continues on the
+              // same line takes. The trailing colon is what keeps real copy out:
+              // without it `[BETA] Experimental — expect changes` and `[ERROR] Unable
+              // to load session` would both be exempt, which two reviewers flagged.
+              // Known false negative, stated: copy that opens with a bracketed
+              // all-caps tag AND ends in a colon is exempt. The wholly-bracketed
+              // mixed-case siblings in that same table do not need this pattern —
+              // measured: an existing shape already covers a string that is
+              // entirely one bracketed token. This entry exists for the marker
+              // that carries text AFTER the closing bracket, which that shape
+              // cannot admit.
+              String.raw`^\[[A-Z]+\][^\[\]]*:$`,
               // CSS SELECTOR LISTS, e.g. `[role="dialog"],[data-x]` or
               // `a,button,[tabindex]` — a comma-joined list of type selectors and
               // bracketed attribute selectors, as passed to querySelector. The
@@ -414,6 +553,15 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
+              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
+              // as copyable recovery text (`pullRequestErrorDetails` returns one
+              // verbatim and the panel renders it in a <code> block). A command
+              // typed into a terminal is a wire string: translating it breaks
+              // it. Enumerated rather than shaped, like the key codes above — a
+              // "lowercase words" shape would exempt exactly the prose this
+              // config fights hardest, and this is a closed two-member set that
+              // grows only when a new provider CLI is wired in on purpose.
+              '^(?:gh|glab) auth login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -467,6 +615,26 @@ export default [
               // slash-prefixed string (`'/Delete'`) is exempt.
               '^https?://\\S*$',
               '^[.~]?/\\S*$',
+              // URL-GRAMMAR FRAGMENTS of the Issue Radar provider table
+              // (`apps/issue-radar/lib/links.ts`): the repository-path templates, the
+              // two placeholders `String.replace` substitutes into them, and Azure
+              // DevOps' `_`-prefixed route segment. Same category as the path and
+              // query entries above — a forge's route is that forge's contract, and a
+              // translated `_workitems` is a 404, not a localized page.
+              //
+              // The slash-bearing entry above cannot cover these: `{owner}/{repo}`
+              // carries braces, which its `[\w./-]` class excludes, and `_workitems`
+              // has no slash at all — the very requirement that stops that entry from
+              // exempting single prose words. So this is ENUMERATED rather than a
+              // shape: the literals the table actually holds, whole-value anchored,
+              // which no sentence of copy can match. A general "token with braces or a
+              // leading underscore" shape was rejected for the reason stated for `mc:`
+              // above — it would start releasing real copy the moment a label
+              // interpolated a placeholder.
+              String.raw`^(?:\{owner\}(?:/_git)?/\{repo\}|\{owner\}|\{repo\}|_workitems)$`,
+              // The autolink href template's substitution placeholder, consumed by
+              // `expand()`; a translated token would stop every match expanding.
+              String.raw`^\{match\}$`,
               // A FILE-PICKER `accept` EXTENSION LIST, e.g.
               // `,.txt,.md,.json,.har,.yaml` — the comma-joined dot-extension
               // string handed to `<input type="file" accept=…>`. These live at
@@ -509,6 +677,11 @@ export default [
               // gate. Adding a marker here is a deliberate one-line act, which is
               // the right cost for adding one to the wire protocol.
               '^\\[(Subagent|Subagent batch|Workflow) completion event\\]$',
+              // The Stop-hook nudge-cap backstop marker (no em dash), enumerated
+              // for the same closed-set reason as the completion-event markers
+              // above. Matched with `startsWith` and sliced off before render;
+              // byte-identical to HOOK_HALTED_RECOVERY_PREFIX in state.py.
+              '^\\[Stop-hook nudge cap reached\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
               // (`generateFullMatchRegExp`), so a pattern must describe the WHOLE
               // string. A prefix-only pattern like `^data:` becomes `^^data:$` and can
@@ -586,7 +759,18 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              // The code-forge product brands, in the do-not-translate glossary for
+              // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
+              // "GitLab" in every language, and a localized spelling would name a
+              // product that does not exist. They reach the UI as the provider name in
+              // Issue Radar's connect picker and as the `{{provider}}` value
+              // interpolated into its refresh tooltips, so the bare brand is the whole
+              // literal. Whole-value-anchored like the entry above, so a sentence that
+              // merely mentions a forge is still reported — only the bare name is
+              // exempt, and the sentences AROUND it stayed in the catalog (that is
+              // what `{{provider}}` is for).
+              '^(GitHub|GitLab|Azure DevOps)$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -619,6 +803,18 @@ export default [
               // trimed = value.trim()`), so a pattern that requires the space can never
               // match. Verified — the space-bearing version left the warning in place.
               '^Auto-Improve -$',
+              // Electron accelerator API tokens, which are the INPUT side of the key
+              // caps above: `accelerator: "CmdOrCtrl+R"` is the string Electron parses
+              // to bind the shortcut, and the Windows titlebar menu rewrites those
+              // tokens to the cap the user actually sees (`CmdOrCtrl` -> `Ctrl`). The
+              // token never reaches the screen, so it is a machine value; the cap it
+              // becomes is already exempt on do-not-translate grounds. Translating the
+              // token would break the binding, not localise anything.
+              //
+              // Anchored and enumerated rather than a PascalCase shape rule on purpose:
+              // `^[A-Z][a-z]+$` would also swallow `File`, `Edit` and `Settings`, which
+              // are genuine UI copy.
+              '^(CommandOrControl|CmdOrCtrl)$',
             ],
           },
 
@@ -642,6 +838,21 @@ export default [
               // in another module inherits this. Both names exist in exactly one
               // module today (`src/utils/popoutController.ts`).
               '^log(Debug|Warn)$',
+              // `contributedCommands.ts`'s single console shim. A refused command
+              // contribution has to say WHY on the console or it is invisible, and
+              // the reason names the manifest field that failed (`missing title`,
+              // `argument.kind must be one of url, text`) addressed to
+              // whoever authored the app.json. Same class as `^console\.\w+$` and
+              // `\berrors\.push$` above: exempt when it is a throw or a direct
+              // console call, so treating it as copy only because a one-line wrapper
+              // adds the message prefix would be an artifact of the sink.
+              //
+              // A CALLEE exemption, not a whole-file one, for the reason the ones
+              // above give -- and the name is deliberately long and specific rather
+              // than a generic `warnSkip`, so a future helper elsewhere cannot
+              // inherit this by accident. One definition exists today, in
+              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing.
+              '^warnContributionSkipped$',
               // Validator diagnostics, for parity with `Error` above. A rejected input's
               // reason names the FIELD that failed (`Missing or invalid "meta" field`,
               // `Invalid meta.format: "…" (expected "svg", "lottie", or "sprite")`) and
@@ -651,7 +862,10 @@ export default [
               // artifact of the sink, not a statement about the text.
               '\\berrors\\.push$',
               // Style and test helpers.
-              '^(css|cx|clsx|twMerge|cva)$',
+              // `cn` is this repo's own `twMerge(clsx(...))` wrapper (src/lib/utils.ts)
+              // and takes `ClassValue[]` -- the same category as the two helpers it
+              // composes, both already listed here. Copy cannot legitimately reach it.
+              '^(css|cx|clsx|twMerge|cva|cn)$',
               // Storage, telemetry and routing take machine keys.
               '(local|session)Storage\\.\\w+', 'navigate', 'track', 'emit',
               // KiroCrew's own telemetry shim (`src/rum.ts`). Its first argument is
@@ -666,7 +880,10 @@ export default [
               // fixed vocabulary (`message_sent`, `tool_call`, `approval_required`), read
               // by the behaviour state machine, never rendered.
               '^report[A-Z]\\w*$', '^pickFile$',
-              'querySelector(All)?', 'getElementById', 'createElement',
+              // `closest` takes the same CSS-selector contract as querySelector:
+              // its argument is an attribute/type selector walked up the tree,
+              // never rendered copy.
+              'querySelector(All)?', 'closest', 'getElementById', 'createElement',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the
@@ -862,7 +1079,39 @@ export default [
   // this module", and any copy later added to this file belongs in the catalog,
   // not here — keep this module CSS-only.
   {
-    files: ['src/apps/md-notebook/styles.ts'],
+    files: [
+      'src/apps/md-notebook/styles.ts',
+      // Same class as Notes: a CSS-in-TS string injected via <style>, never copy.
+      // Editing a selector inside CC_CSS otherwise fails [added-lines] because the
+      // whole template sits under an ALL-CAPS declarator.
+      'src/apps/crew-companion/styles.ts',
+    ],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // Developer diagnostics for the APP AUTHOR, printed to the browser console when
+  // an app subscribes to a WS event its manifest has not declared a scope for.
+  // Translating them would be actively wrong, not merely wasteful: each one quotes
+  // the scope identifier the author must paste into `permissions.events`
+  // (`"slots:user"`, `"notification:system"`, `"<scope>:all"`), and those are
+  // compared BY VALUE against the manifest — localised advice would name a scope
+  // the gateway does not recognise.
+  //
+  // `console.*` is already callee-exempt, so the three call sites are covered; the
+  // strings are flagged because they are composed in `checkSubscribeAllowed`, one
+  // pure predicate that centralises the diagnosis for all three. Inlining the prose
+  // into the calls to earn the callee exemption would duplicate its branch logic
+  // three times — a worse module for a lint technicality.
+  //
+  // Scoped to this one file for the same reason as the two above: the module is the
+  // SDK's protocol surface (event tables, hooks, provider) and holds no other prose.
+  // The pieces that DO render copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` —
+  // are separate files and stay covered. Copy added here later belongs in the
+  // catalog, not under this exemption; keep this module protocol-and-diagnostics.
+  {
+    files: ['src/app-sdk/index.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -938,6 +1187,20 @@ export default [
     },
   },
 
+  // PROTOCOL VALUES ONLY, same category as `wireValues.ts` above: the two
+  // Aperture-registered literals for the session-pulse survey (a radio
+  // question's response values, and the question text itself). Both are
+  // compared/sent by value against Aperture's registered form template
+  // (category=KiroCrew, name=SessionFeedback, version=1.0.1) — ingestion  // brand-ok: registered category id
+  // 400s on any text/type mismatch, so translating either would break the
+  // submission rather than localize it. See the module's own header.
+  {
+    files: ['src/components/sessionPulseWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
   // into the Settings search corpus so a query like "dark mode" finds a setting
   // whose label does not contain those words. Every value is a term matched
@@ -949,6 +1212,45 @@ export default [
   // and any real copy later added elsewhere still belongs in the catalog.
   {
     files: ['src/components/commandPalette/settingsKeywords.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FONT FAMILY NAMES ONLY: the candidate names the terminal font picker probes
+  // the viewing machine's font book for, plus the probe and preview sample text.
+  // Every name is matched BY VALUE against that font book — a translated
+  // `JetBrains Mono` resolves to nothing and the terminal silently falls back to
+  // the generic monospace, so translating one breaks the feature in that locale
+  // while adding a catalog entry no one can act on. The names do reach the screen
+  // as picker rows, which is the point: a font is chosen by the name it is
+  // installed under, the way a person is addressed by their own name.
+  //
+  // Scoped to this one file for the same reason as the modules above: a shape rule
+  // cannot express "font family names, but only in this module". Title-case
+  // multi-word names are exactly the shape the gate exists to catch, and the
+  // ` Mono` / ` Nerd Font` suffixes are far too generic to anchor an exclusion on.
+  // Keep this module names-only — the picker's own copy (its label, description,
+  // and the free-text row) lives in the catalog, not behind this exemption.
+  {
+    files: ['src/utils/monoFontCandidates.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FONT FAMILY PICKER ROWS + BUNDLED FONT NAME LITERALS: the Settings →
+  // Display Font Family picker's option labels ('Sans' / 'Mono' / 'System' /
+  // 'OpenDyslexic') are proper nouns and internal identifiers, not user copy.
+  // The module also holds the CSS font-family stack strings for the bundled
+  // OpenDyslexic face (OPENDYSLEXIC_BODY_STACK / OPENDYSLEXIC_MONO_STACK) and
+  // the bundled-mono family-name list (BUNDLED_MONO_FONTS). All are matched by
+  // exact value against @font-face declarations and CSS lookups; translating
+  // any of them would break the resolution. Same names-only rationale as
+  // monoFontCandidates.ts above — kept in its own module so the exemption is
+  // tight.
+  {
+    files: ['src/utils/fontFamilyOptions.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

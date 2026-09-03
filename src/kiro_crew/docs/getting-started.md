@@ -10,7 +10,7 @@ like Slack, Discord, and Telegram.
 
 | Requirement | Needed for | Floor |
 |-------------|------------|-------|
-| **Python** + pip | Backend | `>= 3.10` |
+| **Python** + pip | Backend | `>= 3.12` |
 | **Node.js** + npm | Building the dashboard from source | `>= 22` (24 LTS recommended) |
 | **`kiro-cli`** | Driving the LLM | Required, on your `PATH` |
 
@@ -55,7 +55,7 @@ carries only `kirocrew` and pip still needs PyPI to resolve its dependencies.
 
 ```bash
 git clone https://github.com/kirodotdev/KiroCrew.git
-cd Kiro Crew
+cd KiroCrew
 cd website && npm install && npm run build && cd ..
 pip install -e ".[voice]"       # [voice] adds the optional speech-to-text extras
 ```
@@ -84,16 +84,31 @@ kirocrew setup
 
 This interactive wizard detects `kiro-cli` on your PATH, saves the project
 directory so Kiro Crew works from any working directory, installs the agent
-config to `~/.kiro/agents/kirocrew.json`, registers the browser MCP proxy, and
-walks through the workspace directory, timezone, dashboard URL, and the
-`http://kirocrew.localhost:5476` custom domain. It configures no messaging
-channels: connect them after setup from the dashboard, or run `kirocrew setup
---slack` for the guided Slack setup.
+config to `~/.kiro/agents/kirocrew.json`, and walks through the workspace
+directory, timezone, dashboard URL, and the `http://kirocrew.localhost:5476`
+custom domain. It configures no messaging channels: connect them after setup
+from the dashboard, or run `kirocrew setup --slack` for the guided Slack setup.
 
-To actually browse, turn on **Browser Mode** in Settings → Browser. Enabling it
-downloads and sets up Playwright (`@playwright/mcp` plus the selected engine's
-browser binary, bootstrapping Node if needed); browsing is then default-on
-whenever Browser Mode stays enabled.
+To browse, install the Playwright agent CLI (needs Node.js 20 or newer):
+
+```bash
+npm install -g @playwright/cli@latest
+playwright-cli install-browser              # --with-deps on Debian/Ubuntu only
+playwright-cli install --skills agents --global
+```
+
+`--with-deps` installs OS libraries through `apt` and needs root. Playwright
+implements it for apt alone, so on Fedora, RHEL, CentOS or Amazon Linux it
+misfires against Ubuntu package names; install the libraries with your own
+package manager instead. The Settings → Browser install button handles this
+per-distribution and prints the command to run when it needs root.
+
+Having `playwright-cli` on your `PATH` is what makes browsing available, so
+uninstalling it is how you take the capability away. Note that it covers
+`playwright-cli attach --extension`, which drives your own running Chrome with
+the sessions you are logged into. The dashboard's **Browser** panel shows the
+live session and lets you take over with real mouse and keyboard, which is how
+you complete a CAPTCHA or a 2FA prompt.
 
 Use `kirocrew setup --agent-only` to reinstall just the agent config and skip
 the other wizard steps.
@@ -156,9 +171,7 @@ entries where it can, and prints a specific fix hint for anything it cannot.
 kirocrew update
 ```
 
-For a source checkout this pulls, rebuilds the frontend, reinstalls the package,
-and restarts in place. Clicking "Update Available" in the dashboard topbar runs
-the same path.
+For a source checkout this updates the checkout and rebuilds it. Restart the gateway with `kirocrew restart` to use the new version. Clicking "Update Available" in the dashboard topbar runs the same path.
 
 ## Running in the Background
 

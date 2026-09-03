@@ -114,7 +114,7 @@ vi.mock('../components/MarkdownRenderer', () => ({
 }))
 vi.mock('../components/TypewriterText', () => ({ default: () => null }))
 vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
-vi.mock('../components/AgentDropdownList', () => ({ default: () => null, ManageAgentsFooter: () => null }))
+vi.mock('../components/AgentDropdownList', () => ({ default: () => null, DefaultAgentRow: () => null, ManageAgentsFooter: () => null }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
@@ -160,8 +160,8 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -346,21 +346,21 @@ describe('ChatPage row callbacks — fork', () => {
     expect(String(alertSpy.mock.calls[0][0])).toContain('slot is busy')
   })
 
-  it('still alerts when the fork request throws', async () => {
+  it('still alerts when the fork request throws, naming the real reason', async () => {
     apiSpy('forkChatSlot').mockRejectedValue(new Error('network down'))
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
     await waitFor(() => expect(alertSpy).toHaveBeenCalled())
     const said = String(alertSpy.mock.calls[0][0])
     expect(said).toContain('Fork failed')
-    // Pinned deliberately: `unwrap()` rejects with a redux-toolkit
+    // Flipped, as this assertion's previous form asked to be: it pinned the
+    // reason being LOST — `unwrap()` rejects with a redux-toolkit
     // SerializedError (a PLAIN OBJECT), so the handler's `e instanceof Error`
-    // test is false and the fallback `String(e)` renders '[object Object]' —
-    // the reason is lost from the alert. Reported, not fixed here; when the
-    // handler learns to read `.message` off a serialized error this assertion
-    // is the one that should flip to the real text.
-    expect(said).toContain('[object Object]')
-    expect(said).not.toContain('network down')
+    // test was false and the `String(e)` fallback rendered '[object Object]'.
+    // The handler now reads the message through `utils/thunkError.errMessage`,
+    // which knows that shape, so the alert carries the real text.
+    expect(said).toContain('network down')
+    expect(said).not.toContain('[object Object]')
   })
 })
 
@@ -538,7 +538,7 @@ describe('ChatPage window-event listeners', () => {
   })
 
   it('answers a run-in-terminal request exactly once, carrying its reqId back', async () => {
-    const { store } = await renderTurn()
+    await renderTurn()
     const results: { reqId?: string; ok?: boolean }[] = []
     const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
     window.addEventListener('mc:run-in-terminal-result', onResult)
@@ -548,10 +548,11 @@ describe('ChatPage window-event listeners', () => {
           detail: { code: 'npm test', reqId: 'r2' },
         }))
       })
-      // The handler opens the panel synchronously, then races the PTY against a
-      // ~6 s cap. Either leg answers; the `settled` latch is what guarantees the
-      // code-block button is told once and only once.
-      expect(store.getState().chat.activityOpen).toBe(true)
+      // "Run in terminal" now routes to the app-wide dock panel
+      // (useBottomTerminal), not the chat-scoped activity panel, so
+      // `chat.activityOpen` is intentionally untouched. The handler races the
+      // PTY against a ~6 s cap; either leg answers, and the `settled` latch is
+      // what guarantees the code-block button is told once and only once.
       await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
       await waitFor(() => expect(results.length).toBe(1), { timeout: 5_000 })
     } finally {
@@ -584,8 +585,9 @@ describe('ChatPage welcome-state history suggestions', () => {
     })
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('rate limiter')
+    // #765: history is seeded lazily by the typed query, not on mount.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     const list = await screen.findByRole('listbox', { name: 'Previous chats' }, { timeout: 5_000 })
     const options = within(list).getAllByRole('option')
     expect(options).toHaveLength(1)
@@ -597,8 +599,9 @@ describe('ChatPage welcome-state history suggestions', () => {
   it('dismisses the suggestions on Escape', async () => {
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('rate limiter')
+    // #765: history is seeded lazily by the typed query, not on mount.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     expect(await screen.findByRole('listbox', { name: 'Previous chats' }, { timeout: 5_000 })).toBeInTheDocument()
     act(() => { fireEvent.keyDown(document, { key: 'Escape' }) })
     await waitFor(() => expect(screen.queryByRole('listbox', { name: 'Previous chats' })).toBeNull())
@@ -607,8 +610,11 @@ describe('ChatPage welcome-state history suggestions', () => {
   it('offers nothing when no past session matches', async () => {
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('kubernetes migration')
+    // #765: history is seeded lazily by the typed query, not on mount — wait
+    // for the seed to land so the "no match" below is a real negative, not a
+    // not-yet-loaded false pass.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     expect(screen.queryByRole('listbox', { name: 'Previous chats' })).toBeNull()
   })
 })

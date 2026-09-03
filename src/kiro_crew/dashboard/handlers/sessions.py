@@ -10,7 +10,9 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from kiro_crew.loop_lock import LoopBoundLock
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider  # noqa: F811
@@ -22,24 +24,23 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew import session_ledger
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.history import INCOGNITO_MEMORY_MODES, SEARCH_MIN_CHARS, _archive_dir
+from kiro_crew.history import SEARCH_MIN_CHARS, _archive_dir, is_incognito_transcript
 from kiro_crew.llm_helpers import run_bg_oneliner
-from kiro_crew.mcp_discovery import (
-    discover_servers_to_sync,
-    register_servers_for_cc,
-    sync_to_agent_config,
-)
+from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
     create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
@@ -92,15 +93,13 @@ async def api_sessions_memory(request: web.Request) -> web.Response:
 
 _health_cache: dict[str, dict] = {}
 _health_cache_ts: float = 0.0
-_health_lock: asyncio.Lock | None = None
+_health_lock = LoopBoundLock()
 _HEALTH_REFRESH_SECS = 15
 
 
 async def api_sessions_health(request: web.Request) -> web.Response:
     """GET /api/sessions/health — slots flagged as stalled from log scan."""
-    global _health_cache, _health_cache_ts, _health_lock
-    if _health_lock is None:
-        _health_lock = asyncio.Lock()
+    global _health_cache, _health_cache_ts
     now = time.monotonic()
     if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
         async with _health_lock:
@@ -126,6 +125,16 @@ _USAGE_REFRESH_SECS = 600  # background refresh every 10 min
 # guaranteed to release the in-flight guard instead of parking it forever.
 _USAGE_FETCH_DEADLINE_SECS = 180
 _usage_fetching = False
+_MAX_BONUS_GRANTS = 32
+_MAX_BONUS_NAME_CHARS = 100
+_MAX_BONUS_CREDITS = 1_000_000.0
+_MAX_BONUS_DAYS_LEFT = 3_650
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_BONUS_DASH_RE = re.compile(r"^([\d.]+)/([\d.]+)\s+used\s+\((\d+)\s+days?\s+left\)$")
+_BONUS_COLON_RE = re.compile(
+    r"^(.+?):\s*([\d.]+)/([\d.]+)\s*\(expires\s+in\s+(\d+)\s+days?\)$",
+    re.IGNORECASE,
+)
 
 # --- Text-scrape gate ------------------------------------------------------
 # The `/usage` text scrape is a REAL billed kiro-cli chat turn, unlike the
@@ -255,9 +264,17 @@ def _safe_float(text: str) -> float | None:
         return None
 
 
+def _safe_int(text: str) -> int | None:
+    """Parse a regex-constrained integer without letting huge input raise."""
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _parse_usage(raw: str) -> dict[str, object]:
     """Parse structured fields from kiro-cli /usage output."""
-    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
+    clean = _ANSI_ESCAPE_RE.sub("", raw)
     result: dict[str, object] = {"raw": ""}
 
     lines = clean.splitlines()
@@ -309,33 +326,59 @@ def _parse_usage(raw: str) -> dict[str, object]:
                 if rate is not None:
                     result["overage_rate"] = rate
 
-    # Bonus / promotional credits are a separate pool kiro-cli lists in its own
-    # section after the plan, e.g.:
-    #     Bonus Credits:
-    #       Welcome bonus: 386.34/500 (expires in 15 days)
-    # This pool is drawn down BEFORE the plan, so while it lasts the plan meter
-    # barely moves — which looked like a frozen counter until we surfaced it.
-    # Capture the first bonus line (first-wins) so the dashboard can pool it into
-    # the header total and show it in the credits modal.
-    in_bonus = False
-    for line in usage_lines:
-        if "Bonus Credits" in line:
-            in_bonus = True
+    # Kiro CLI has shipped both "name: used/total (expires in N days)" and
+    # "name - used/total used (N days left)". Parse both bounded formats and
+    # retain every active grant; one malformed line must not poison the rest.
+    bonus_credits: list[dict[str, object]] = []
+    in_bonus_section = False
+    for raw_line in usage_lines:
+        line = raw_line.strip()
+        if "bonus credits:" in line.casefold():
+            in_bonus_section = True
             continue
-        if not in_bonus or "bonus_limit" in result:
+        if not in_bonus_section:
             continue
-        m = re.search(r"([A-Za-z][A-Za-z0-9 ]*?):\s*([\d.]+)\s*/\s*([\d.]+)", line)
-        if not m:
+        if line.startswith("Credits") or line.startswith("Overages:"):
+            break
+        if not line:
             continue
-        used = _safe_float(m.group(2))
-        limit = _safe_float(m.group(3))
-        if used is not None and limit is not None and limit > 0:
-            result["bonus_label"] = m.group(1).strip()
-            result["bonus_used"] = used
-            result["bonus_limit"] = limit
-            exp = re.search(r"\(([^)]*expires[^)]*)\)", line, re.IGNORECASE)
-            if exp:
-                result["bonus_expires_label"] = exp.group(1).strip()
+        if " - " in line:
+            name, usage_text = line.rsplit(" - ", 1)
+            match = _BONUS_DASH_RE.fullmatch(usage_text.strip())
+            values = match.groups() if match else None
+        else:
+            match = _BONUS_COLON_RE.fullmatch(line)
+            if match:
+                name = match.group(1)
+                values = match.group(2), match.group(3), match.group(4)
+            else:
+                name = ""
+                values = None
+        name = name.strip()
+        if not values or not name or len(name) > _MAX_BONUS_NAME_CHARS:
+            continue
+        used = _safe_float(values[0])
+        total = _safe_float(values[1])
+        days_left = _safe_int(values[2])
+        if (
+            used is None
+            or total is None
+            or days_left is None
+            or used < 0
+            or total <= 0
+            or used > _MAX_BONUS_CREDITS
+            or total > _MAX_BONUS_CREDITS
+            or days_left > _MAX_BONUS_DAYS_LEFT
+            or not name.isprintable()
+        ):
+            continue
+        bonus_credits.append({"name": name, "used": used, "total": total, "days_left": days_left})
+        if len(bonus_credits) >= _MAX_BONUS_GRANTS:
+            break
+    # Preserve an observed empty section as an explicit empty list, so callers
+    # can distinguish "no active grants" from an output format with no section.
+    if in_bonus_section:
+        result["bonus_credits"] = bonus_credits
     return result
 
 
@@ -467,6 +510,13 @@ def _redact_strings(value: object) -> object:
     return value
 
 
+def _publish_usage(payload: dict[str, object]) -> None:
+    """Atomically replace the cache served by ``/api/sessions/usage``."""
+    global _usage_cache, _usage_cache_ts
+    _usage_cache = payload
+    _usage_cache_ts = time.time()
+
+
 def _cache_transient_failure() -> None:
     """Record a transient usage-fetch failure without blanking the pill.
 
@@ -506,11 +556,10 @@ def _wrap_argv_at_configured_tier(argv: list[str]) -> tuple[list[str], str | Non
     ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
     only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
     shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
-    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
-    misclassification skips the delegation branch — and with it the credential-env
-    scrub — so the child would inherit the sensitive environment. Both callers
-    here spawn kiro-cli by construction, and both ACP spawn paths pass the same
-    flag for the same reason.
+    read as "not kiro-cli". The positive classification is also the security gate
+    for default Windows delegation to Kiro's internal sandbox; basename inference
+    cannot grant it. Both callers here spawn kiro-cli by construction, and both ACP
+    spawn paths pass the same flag for the same reason.
     """
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
@@ -549,10 +598,10 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
         # Configured tier, not a hardcoded "standard": this is the same binary
         # chat spawns, so it must not demand stricter isolation than chat does.
         # Where the operator set agent.sandbox="off" (isolation deferred to
-        # kiro-cli's own internal sandbox) on a host with no backend, the pinned
-        # "standard" fail-closed and silently dropped the identity this readout
-        # labels the credit numbers with — failure here is non-fatal by design,
-        # so the symptom is a permanently blank email, not an error.
+        # kiro-cli's own internal sandbox), the pinned "standard" tier could
+        # silently diverge from chat and drop the identity this readout labels the
+        # credit numbers with. The explicit Kiro classification also lets the
+        # default Windows tier delegates through Kiro's internal sandbox.
         # Off the loop: see _wrap_argv_at_configured_tier for the two blocking reads.
         argv, cleanup = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), _wrap_argv_whoami, kiro_bin
@@ -562,6 +611,7 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrub_agent_subprocess_env(),
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
         raw = (out or err or b"").decode(errors="replace")
@@ -601,7 +651,7 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
         if m:
             out_map["_profile_arn"] = m.group(0)[:200]
         return out_map
-    except (asyncio.TimeoutError, json.JSONDecodeError, ValueError, OSError):
+    except (asyncio.TimeoutError, ValueError, OSError):
         logger.debug("whoami identity fetch failed", exc_info=True)
         return {}
     except Exception:
@@ -666,8 +716,7 @@ async def _fetch_usage_bg() -> None:
         if not kiro_bin:
             # kiro-cli absent (non-Kiro provider): cache an unavailable marker so
             # the dashboard hides the credit pill instead of polling forever.
-            _usage_cache = {"available": False}
-            _usage_cache_ts = time.time()
+            _publish_usage({"available": False})
             return
         # Identity FIRST, because it is the anchor for credential selection.
         # ``whoami`` is kiro-cli's own account, and it costs no credits; passing
@@ -675,6 +724,23 @@ async def _fetch_usage_bg() -> None:
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
+        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
+        # enum variant ``ApiKey``; the compare normalizes case and strips
+        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
+        # still fails fast instead of silently regressing to the slow path —
+        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
+        # would spend its full timeout walking credential stores that cannot
+        # contain one, and the billed text scrape is no better a source. The
+        # ``reason`` rides the existing unavailable-marker shape so the
+        # frontend can say WHY instead of hiding the pill without explanation.
+        account_type = identity.get("account_type")
+        if (
+            isinstance(account_type, str)
+            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+        ):
+            _publish_usage({"available": False, "reason": "api_key_auth"})
+            logger.info("Kiro usage: not available under API key auth; skipping fetch")
+            return
         raw_arn = identity.get("_profile_arn")
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
@@ -712,8 +778,7 @@ async def _fetch_usage_bg() -> None:
                 api_usage.update(
                     {k: _redact_strings(v) for k, v in identity.items() if not k.startswith("_")}
                 )
-            _usage_cache = api_usage
-            _usage_cache_ts = time.time()
+            _publish_usage(api_usage)
             logger.info(
                 "Kiro usage refreshed (api): %s / %s credits",
                 api_usage.get("credits_used", "?"),
@@ -762,6 +827,7 @@ async def _fetch_usage_bg() -> None:
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrub_agent_subprocess_env(),
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
         raw = (out or err or b"").decode(errors="replace")
@@ -812,8 +878,7 @@ async def _fetch_usage_bg() -> None:
             parsed.update(
                 {k: _redact_strings(v) for k, v in fresh_identity.items() if not k.startswith("_")}
             )
-            _usage_cache = parsed
-            _usage_cache_ts = time.time()
+            _publish_usage(parsed)
             logger.info(
                 "Kiro usage refreshed (text): %s credits used",
                 parsed.get("credits_used", "?"),
@@ -894,6 +959,43 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     return web.json_response({"usage": _usage_cache})
 
 
+def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
+    """Every transcript key and filename stem a live slot could be reading.
+
+    A session in this set is reachable as an open tab. That single fact drives
+    two callers: the bulk delete must not touch it, and the Older-sessions list
+    must not repeat it (that list is the complement of the open tabs above it).
+
+    Resolved FROM the slot, never derived from its name. A channel-born slot's
+    transcript is its ``linked_session_key`` (``slack:<ts>``), so a hand-built
+    ``dashboard:<slot>`` name would miss every channel tab. ``list_sessions``
+    reports filename STEMS, so each candidate contributes its key AND its stem:
+    ``_safe_key`` is the function that produced the filename, and a single-colon
+    replace would leave a multi-colon channel key like
+    ``discord:kirocrew:direct:123`` mapped to a stem that does not exist.
+
+    Both candidates are included because a slot's write target and its DISPLAY
+    source can differ: a channel tab the dashboard could not bind runs under
+    ``dashboard:<stem>`` while the conversation on screen lives in the channel
+    transcript. Choosing between them would make the answer depend on provenance
+    resolving correctly, and provenance is exactly what a legacy transcript
+    cannot supply. Both names belong to the SAME slot, so covering both is safe
+    in either direction — it can only protect, or hide, a transcript that one
+    slot could itself be showing.
+    """
+    from kiro_crew.dashboard.chat_utils import slot_history_key, slot_transcript_key
+    from kiro_crew.history import _safe_key
+
+    keys: set[str] = set()
+    # Snapshot the values: a concurrent turn can add or remove a slot while this
+    # iterates, and a dict mutated mid-iteration raises.
+    for slot in list(state._slots.values()):
+        for candidate in (slot_history_key(slot), slot_transcript_key(slot.key)):
+            keys.add(candidate)
+            keys.add(_safe_key(candidate))
+    return keys
+
+
 async def api_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list conversation session files.
 
@@ -903,6 +1005,12 @@ async def api_sessions(request: web.Request) -> web.Response:
       - ``preview``: when truthy, attach a redacted last-message ``preview``
         to each returned session (bounded tail read; page-scoped so the
         default list stays a cheap metadata scan)
+      - ``exclude_open``: when truthy, drop sessions a live slot already holds
+        open. Opt-in, not the default: the full inventory is what the memory
+        "Consolidate all" action and the command palette's recents read, and
+        both would silently skip the user's active conversations if this
+        endpoint decided on their behalf. Only the caller rendering the
+        complement of the open tabs asks for it.
 
     Returns ``{sessions, total, has_more}`` for pagination.
     """
@@ -918,18 +1026,46 @@ async def api_sessions(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
-    all_sessions = state.conversation_log.list_sessions()
+    exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
+    # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
+    # the event loop freezes chat, heartbeat, and every other coroutine for the
+    # full duration. Offload to a worker thread (#3057).
+    all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
+    if exclude_open:
+        open_keys = _open_slot_transcript_keys(state)
+        # Fold through ``_canonical_key`` as well: ``list_sessions`` deduplicates
+        # by canonical name but reports the RAW stem of whichever file won on
+        # mtime, so a resume round-trip's ``dashboard_dashboard_<name>`` file
+        # reaches here under a name no slot ever produces. Without the fold that
+        # session is listed as a second, separate conversation.
+        canon = state.conversation_log._canonical_key
+        all_sessions = [
+            s
+            for s in all_sessions
+            if s.get("key", "") not in open_keys and canon(s.get("key", "")) not in open_keys
+        ]
+    # Count AFTER the exclusion so the page, ``total`` and ``has_more`` describe
+    # one list. The client advances its offset by the number of rows it received,
+    # so filtering on its side instead would skip or repeat rows across pages.
     total = len(all_sessions)
     page = all_sessions[offset : offset + limit]
     if want_preview:
         log = state.conversation_log
 
         def _attach_previews(sessions: list[dict]) -> None:
+            def _sanitize(text: str) -> str:
+                # Injected so redaction runs BEFORE the preview's length cap:
+                # a credential split by truncation leaves a partial token the
+                # patterns cannot match, letting its raw prefix through.
+                text, _ = _h.redact_exfiltration_urls(text)
+                text, _ = _h.redact_credentials(text)
+                return text
+
             for s in sessions:
-                preview = log.last_message_preview(s.get("key", ""))
+                preview = log.last_message_preview(s.get("key", ""), sanitize=_sanitize)
                 if preview:
-                    preview, _ = _h.redact_exfiltration_urls(preview)
-                    preview, _ = _h.redact_credentials(preview)
                     s["preview"] = preview
 
         # Tail reads are sync file IO — keep them off the event loop.
@@ -990,7 +1126,7 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     meta = await loop.run_in_executor(None, log.get_metadata, key)
     # Defense in depth: never summarize an incognito/temporary session even if a
     # caller somehow passes its key.
-    if str(meta.get("memory_mode", "")).lower() in INCOGNITO_MEMORY_MODES:
+    if is_incognito_transcript(meta.get("memory_mode")):
         return ""
     # Cache: a summary persisted in a sidecar file is reusable as long as the
     # session file hasn't changed since it was generated. session_mtime advances
@@ -1000,6 +1136,10 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     # (never the session JSONL) so summarizing an *active* session never rewrites
     # its log and cannot lose a concurrently-appended message.
     sig = await loop.run_in_executor(None, log.session_mtime, key)
+    # Captured WITH the signature: a rewrite during the model call below
+    # preserves the mtime while advancing this counter, and stamping the new
+    # content identity onto the older summary would bless it as fresh.
+    generation = await loop.run_in_executor(None, log.rotation_generation, key)
     cached = await loop.run_in_executor(None, log.get_cached_summary, key)
     if cached:
         return str(cached)
@@ -1033,7 +1173,7 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         try:
             await loop.run_in_executor(
                 None,
-                functools.partial(log.set_cached_summary, key, summary, sig),
+                functools.partial(log.set_cached_summary, key, summary, sig, generation),
             )
         except Exception:
             logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
@@ -1122,7 +1262,13 @@ async def api_session_detail(request: web.Request) -> web.Response:
     key = request.match_info["key"]
     if not state.conversation_log:
         return web.json_response([])
-    return web.json_response(state.conversation_log.read_messages(key))
+    # read_messages() opens and parses the transcript on a cache miss, which for
+    # the multi-MB sessions a long-lived store accumulates is 100-300 ms of
+    # blocking file IO — on the event loop, stalling every other request. Off the
+    # loop, like every other conversation_log read in this module (list_sessions,
+    # get_metadata, session_mtime, search_sessions, delete_session).
+    messages = await asyncio.to_thread(state.conversation_log.read_messages, key)
+    return web.json_response(messages)
 
 
 async def api_session_delete(request: web.Request) -> web.Response:
@@ -1177,6 +1323,23 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
         slot = state._slots.pop(normalized, None)
     if slot:
         pin_slot_keys.add(slot.key)
+    # Crew persists independently of the transcript, so a permanent delete has to
+    # reach into it too: its durable queue holds the user's own request texts and
+    # its dispatched subagents keep running whether or not a tab is open. Purging
+    # every candidate key rather than just the slot's, because the slot may already
+    # be gone (closed tab, restart) while the store on disk is not.
+    crew = getattr(state, "crew", None)
+    if crew is not None:
+        # Deferred: `handlers.sessions` loads with the dashboard package, which the
+        # gateway imports on its boot path. Crew is dashboard-only, and a delete
+        # with no live crew never needs the class at all.
+        from kiro_crew.crew_chat import CrewOrchestrator
+    if crew is not None and isinstance(crew, CrewOrchestrator):
+        for candidate in pin_slot_keys:
+            try:
+                await crew.purge_slot(candidate)
+            except Exception:
+                logger.warning("History delete: crew purge failed for %s", candidate, exc_info=True)
     try:
         await state.remove_chat_pins_for_slots(pin_slot_keys)
     except Exception:
@@ -1213,6 +1376,60 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             await state.sessions.destroy(effective_session_key(slot))
         except Exception:
             pass
+    # The work ledger persists independently of the transcript too, and its
+    # content is disposable intermediate state (nothing reconstructs from it),
+    # so a permanent delete reaps it unconditionally. Runs LAST — after the
+    # slot's turn is cancelled and its session destroyed — so an in-flight
+    # ledger write from the dying turn cannot land after the purge; a write
+    # racing in from another process can at worst recreate an orphan directory
+    # the next delete sweeps (see session_ledger.purge). Tab close
+    # (api_chat_slot_delete) deliberately does NOT reach here: the ledger is
+    # part of a session's resumable state.
+    ledger_candidates = set(pin_slot_keys)
+    if slot is not None:
+        # The AUTHORITATIVE session key: a channel-born slot runs the
+        # channel's own session, whose exact key (the ledger's identity) may
+        # appear in pin_slot_keys only as a folded spelling.
+        try:
+            from kiro_crew.dashboard.chat_utils import effective_session_key
+
+            ledger_candidates.add(effective_session_key(slot))
+        except Exception:
+            pass
+    exact_keys = {session_ledger.ledger_key(k) for k in ledger_candidates if k}
+    for candidate in exact_keys:
+        try:
+            await asyncio.to_thread(session_ledger.purge, candidate)
+        except Exception:
+            logger.warning("History delete: ledger purge failed for %s", candidate, exc_info=True)
+    # Breadcrumb sweep: a channel session's ledger is keyed by its EXACT
+    # session key, but a slotless delete only holds the folded transcript
+    # spelling — match each ledger's breadcrumb under the same fold so the
+    # exact-key ledger cannot outlive its session.
+    folded_keys = {_normalize_slot_key(k) for k in ledger_candidates if k}
+    try:
+        await asyncio.to_thread(
+            session_ledger.purge_matching, exact_keys, folded_keys, _normalize_slot_key
+        )
+    except Exception:
+        logger.warning("History delete: ledger sweep failed for %s", key, exc_info=True)
+    # The per-session compaction-threshold override dies with permanent
+    # deletion, and ``destroy()`` above only runs when a LIVE slot exists — a
+    # slotless delete of archived history would otherwise leave the override
+    # for a deterministic (channel) key to be silently inherited by a
+    # recreated session. Same fold-matching sweep as the ledger purge; safe to
+    # run unconditionally (the slot path's destroy already popped its entry).
+    try:
+        raw_candidates = set(pin_slot_keys) | {key}
+        dropped = state.sessions.drop_autocompact_overrides_matching(
+            raw_candidates | folded_keys,
+            {_normalize_slot_key(k) for k in raw_candidates} | folded_keys,
+            _normalize_slot_key,
+        )
+        if dropped:
+            logger.info("History delete: dropped %d autocompact override(s) for %s", dropped, key)
+    except Exception:
+        logger.warning("History delete: override sweep failed for %s", key, exc_info=True)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
@@ -1226,59 +1443,35 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
 
-    from kiro_crew.dashboard.chat_utils import slot_history_key, slot_transcript_key
-    from kiro_crew.history import _safe_key
+    # Bind after the None guard so mypy's narrowing carries into the closure.
+    log = state.conversation_log
 
-    protected: set[str] = set()
-    for slot in state._slots.values():
-        # Protect EVERY transcript this slot could be reading, not just the one
-        # it currently writes. ``list_sessions`` reports filename stems, so each
-        # candidate contributes its key AND its stem: ``_safe_key`` is the
-        # function that produced the filename, and a single-colon replace would
-        # leave a multi-colon channel key like ``discord:kirocrew:direct:123``
-        # mapped to a stem that does not exist, putting a live conversation
-        # outside ``protected`` so this bulk delete removes it.
-        #
-        # The union matters because a slot's write target and its DISPLAY source
-        # can differ: a channel tab the dashboard could not bind runs under
-        # ``dashboard:<stem>`` while the conversation on screen lives in the
-        # channel transcript. Choosing between them here would make deletion
-        # depend on provenance resolving correctly, and provenance is exactly
-        # what a legacy transcript cannot supply. Protection only ever PREVENTS
-        # a delete, so covering both candidates is the safe direction: the worst
-        # case is that Clear All skips a transcript nobody is reading.
-        for candidate in (slot_history_key(slot), slot_transcript_key(slot.key)):
-            protected.add(candidate)
-            protected.add(_safe_key(candidate))
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). Offload to keep the event loop responsive.
+    all_sessions = await asyncio.to_thread(log.list_sessions)
 
-    sessions = state.conversation_log.list_sessions()
     count = 0
     skipped = 0
     failed = 0
     cleanup_tasks = []
-    for s in sessions:
+    for s in all_sessions:
         key = s["key"]
-        if key in protected:
+
+        # Re-check per iteration: a resume publishing a slot during the
+        # list_sessions scan OR during an earlier delete-await now appears here.
+        if key in _open_slot_transcript_keys(state):
             skipped += 1
             continue
+
         try:
-            meta = state.conversation_log.get_metadata(key)
-        except Exception:
-            logger.warning(
-                "api_sessions_clear: unreadable metadata for %s, skipping", key, exc_info=True
-            )
-            skipped += 1
-            continue
-        if not isinstance(meta, dict):
-            skipped += 1
-            continue
-        if meta.get("pinned"):
-            skipped += 1
-            continue
-        try:
-            # delete_session enters _locked (flock + os.close) — offload off the
-            # event loop so a wedged peer can't stall the bulk clear on it.
-            if await asyncio.to_thread(state.conversation_log.delete_session, key):
+            # Offload off the event loop — delete_session enters _locked (flock).
+            # skip_pinned=True makes the pin-check-and-delete atomic so a
+            # concurrent pin cannot sneak in between the metadata read and the
+            # unlink. The invariant (lock, real test) now lives in history.py.
+            result = await asyncio.to_thread(log.delete_session, key, skip_pinned=True)
+            if result is None:
+                skipped += 1
+            elif result:
                 cleanup_tasks.append(_remove_slot_for_history_key(state, key))
                 count += 1
             else:
@@ -1307,16 +1500,84 @@ async def api_approvals(request: web.Request) -> web.Response:
 
 
 async def api_approval_resolve(request: web.Request) -> web.Response:
-    """POST /api/approvals/{id}/{action} — approve or reject."""
+    """POST /api/approvals/{id}/{action} — approve, reject, or reject_once."""
     state: DashboardState = request.app["state"]
     approval_id = request.match_info["id"]
     action = request.match_info["action"]
-    if action not in ("approve", "reject"):
+    if action not in ("approve", "reject", "reject_once"):
         return web.json_response({"error": "invalid action"}, status=400)
-    ok = state.resolve_approval(approval_id, action == "approve")
+    ok = state.resolve_approval(
+        approval_id, action == "approve", rejected_once=action == "reject_once"
+    )
     if not ok:
         return web.json_response({"error": "not found or expired"}, status=404)
     return web.json_response({"ok": True})
+
+
+async def api_session_directive(request: web.Request) -> web.Response:
+    """POST /api/session-directive — park a validated session directive.
+
+    The provider-neutral leg of the session-directive protocol. Its only caller is
+    a Kiro Crew directive tool (``mcp_tools.control._emit_directive``), which has
+    already validated the payload; this route carries that payload to the gateway
+    OUT OF BAND so the turn's consumer can apply it without having to trust the
+    model-visible marker in the tool result. See
+    :mod:`kiro_crew.dashboard.directive_queue` for why that is not weaker than the
+    marker gate it backs up.
+
+    Authenticated via X-Internal-Secret, and the session is selected by the
+    X-Session-Key header every MCP subprocess already sends — the SAME shape as
+    ``api_session_keepalive``. The header is not taken on faith: on the unix
+    socket ``token_auth`` kernel-verifies the peer and denies 403 when it resolves
+    to a session key other than the declared one, which is the check that stops a
+    caller parking a directive against somebody else's session.
+
+    Unknown ``kind`` is a 400, not a silent drop: the only legitimate callers are
+    Kiro Crew's own directive tools, so an unrecognized kind means the request did
+    not come from one and the caller should hear about it.
+    """
+    # Re-assert the caller's locality BEFORE the header is read. The route is in
+    # server.py's strict allowlist, but a ``local_only=False`` deployment
+    # reclassifies strict paths as MIXED — so the auth middleware also admits a
+    # cookie/token-authenticated browser caller here, and such a caller picks its
+    # own ``X-Session-Key``. That is somebody else's session: a parked record is
+    # applied verbatim by the next consumer frame in the named turn, so accepting
+    # it would hand a remote cookie holder a cross-session mutation (arm a loop,
+    # retarget a project). ``internal_auth`` is set only after a constant-time
+    # ``X-Internal-Secret`` match on a same-machine transport; ``peer_verified``
+    # only after the kernel-attested AF_UNIX peer resolved to the DECLARED key —
+    # either one is positive proof of a local caller, and a cookie carries
+    # neither. Same predicate as ``handlers/updates.py``'s host-locality gate.
+    if not (request.get("internal_auth") or request.get("peer_verified")):
+        return web.json_response(
+            {"error": "local caller required", "code": "not_local_caller"},
+            status=403,
+        )
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "session_key_required"},
+            status=400,
+        )
+    body: dict = {}
+    try:
+        if request.can_read_body:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+    except Exception:
+        return web.json_response(
+            {"error": "malformed JSON body", "code": "invalid_body"}, status=400
+        )
+    kind = str(body.get("kind") or "").strip()
+    args = body.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        record_id = directive_queue.publish(session_key, kind, args)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_directive"}, status=400)
+    return web.json_response({"ok": True, "id": record_id})
 
 
 async def api_session_keepalive(request: web.Request) -> web.Response:
@@ -1371,8 +1632,68 @@ async def api_session_keepalive(request: web.Request) -> web.Response:
     reply: dict = {"ok": True}
     wait_id = str(body.get("wait_id") or "").strip()[:64]
     if wait_id:
-        _service_wait_ping(state, session_key, wait_id, body, reply)
+        _service_wait_ping(state, session_key, wait_id, body, reply, provider)
     return web.json_response(reply)
+
+
+def _wait_end_reason(slot, wait_id: str, provider: Any) -> str | None:
+    """Why this sleep should return early, or None to keep sleeping.
+
+    Exactly two reasons, and the narrowness is the design:
+
+    ``"user"``
+        The End-wait button parked an explicit request naming this ``wait_id``.
+
+    ``"steer"``
+        A mid-turn steer reached the backend AFTER this sleep began. kiro-cli
+        can only inject a steer at a model-inference boundary and an in-flight
+        tool call is the absence of one, so without this the user's correction
+        sits in the backend's steer queue until the sleep elapses — up to the
+        tool's 1800s ceiling — while the agent sleeps through it.
+
+    "After this sleep began" is decided by comparing the provider's steer stamp
+    against the reading taken when this sleep was minted, so the handler reads
+    no clock of its own: the only two values ever compared are two readings of
+    the same monotonic source. That is deliberate — a wall-clock stamp on one
+    side and a monotonic one on the other is how a suspend silently reorders
+    the comparison.
+
+    Re-taking the baseline at every mint is also what makes the reason fire
+    once. A steer the backend has accepted but not yet injected stays newer
+    than nothing at all, so without a per-sleep baseline it would end sleep
+    after sleep for the rest of the turn and hand the model a `wait` that
+    returns instantly.
+
+    Not extended to the other long block on this route. ``spawn_sub_agents``
+    can wait 7200s on live sub-agents and pings the same endpoint, but sends no
+    ``wait_id`` and so never reaches this decision — an exclusion worth keeping
+    deliberately: ending a sleep discards nothing, while cutting a sub-agent
+    collection short orphans work that keeps running with nobody left to read
+    its results.
+    """
+    if slot._end_wait_request and slot._end_wait_request == wait_id:
+        return "user"
+    tracked = slot._wait_state or {}
+    if tracked.get("wait_id") != wait_id:
+        # Not the sleep this slot is tracking (contested identity, stale ping).
+        return None
+    steered_at = _provider_steer_stamp(provider)
+    return "steer" if steered_at > slot._wait_steer_baseline else None
+
+
+def _provider_steer_stamp(provider: Any) -> float:
+    """Monotonic time of the session's last steer, 0.0 when never steered or
+    when the provider does not expose one (a non-kiro backend, a test double).
+
+    Read through ``getattr`` rather than an interface method because this route
+    is reached by every backend, and a missing stamp must read as "no steer" —
+    the direction that keeps sleeping — rather than raise on the keepalive that
+    stops the watchdog killing the session mid-sleep.
+    """
+    try:
+        return float(getattr(provider, "last_steer_monotonic", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _service_wait_ping(
@@ -1381,13 +1702,14 @@ def _service_wait_ping(
     wait_id: str,
     body: dict,
     reply: dict,
+    provider: Any = None,
 ) -> None:
     """Track an in-flight `wait` sleep and hand back any early-end request.
 
-    Mutates ``reply`` in place, adding ``end_wait`` when the user asked to end
-    this exact wait. Silent no-op when the calling session has no dashboard tab
-    (a Slack/cron session can call `wait` too — it just has nothing to render a
-    countdown on).
+    Mutates ``reply`` in place, adding ``end_wait`` when the sleep should return
+    early (see :func:`_wait_end_reason`). Silent no-op when the calling session
+    has no dashboard tab (a Slack/cron session can call `wait` too — it just has
+    nothing to render a countdown on).
     """
     # Local import: this module's other chat_utils uses are function-local for
     # the same circular-import reason (handlers/__init__ re-exports this module).
@@ -1413,6 +1735,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             state.push_slots_update()
         return
     # ── Ambiguous-identity guard ──
@@ -1444,6 +1767,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             state.push_slots_update()
         return
     prev = slot._wait_state
@@ -1453,6 +1777,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             logger.info("two concurrent waits share session %s; countdown suppressed", session_key)
             state.push_slots_update()
             return
@@ -1476,21 +1801,58 @@ def _service_wait_ping(
         }
         # A brand-new wait cannot inherit an end request aimed at an older one.
         slot._end_wait_request = None
+        # Baseline for the steer reason: re-read on every mint, so only a steer
+        # that lands after THIS sleep began can end it. No clock read here —
+        # the baseline and the later comparison are two readings of the same
+        # provider stamp.
+        slot._wait_steer_baseline = _provider_steer_stamp(provider)
         slot._wait_last_ping = now
         state.push_slots_update()
     else:
         # Heartbeat only. Held OFF the wire payload so the deadline the browser
         # counts down against stays byte-identical between pushes.
         slot._wait_last_ping = now
-    if slot._end_wait_request and slot._end_wait_request == wait_id:
+    reason = _wait_end_reason(slot, wait_id, provider)
+    if reason is not None:
         # Consume exactly once. Leaving it set would make the NEXT wait in this
         # session return instantly, which is the failure mode a session-scoped
         # boolean flag would have had.
         slot._end_wait_request = None
         slot._wait_state = None
         slot._wait_last_ping = 0.0
+        slot._wait_steer_baseline = 0.0
         reply["end_wait"] = wait_id
+        logger.info("wait ending early for %s (reason=%s)", session_key, reason)
         state.push_slots_update()
+
+
+def _read_managed_tool_policy_sync(agent_path: Path) -> dict[str, Any] | None:
+    """Read one agent's ``managedToolPolicy`` from disk. Blocking.
+
+    Split out so the whole filesystem transaction -- the existence probe, the
+    read and the JSON parse -- crosses to a worker as ONE unit. Offloading only
+    the read would leave the ``stat`` and the parse on the gateway's single event
+    loop, which is the same defect in a smaller form.
+
+    ``None`` means "no policy to report", and is deliberately distinct from an
+    empty dict. The caller answers ``{}`` for both, but only a dict is an agent
+    whose config was read and understood, which is what its SEL ``ok`` record
+    attests -- an unreadable or malformed file is not an agent with no policy.
+    Collapsing the two would start logging success for files this never parsed.
+    """
+    try:
+        if not agent_path.is_file():
+            return None
+        config = json.loads(agent_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        # Valid JSON that is not an object (a list, a scalar, null) parses
+        # fine, but `.get` on it would raise. It is a malformed spec, so it
+        # takes the same disposition as the unparseable case above.
+        return None
+    policy = config.get("managedToolPolicy", {})
+    return policy if isinstance(policy, dict) else None
 
 
 async def api_session_tool_policy(request: web.Request) -> web.Response:
@@ -1560,18 +1922,15 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid agent name"}, status=400)
 
-    # Read agent config from disk
+    # Read agent config from disk, OFF the event loop. A managed MCP server
+    # calls this to filter its tool list, so it runs on ordinary request traffic
+    # rather than at startup: the stat, the read and the parse would otherwise
+    # execute on the single loop every gateway request shares.
     agent_path = kiro_agents_dir() / f"{agent_name}.json"
-    if not agent_path.is_file():
-        return web.json_response({})
-
-    try:
-        config = json.loads(agent_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return web.json_response({})
-
-    policy = config.get("managedToolPolicy", {})
-    if not isinstance(policy, dict):
+    policy = await asyncio.to_thread(_read_managed_tool_policy_sync, agent_path)
+    if policy is None:
+        # Missing, unreadable, malformed, or a non-dict policy: answer the same
+        # empty policy as before and, as before, do not log it as a success.
         return web.json_response({})
 
     _sel().log_api_access(
@@ -1622,8 +1981,6 @@ async def _reset_all_sessions(request: web.Request) -> int:
         if providers:
 
             async def _safe_shutdown(p: LLMProvider) -> None:
-                import kiro_crew.dashboard.handlers as _h  # noqa: F811
-
                 _timeout = _SHUTDOWN_TIMEOUT_SECS
                 try:
                     await asyncio.wait_for(p.shutdown(), timeout=_timeout)
@@ -1665,26 +2022,24 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     installed servers (e.g. via AIM) are picked up on restart.
     """
     # Sync MCP servers before restarting so new installs take effect.
-    # Run in thread — discover/sync do blocking file I/O and subprocess calls.
-    # Cap at 30s so a hung kiro-cli subprocess doesn't stall the restart.
+    # Run in thread — the sync does blocking file I/O. Cap at 30s so a hung
+    # rebuild doesn't stall the restart. sync_discovered_servers serializes
+    # against the /api/mcp/sync handler's run of the same sequence.
     synced = 0
+    sync_ok = True
     try:
-
-        async def _sync() -> int:
-            to_sync = await asyncio.to_thread(discover_servers_to_sync)
-            if to_sync:
-                ok: bool = await asyncio.to_thread(sync_to_agent_config, to_sync)
-                # Register for CC unconditionally (CC uses its own .mcp.json)
-                await asyncio.to_thread(register_servers_for_cc, to_sync)
-                if ok:
-                    return len(to_sync)
-            return 0
-
-        synced = await asyncio.wait_for(_sync(), timeout=30)
+        to_sync = await asyncio.wait_for(asyncio.to_thread(sync_discovered_servers), timeout=30)
+        synced = len(to_sync)
     except Exception:
+        # The restart still proceeds (it applies whatever IS on disk), but the
+        # response says the reconcile failed rather than reporting a success
+        # the on-disk config does not back.
+        sync_ok = False
         logger.warning("MCP server sync failed before restart", exc_info=True)
     count = await _reset_all_sessions(request)
-    return web.json_response({"ok": True, "sessions_reset": count, "mcp_synced": synced})
+    return web.json_response(
+        {"ok": True, "sessions_reset": count, "mcp_synced": synced, "mcp_sync_ok": sync_ok}
+    )
 
 
 async def api_session_archive_list(request: web.Request) -> web.Response:

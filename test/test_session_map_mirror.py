@@ -9,17 +9,28 @@ Slack ``ChannelLink`` without needing migration.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import asyncio
+import logging
+import threading
+import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from kiro_crew.messaging.link import (
+    UNBIND_REASON_PRUNED_STALE,
+    UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     legacy_dashboard_mirror_key,
     release_conversation_location,
 )
 from kiro_crew.session import SessionManager, _opt_out_key
-from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG, ConversationOwnershipConflict, SessionMap
+from kiro_crew.session_map import (
+    MIRROR_OPT_OUT_FLAG,
+    ConversationOwnershipConflict,
+    SessionMap,
+    set_unbind_listener,
+)
 
 
 @pytest.fixture()
@@ -382,6 +393,71 @@ class TestPrunePreservesMirror:
             pruned = sm.prune()
             assert pruned == 0
             assert sm.get_mirror_link("dashboard:chat-1") is not None
+
+    def test_stale_sid_repairs_a_resume_binding_instead_of_dropping_it(self, tmp_path):
+        """A restart after kiro-cli collected the session file must not unlink.
+
+        The entry is stale by the ``sid`` predicate, but it carries the inbound
+        resume binding: delete it and the next message from that channel falls
+        back to the channel's own session instead of resuming the linked one.
+        """
+        key = "dashboard:chat-1"
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+            sm.set(key, "sid-that-no-longer-exists")
+            sm.set_mirror_link(key, link, accepts_inbound=True)
+            assert sm.prune() == 0
+            assert sm.get_mirror_link(key) == link
+            assert sm.mirror_accepts_inbound(key) is True
+            assert (sm._data.get(key) or {}).get("sid") == ""
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+        # The repair reached disk, so the next startup does not redo it.
+        assert reloaded.get_mirror_link(key) == link
+        assert reloaded.mirror_accepts_inbound(key) is True
+        assert not (reloaded._data.get(key) or {}).get("sid")
+
+    def test_stale_sid_repairs_a_slack_thread_binding(self, tmp_path):
+        """Same branch for Slack, whose binding lives in the dedicated fields.
+
+        The thread has to keep resolving to this session after the restart, or
+        the next reply in it starts a new conversation.
+        """
+        key = "dashboard:chat-1"
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+            sm.set(key, "sid-that-no-longer-exists")
+            sm.set_slack_link(key, "1700000000.000100", "C123")
+            assert sm.prune() == 0
+            assert (sm._data.get(key) or {}).get("sid") == ""
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+        assert reloaded.get_session_for_thread("1700000000.000100") == key
+        assert not (reloaded._data.get(key) or {}).get("sid")
+
+    def test_stale_sid_with_no_binding_is_still_collected(self, tmp_path):
+        """Repair is for entries that carry state; a bare stale row is garbage."""
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+            sm.set("dashboard:chat-1", "sid-that-no-longer-exists")
+            assert sm.prune() == 1
+            assert "dashboard:chat-1" not in sm._data
+
+    def test_a_live_sid_with_a_mirror_is_left_alone(self, tmp_path):
+        """Prune only touches entries whose session file is gone."""
+        key = "dashboard:chat-1"
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+            sm.set(key, "sid-alive")
+            sm.set_mirror_link(key, link, accepts_inbound=True)
+            with patch("kiro_crew.session_map._kiro_sessions_dir", return_value=tmp_path):
+                (tmp_path / "sid-alive.json").write_text("{}", encoding="utf-8")
+                assert sm.prune() == 0
+            assert (sm._data.get(key) or {}).get("sid") == "sid-alive"
+            assert sm.get_mirror_link(key) == link
+            assert sm.mirror_accepts_inbound(key) is True
 
 
 class TestPersistence:
@@ -806,3 +882,482 @@ class TestAutomaticMirrorOptOut:
         # The repair reached disk, so the next startup does not redo it.
         assert reloaded.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
         assert not (reloaded._data.get(key) or {}).get("sid")
+
+
+INBOUND_LINK = ChannelLink(channel_type="discord", channel_id="chan-1")
+
+
+@pytest.fixture()
+def unbind_calls():
+    """Capture ``(key, link, reason)`` per announced removal, then unregister.
+
+    The listener registry is module-level (a removal performed through a
+    throwaway map must still be announced), so it is restored unconditionally —
+    a leaked listener would fire on every later test in this worker.
+    """
+    calls: list[tuple[str, ChannelLink, str]] = []
+    set_unbind_listener(lambda key, link, reason: calls.append((key, link, reason)))
+    try:
+        yield calls
+    finally:
+        set_unbind_listener(None)
+
+
+@pytest.fixture()
+def sel_events():
+    """Capture every SEL event the map emits during a removal."""
+    with patch("kiro_crew.session_map.sel") as fake_sel:
+        fake_sel.return_value.log_api_access = MagicMock()
+        yield fake_sel.return_value.log_api_access
+
+
+def _inbound_audits(log_api_access):
+    """The inbound-unbind events among everything captured."""
+    return [
+        call.kwargs
+        for call in log_api_access.call_args_list
+        if call.kwargs.get("operation") == "session.inbound_unbind"
+    ]
+
+
+class TestInboundUnbindIsLoud:
+    """Every removal of an inbound resume binding is audited and announced.
+
+    The binding is what routes a channel message back to an existing session, so
+    losing it silently strands the conversation and nothing in the trail says which
+    removal did it. These pin the choke point rather than the call sites, so a
+    future caller inherits the behavior instead of having to remember it.
+    """
+
+    def test_clear_mirror_link_audits_and_announces(
+        self, session_map, unbind_calls, sel_events
+    ):
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        assert session_map.clear_mirror_link("dashboard:chat-1", reason="dashboard_unlink")
+
+        assert unbind_calls == [("dashboard:chat-1", INBOUND_LINK, "dashboard_unlink")]
+        audits = _inbound_audits(sel_events)
+        assert len(audits) == 1
+        assert "dashboard:chat-1" in audits[0]["resources"]
+        assert "discord:chan-1" in audits[0]["resources"]
+        assert "dashboard_unlink" in audits[0]["resources"]
+
+    def test_clear_mirror_links_at_announces_each_loser(
+        self, session_map, unbind_calls, sel_events
+    ):
+        """A location sweep can clear several sessions; each lost its own way back."""
+        plant_binding(session_map, "dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        plant_binding(session_map, "dashboard:chat-2", INBOUND_LINK, accepts_inbound=True)
+
+        cleared = session_map.clear_mirror_links_at(INBOUND_LINK, reason="user_unlink")
+
+        assert sorted(cleared) == ["dashboard:chat-1", "dashboard:chat-2"]
+        assert sorted(key for key, _, _ in unbind_calls) == [
+            "dashboard:chat-1",
+            "dashboard:chat-2",
+        ]
+        assert {reason for _, _, reason in unbind_calls} == {"user_unlink"}
+        assert len(_inbound_audits(sel_events)) == 2
+
+    @pytest.mark.parametrize(
+        "removal, reason",
+        [
+            # An explicit clear through set_mirror_link(None).
+            (lambda m, k: m.set_mirror_link(k, None, reason="dashboard_unlink"),
+             "dashboard_unlink"),
+            # An overwrite onto another location ends the old resume as thoroughly.
+            (lambda m, k: m.set_mirror_link(
+                k,
+                ChannelLink(channel_type="discord", channel_id="chan-2"),
+                accepts_inbound=True,
+                reason="origin_rebind",
+            ), "origin_rebind"),
+            # Same location, inbound flag dropped: no longer resumable.
+            (lambda m, k: m.set_mirror_link(k, INBOUND_LINK, reason="origin_rebind"),
+             "origin_rebind"),
+            # A whole-entry delete carrying its caller's reason.
+            (lambda m, k: m.delete(k, reason="session_destroyed"), "session_destroyed"),
+            # A caller that names none is recorded as unattributed, not skipped.
+            (lambda m, k: m.clear_mirror_link(k), UNBIND_REASON_UNSPECIFIED),
+        ],
+    )
+    def test_every_removal_shape_announces_with_its_reason(
+        self, session_map, unbind_calls, removal, reason
+    ):
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        removal(session_map, "dashboard:chat-1")
+
+        assert unbind_calls == [("dashboard:chat-1", INBOUND_LINK, reason)]
+
+    def test_rebinding_the_same_inbound_binding_is_not_a_removal(
+        self, session_map, unbind_calls
+    ):
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+
+        assert unbind_calls == []
+
+    def test_deleting_the_whole_entry_announces(self, session_map, unbind_calls, sel_events):
+        """A dying entry takes its binding with it, so the entry path announces too."""
+        session_map.set("dashboard:chat-1", "sid-1")
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+
+        session_map.delete("dashboard:chat-1")
+
+        assert unbind_calls == [("dashboard:chat-1", INBOUND_LINK, "entry_deleted")]
+        assert len(_inbound_audits(sel_events)) == 1
+
+    def test_prune_repairs_a_bound_entry_without_unbinding_it(self, session_map, unbind_calls):
+        """A stale sid on a bound entry clears the sid; the binding is not a casualty.
+
+        ``_survives_prune`` keeps any entry carrying a channel binding, so prune
+        cannot reach an inbound binding at all — nothing is removed, so nothing is
+        announced.
+        """
+        session_map.set("dashboard:chat-1", "sid-that-no-longer-exists")
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+
+        assert session_map.prune() == 0
+        assert session_map.get_mirror_link("dashboard:chat-1") == INBOUND_LINK
+        assert session_map.mirror_accepts_inbound("dashboard:chat-1") is True
+        assert unbind_calls == []
+
+
+class TestPruneRemovesThroughTheChokePoint:
+    """Prune's deletions are audited like every other entry removal.
+
+    ``_survives_prune`` keeps every bound entry out of prune's delete branch, so
+    today prune cannot reach a binding at all — which is precisely why this needs
+    pinning rather than leaving to inspection. Prune used to delete straight out
+    of ``_data``, so the audit and the announcement were not skipped by policy,
+    they were simply unreachable: any future loosening of that predicate would
+    have reopened a silent binding-removal path and nothing in the trail would
+    have named prune as the remover.
+    """
+
+    def test_a_pruned_binding_is_audited_and_announced(
+        self, session_map, unbind_calls, sel_events, monkeypatch
+    ):
+        """The latent path, made reachable: the removal still has to be loud."""
+        key = "dashboard:chat-1"
+        session_map.set(key, "sid-that-no-longer-exists")
+        session_map.set_mirror_link(key, INBOUND_LINK, accepts_inbound=True)
+        # Stand in for a future edit to the predicate: the entry becomes
+        # collectable while still holding the binding prune would take with it.
+        monkeypatch.setattr("kiro_crew.session_map._survives_prune", lambda entry: False)
+
+        assert session_map.prune() == 1
+        assert key not in session_map._data
+
+        audits = _inbound_audits(sel_events)
+        assert len(audits) == 1
+        assert key in audits[0]["resources"]
+        assert "discord:chan-1" in audits[0]["resources"]
+        assert UNBIND_REASON_PRUNED_STALE in audits[0]["resources"]
+        assert unbind_calls == [(key, INBOUND_LINK, UNBIND_REASON_PRUNED_STALE)]
+
+    def test_collecting_an_unbound_row_stays_silent(
+        self, session_map, unbind_calls, sel_events
+    ):
+        """The reachable case is unchanged: garbage strands nobody, so no event.
+
+        Routing prune through the choke point must not start narrating ordinary
+        collection — the audit exists for a lost binding, and a bare stale row
+        holds none.
+        """
+        session_map.set("dashboard:chat-1", "sid-that-no-longer-exists")
+
+        assert session_map.prune() == 1
+        assert "dashboard:chat-1" not in session_map._data
+        assert unbind_calls == []
+        assert _inbound_audits(sel_events) == []
+
+    @pytest.mark.asyncio
+    async def test_startup_collection_defers_the_write_off_loop(self, session_map):
+        """Prune on a running loop pays no inline whole-map write.
+
+        ``_save`` defers the disk write to a worker thread precisely so the
+        loop never blocks on serialization (its docstring cites #2405), and
+        prune's sole caller is ``start_pool`` on the startup loop. Routing
+        removals through the choke point must keep that property: per-key
+        audits, zero loop-thread writes, one coalesced flush afterwards.
+        """
+        import kiro_crew.session_map as mod
+
+        loop_thread = threading.current_thread()
+        replace_threads: list[threading.Thread] = []
+        real_replace = mod.os.replace
+
+        def _recording_replace(src, dst, **kw):
+            replace_threads.append(threading.current_thread())
+            return real_replace(src, dst, **kw)
+
+        # NOTE: mod.os IS the os module, so this patch is process-global, not
+        # module-local. Harmless under xdist process isolation; do not widen.
+        with patch.object(mod.os, "replace", side_effect=_recording_replace):
+            for n in range(5):
+                session_map.set(f"dashboard:chat-{n}", f"sid-gone-{n}")
+
+            assert session_map.prune() == 5
+            assert [t for t in replace_threads if t is loop_thread] == []
+            while True:
+                task = session_map._flush_task
+                if task is None:
+                    break
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                if task is session_map._flush_task:
+                    break
+            assert len(replace_threads) == 1
+            assert replace_threads[0] is not loop_thread
+
+    def test_a_collected_thread_binding_leaves_the_index(
+        self, session_map, monkeypatch
+    ):
+        """The reverse index cannot outlive the entry that owned the thread."""
+        key = "dashboard:chat-1"
+        session_map.set_slack_link(key, "1700000000.000100", "C123")
+        assert session_map.get_session_for_thread("1700000000.000100") == key
+        monkeypatch.setattr("kiro_crew.session_map._survives_prune", lambda entry: False)
+
+        assert session_map.prune() == 1
+        assert session_map.get_session_for_thread("1700000000.000100") is None
+
+
+class TestOutboundOnlyStaysQuiet:
+    """An outbound-only mirror routes nothing back, so losing it strands nobody."""
+
+    @pytest.mark.parametrize(
+        "setup, remove",
+        [
+            # An outbound-only mirror, cleared by key and deleted with its entry;
+            # a Slack binding (its own reverse index); and an inbound flag with no
+            # mirror, which routes nothing and so is no loss.
+            (lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
+             lambda m: m.clear_mirror_link("dashboard:chat-1")),
+            (lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
+             lambda m: m.delete("dashboard:chat-1")),
+            (lambda m: m.set_mirror_link(
+                "dashboard:chat-1",
+                ChannelLink(channel_type="slack", channel_id="C1", thread_id="ts-1"),
+             ),
+             lambda m: m.clear_mirror_link("dashboard:chat-1")),
+            (lambda m: (m._ensure_entry("dashboard:chat-1").update(
+                {"mirror_accepts_inbound": True}), m._save()),
+             lambda m: m.delete("dashboard:chat-1")),
+        ],
+    )
+    def test_losing_it_announces_nothing(
+        self, session_map, unbind_calls, sel_events, setup, remove
+    ):
+        setup(session_map)
+        remove(session_map)
+
+        assert unbind_calls == []
+        assert _inbound_audits(sel_events) == []
+
+    def test_sweeping_outbound_mirrors_does_not_announce(self, session_map, unbind_calls):
+        plant_binding(session_map, "dashboard:chat-1", INBOUND_LINK)
+        plant_binding(session_map, "dashboard:chat-2", INBOUND_LINK)
+
+        assert len(session_map.clear_mirror_links_at(INBOUND_LINK)) == 2
+        assert unbind_calls == []
+
+
+class TestAnnouncementIsBestEffort:
+    """A broken notifier or audit sink cannot fail the removal that provoked it."""
+
+    def test_listener_exception_is_swallowed_and_logged_at_warning(
+        self, session_map, caplog
+    ):
+        def _explode(key, link, reason):
+            raise RuntimeError("notifier down")
+
+        set_unbind_listener(_explode)
+        try:
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.session_map"):
+                session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+                assert session_map.clear_mirror_link("dashboard:chat-1") is True
+        finally:
+            set_unbind_listener(None)
+        # The removal still committed, and the failure is visible in production.
+        assert session_map.get_mirror_link("dashboard:chat-1") is None
+        assert any("listener failed" in r.message for r in caplog.records)
+
+    def test_manager_registers_on_the_shared_registry(self, session_map, tmp_path):
+        """A removal through a DIFFERENT map instance is announced too."""
+        calls: list[str] = []
+        _manager_over(session_map).set_unbind_listener(
+            lambda key, link, reason: calls.append(key)
+        )
+        try:
+            session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+            with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+                other = SessionMap()
+            other.clear_mirror_link("dashboard:chat-1")
+        finally:
+            set_unbind_listener(None)
+
+        assert calls == ["dashboard:chat-1"]
+
+
+class TestAuditDoesNotBlockTheLoop:
+    """The SEL write, ``sel()`` resolution included, must leave the loop free.
+
+    ``sel()`` resolves the data home, creates the log and mints the HMAC trust root
+    on its first call, and every write appends. ``SessionMap`` is called
+    synchronously from coroutines, so doing that inline stalls the gateway.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_loop_keeps_beating_while_the_audit_runs(
+        self, session_map, unbind_calls
+    ):
+        """The clear must RETURN while the sink is still blocked.
+
+        Timing the synchronous call is the only assertion that fails when ``sel()``
+        is resolved on the caller's thread: a heartbeat measured after the call
+        returns cannot tell a stall from a slow sink.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking_sel():
+            entered.set()
+            # Long enough that an inline resolution cannot finish inside the
+            # assertion below; released in the finally so nothing hangs.
+            release.wait(30)
+            return MagicMock()
+
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        try:
+            with patch("kiro_crew.session_map.sel", _blocking_sel):
+                started = time.monotonic()
+                session_map.clear_mirror_link("dashboard:chat-1", reason="dashboard_unlink")
+                elapsed = time.monotonic() - started
+                # The audit is in flight on the executor...
+                assert await asyncio.to_thread(entered.wait, 10) is True
+                # ...and the loop-side caller did not wait for it.
+                assert elapsed < 1.0, f"clear blocked the caller for {elapsed:.1f}s"
+                # The loop is still able to run work.
+                beats = 0
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                    beats += 1
+                assert beats == 5
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_an_audit_failure_is_isolated_and_logged_at_warning(
+        self, session_map, caplog
+    ):
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_map"):
+            with patch("kiro_crew.session_map.sel", side_effect=RuntimeError("sel down")):
+                # The removal still commits despite the broken sink.
+                assert session_map.clear_mirror_link("dashboard:chat-1") is True
+                for _ in range(200):
+                    if any("audit failed" in r.message for r in caplog.records):
+                        break
+                    await asyncio.sleep(0.01)
+
+        assert session_map.get_mirror_link("dashboard:chat-1") is None
+        assert any("audit failed" in r.message for r in caplog.records)
+
+    def test_off_loop_the_audit_runs_inline_exactly_once(self, session_map):
+        """With no loop to protect there is nothing to offload to."""
+        calls: list[dict] = []
+        fake = MagicMock()
+        fake.log_api_access = lambda **kw: calls.append(kw)
+
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        with patch("kiro_crew.session_map.sel", return_value=fake):
+            session_map.clear_mirror_link("dashboard:chat-1", reason="dashboard_unlink")
+
+        assert len(calls) == 1
+        assert calls[0]["operation"] == "session.inbound_unbind"
+        assert "dashboard_unlink" in calls[0]["resources"]
+
+
+class TestReasonIsNormalizedAtTheChokePoint:
+    """An unexpected reason must not reach SEL or the notice copy."""
+
+    def test_an_unknown_reason_is_normalized_and_warned(
+        self, session_map, unbind_calls, caplog
+    ):
+        session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_map"):
+            session_map.clear_mirror_link("dashboard:chat-1", reason="totally_made_up")
+
+        assert unbind_calls == [
+            ("dashboard:chat-1", INBOUND_LINK, UNBIND_REASON_UNSPECIFIED)
+        ]
+        assert any("totally_made_up" in r.getMessage() for r in caplog.records)
+
+
+class TestGetRepairsRatherThanUnbinds:
+    """``get()``'s stale-entry path must not delete a bound conversation.
+
+    Same hazard prune was corrected for: a garbage-collected session file leaves a
+    stale ``sid``, and deleting the whole entry takes the channel binding with it.
+    """
+
+    @pytest.mark.parametrize(
+        "plant, verify",
+        [
+            # A mirror binding (the inbound resume identity), a Slack thread, and a
+            # durable per-conversation SETTING — each must outlive the session.
+            (
+                lambda m, k: m.set_mirror_link(k, INBOUND_LINK, accepts_inbound=True),
+                lambda m, k: m.get_mirror_link(k) == INBOUND_LINK
+                and m.mirror_accepts_inbound(k) is True,
+            ),
+            (
+                lambda m, k: m.set_slack_link(k, "ts-1", "C1"),
+                lambda m, k: m.get_slack_link(k) == ("ts-1", "C1"),
+            ),
+            (
+                lambda m, k: m.set_flag(k, MIRROR_OPT_OUT_FLAG, True),
+                lambda m, k: m.get_flag(k, MIRROR_OPT_OUT_FLAG) is True,
+            ),
+        ],
+    )
+    def test_state_that_must_outlive_the_session_survives(
+        self, session_map, unbind_calls, plant, verify
+    ):
+        key = "dashboard:chat-1"
+        session_map.set(key, "sid-that-no-longer-exists")
+        plant(session_map, key)
+
+        assert session_map.get(key) is None
+        assert key in session_map._data
+        assert not session_map._data[key]["sid"]
+        assert verify(session_map, key)
+        # Nothing was unbound, so nothing is audited or announced.
+        assert unbind_calls == []
+
+    def test_the_repair_reaches_disk(self, session_map, unbind_calls, tmp_path):
+        key = "dashboard:chat-1"
+        session_map.set(key, "sid-that-no-longer-exists")
+        session_map.set_mirror_link(key, INBOUND_LINK, accepts_inbound=True)
+        assert session_map.get(key) is None
+
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+
+        assert reloaded.get_mirror_link(key) == INBOUND_LINK
+        assert unbind_calls == []
+
+    def test_a_truly_unbound_stale_entry_is_still_collected(
+        self, session_map, unbind_calls
+    ):
+        key = "dashboard:chat-1"
+        session_map.set(key, "sid-gone")
+
+        assert session_map.get(key) is None
+        assert key not in session_map._data
+        # It held no binding, so there is nothing to announce.
+        assert unbind_calls == []

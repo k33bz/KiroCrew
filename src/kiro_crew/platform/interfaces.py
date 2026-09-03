@@ -14,14 +14,26 @@ deny decision must be ``@final`` to enforce the ADD-only floor.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 if TYPE_CHECKING:
     from aiohttp import web
 
-    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.config.loader import KiroCrewConfig, TelemetryConfig
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
 
 
 class InterceptDecision(enum.Enum):
@@ -56,9 +68,10 @@ class InterceptDecision(enum.Enum):
 class ProviderRegistry(Protocol):
     """The LLM-provider factory + ACP-backend registration seam.
 
-    The public edition ships Kiro-CLI-ACP only.  The companion uses
-    ``register_acp_backends`` to re-register a Claude backend through the dormant
-    ``ACP_BACKEND_CLAUDE`` seam without the core changing.
+    The public edition ships every KNOWN ACP backend as selectable, so this seam
+    exists for a harness the core does NOT ship: an edition calls
+    ``register_acp_backends`` and its id becomes selectable without the core
+    changing.
     """
 
     def create_factory(self, cfg: "KiroCrewConfig") -> Callable[..., Any]:
@@ -78,6 +91,14 @@ class ProviderRegistry(Protocol):
         """Register any extra ACP backends (no-op in the public edition).
 
         Consumed at boot by ``bootstrap_context`` after the context installs.
+
+        An implementation MUST also call
+        ``acp_backends.register_selectable_backend(<id>)`` for anything an operator
+        should be able to choose. Registering the provider alone leaves the harness
+        runnable but unreachable: the dashboard's backend switch, its PATCH
+        allowlist and the config load path all derive from that registry, so an
+        unregistered id is not offered in the dashboard at all and is coerced back
+        to the default on load.
         """
         ...
 
@@ -210,6 +231,15 @@ class SlackEnterpriseGate(Protocol):
     Signatures mirror ``slack/enterprise.py``: ``validate_enterprise`` is called
     once at startup with the bot token; ``check_message_origin`` is the per-
     message in-memory check.
+
+    ``extra_ids`` is advisory, and an implementation MAY ignore it. The public
+    default gate DOES ignore it: its callers derive the value from the same
+    ``slack.allowed_enterprise_ids`` key that gate re-reads itself, so the value
+    can only be an older copy of what the gate already has, and honouring it
+    would re-admit ids the operator removed. Do not rely on this parameter to
+    add ids the config does not list -- against the default gate they are
+    dropped. It stays in the signature because an edition whose allowlist comes
+    from somewhere other than that config key can still use it.
     """
 
     def validate_enterprise(
@@ -355,6 +385,81 @@ class IdentityProvider(Protocol):
     def credential_watch_paths(self) -> List[Path]: ...
 
 
+@dataclass(frozen=True)
+class WorkloadIdentity:
+    """The agent process's registered workload (name + ARN).
+
+    Public Default never has one. A companion fills this from the edition's
+    workload registration; core code must not invent an ARN.
+    """
+
+    name: str
+    arn: str
+
+
+@dataclass(frozen=True)
+class SessionPrincipal:
+    """Trusted caller for agent-identity token vending.
+
+    Core-derived (surface + already-partitioned subject + session key). Never
+    taken from tool input. ``user_jwt`` is set only by a companion after IdP
+    verify; the public Default leaves it ``None``.
+    """
+
+    surface: str
+    subject: str
+    session_key: str
+    user_jwt: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class InboundToken:
+    """A short-lived inbound credential a companion vends for Gateway MCP.
+
+    ``token`` is bearer material: it must never enter ``status()``, SEL
+    payloads, or transcripts. Public Default never vends one.
+    """
+
+    scheme: str
+    token: str = field(repr=False)
+    expires_at: float
+    audience: str
+
+
+class AgentIdentityProvider(Protocol):
+    """Agent workload identity and token vending — not operator SSO.
+
+    ``IdentityProvider`` is the operator-SSO slot (status line, preflight,
+    credential watch). This slot is the edition concern for a process-level
+    workload identity and for vending tokens *as that workload*. Same reason
+    ``AgentCatalogProvider`` is not folded into ``McpToolingProvider``.
+
+    Public Default is disabled (``enabled() -> False``; every other method
+    returns ``None`` / ``{}`` / the input principal unchanged) so a standalone
+    process stays byte-identical. ``IdentityProvider.whoami`` / ``issuer`` stay
+    RESERVED — do not consume them to satisfy this seam.
+
+    v1 field addition (no ``CONTRACT_VERSION`` bump); same landing as
+    ``knowledge`` / ``dashboard`` / ``jail``.
+    """
+
+    def enabled(self) -> bool: ...
+
+    def workload_identity(self) -> WorkloadIdentity | None: ...
+
+    def status(self) -> dict[str, object]: ...
+
+    def gateway_mcp_spec(self) -> dict[str, object] | None: ...
+
+    async def annotate_principal(self, principal: SessionPrincipal) -> SessionPrincipal: ...
+
+    async def vend_workload_access_token(self, principal: SessionPrincipal) -> str | None: ...
+
+    async def vend_gateway_inbound_token(
+        self, principal: SessionPrincipal
+    ) -> InboundToken | None: ...
+
+
 class EmbeddingSource(Protocol):
     """**RESERVED extension point — not consumed by the core.**
 
@@ -492,6 +597,177 @@ class PromptSourceProvider(Protocol):
         resolved package prompt/SOP roots so its installed SOPs appear in the
         ``/api/prompts`` catalog and ``@agent-sop:`` mentions. Read fail-closed
         through ``safe_context_call`` at the call site (fallback ``[]``).
+        """
+        ...
+
+
+class SkillDiscoveryProvider(Protocol):
+    """Edition-contributed skill discovery providers for the multi-provider search.
+
+    A distinct edition concern with its own interface (not folded into
+    ``McpToolingProvider``) so each edition hook lands on its own interface.
+    """
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        """Extra skill discovery providers the edition contributes.
+
+        WIRED: the dashboard discover registry
+        (``handlers/discover._build_registry``) registers each returned provider
+        AFTER the built-in one, gated per provider by the same
+        ``external_access.admits_registry("skill", name, api_base)`` decision the
+        built-in provider passes through — so an edition provider is subject to
+        the composed discovery policy uniformly, and a managed allowlist needs no
+        edition-specific carve-out. ADD-only and de-duped by name: a provider
+        whose ``name`` collides with an already-registered one is skipped with a
+        warning (the built-in wins), so an edition cannot silently replace the
+        catalog identity a policy admitted.
+
+        Each returned object implements
+        ``kiro_crew.skill_providers.base.SkillProvider`` (async ``search`` /
+        ``fetch_skill_content`` plus ``is_available()``, so an unconfigured
+        provider is skipped by the registry rather than erroring) and SHOULD
+        expose an ``api_base`` naming its catalog endpoint — that is the identity
+        an allowlist is written against; a provider without one is gated on an
+        empty base. Read fail-closed through ``safe_context_call`` at the call
+        site (fallback ``[]``). The public Default returns ``[]`` (discovery
+        offers the built-in catalog only). v1 addition (no ``CONTRACT_VERSION``
+        bump).
+        """
+        ...
+
+
+class DeniedRuleProvider(Protocol):
+    """Edition-contributed DENIED-COMMAND RULES that the user can switch off.
+
+    A distinct edition concern with its own interface (not folded into
+    ``SecurityOverlay``) because the two answer opposite questions.
+    ``SecurityOverlay.extra_deny_patterns`` is the un-weakenable floor: its
+    patterns travel the GLOB tier via ``extra_patterns`` and no user opt-out can
+    reach them. This seam is the other half — rules an edition wants ON by
+    default but wants the operator to be ABLE to turn off, which the overlay
+    structurally cannot express.
+    """
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
+        """Extra denied-command rules the edition contributes, DISABLEABLE.
+
+        WIRED: ``hooks.resolve_effective_denied_regexes`` unions these into the
+        rule list it hands ``security.compute_effective_denied``, so each rule is
+        subject to the SAME opt-out resolution as a built-in — an operator can
+        disable one by id, or clear the lot with ``disable_all``, through the
+        existing ``denied_commands.json`` keystone and the existing
+        ``/api/security/denied-commands`` endpoints. ``handlers/security`` lists
+        them in the Settings panel (tagged ``source="edition"``) and accepts a
+        toggle for them, so a rule contributed here is discoverable rather than
+        an invisible block.
+
+        TIER: ``pattern`` is a Python REGEX matched via ``re.search`` with
+        ``re.IGNORECASE`` — the same tier and the same ReDoS-bounded matcher as a
+        built-in rule. It is NOT an fnmatch glob. An edition moving a pattern
+        here from ``extra_deny_patterns`` MUST rewrite it: ``*ada credentials*``
+        is a glob, and as a regex its ``*`` are quantifiers on ``a`` and ``s``.
+
+        SCOPE — the surfaces these rules reach, and the one they do not.  They
+        are enforced wherever the *effective* denied set is resolved from the
+        keystone opt-out state: the agent tool gate (``hooks.on_tool_call``) and
+        the cron/MCP gate (``mcp_cron`` via
+        ``effective_denied_regexes_from_config``).  They deliberately do NOT
+        reach ``computer_use.policy.check_text_input``, which calls
+        ``is_denied`` with ``denied_regexes=None`` to fail closed to the BUILT-IN
+        catalogue alone — that surface ignores opt-out state on purpose (typing
+        into somebody else's window is not the same decision as running a command
+        under the tool gate), and honouring an edition contribution there without
+        its opt-out would make the seam mean two different things on two
+        surfaces.  An edition needing a rule enforced on the computer-use
+        surface must express it as an un-weakenable
+        ``SecurityOverlay.extra_deny_patterns`` glob instead.
+
+        IDENTITY: ``id`` is the opt-out key and the SEL ``rule_id``, so it MUST be
+        namespaced by the edition (``<edition>-<slug>``). ``disabled_ids`` is one
+        flat set: a rule whose id collides with a built-in id is SKIPPED with a
+        warning (the built-in wins), because a collision would make one rule's
+        toggle silently move the other.
+
+        NOT PINNABLE (v1): governance ``commands``-scope pins resolve a pattern to
+        a rule id against the STATIC catalog, so a pin naming a rule from this
+        seam matches nothing. An edition needing an un-opt-out-able pattern keeps
+        using ``extra_deny_patterns`` — that is still the floor, unchanged.
+
+        Read fail-closed through ``safe_context_call`` at the call site (fallback
+        ``[]``): a raising provider degrades to the built-in catalog rather than
+        wedging the deny gate. Losing an additive, user-disableable rule is the
+        safe direction; the overlay floor is unaffected either way. The public
+        Default returns ``[]`` (the built-in catalog only). v1 addition (no
+        ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class ImportSource:
+    """One foreign agent installation the onboarding importer can read from.
+
+    A descriptor says WHERE an install is. It does not supply reader code, and it
+    does not choose a reader: the engine does all reading with its own gated
+    helpers, which is what keeps credential redaction, prompt-injection screening,
+    sensitive-path refusal, size caps and symlink rejection applying to a
+    registered source exactly as they do to a built-in one. A seam that accepted a
+    scanner callable would hand an edition the engine's internal accumulator and
+    depend on it to re-implement every one of those invariants correctly.
+
+    The engine reads a registered source as an install of **this product's own
+    on-disk layout** — a predecessor, a rename, or a fork, which is the case an
+    edition actually has. A genuinely novel foreign format needs a reader in the
+    core, because only the core can read it through the content gates; when a
+    second layout exists, naming one becomes an additive default-valued field
+    here rather than a reason to accept arbitrary reader code now.
+
+    ``env_vars`` are consulted in order and the first non-empty one wins;
+    ``home_dir`` is the fallback directory name under the user's home. A source
+    declaring only ``env_vars``, with none of them set, is left unresolved rather
+    than defaulting to the home root.
+    """
+
+    id: str
+    display_name: str
+    env_vars: tuple[str, ...] = ()
+    home_dir: str = ""
+    #: MCP server names this agent manages itself. Importing one would hand the
+    #: user a server pointing at a foreign runtime, so they are always skipped.
+    managed_mcp_names: tuple[str, ...] = ()
+    #: Whether this product REPLACES the agent — a predecessor or a rename, not
+    #: a peer the user may still be running. Only a superseded agent's leftovers
+    #: are reclaimed from the user's global provider config: doing that to a live
+    #: foreign agent would delete servers it is still using.
+    superseded: bool = False
+    #: Basenames of this agent's own launcher, used with ``superseded``. An MCP
+    #: entry whose command is one of these was written by that agent and is
+    #: purgeable once it is gone. Matched on the command, never on the server
+    #: name, so an entry the user created themselves is left alone. A shared
+    #: runtime (``node``, ``python``, a Windows shell, any versioned spelling of
+    #: one) is refused: it would reclaim every server that happens to run on it.
+    stale_mcp_binaries: tuple[str, ...] = ()
+
+
+class ImportSourceProvider(Protocol):
+    """Edition-contributed onboarding-import sources.
+
+    The public edition ships the foreign agents any user may plausibly have
+    installed. An edition whose users are migrating from a predecessor of its
+    own registers that predecessor here instead of the core naming it, which is
+    what keeps an edition-specific product name out of the public tree.
+    """
+
+    def import_sources(self) -> List[ImportSource]:
+        """Return extra import sources (Default: ``[]``).
+
+        WIRED: ``onboarding_import._sources()`` unions these over the core
+        builtins for every scan, apply, and id-validation path, so a registered
+        source appears in ``/api/onboarding/import/scan`` and is accepted by
+        ``/api/onboarding/import/apply`` with no core branching. Read
+        fail-closed through ``safe_context_call`` (fallback: builtins only), and
+        a duplicate or malformed descriptor is dropped rather than shadowing a
+        builtin.
         """
         ...
 
@@ -658,6 +934,55 @@ class CapabilityManager(Protocol):
 # ── install / structural extension points ──
 
 
+class ExternalAccessPolicy(Protocol):
+    """Which external services this deployment may reach, beyond the deny floor.
+
+    The core offers three things unconditionally that a managed deployment may
+    have to withhold, and none of them had a composition point:
+
+    * **Installable-content registries.** Skill discovery (``skill_providers/``,
+      skills.sh) and MCP server discovery (``mcp_providers/``, the official MCP
+      registry) fetch from the public internet and then offer to INSTALL what
+      they return. Both hardcoded their public provider at registration time.
+    * **Cloud deployment.** ``kiro_crew/deploy/`` provisions real infrastructure
+      (S3, CloudFront, IAM roles, a reaper Lambda) in the operator's own cloud
+      account and hands back a public URL. It carries no capability gate at all,
+      so ``capabilities.publish`` — which bounds publish-provider destinations —
+      does not reach it.
+
+    One policy object rather than three, because they answer the same question
+    ("may this deployment use an external service the core offers by default?")
+    and because a single object gives ONE audited admission chokepoint and one
+    thing for an operator to implement, instead of a decision that is logged in
+    some places and not others.
+
+    Both decisions take the concrete target as well as a label. A name is
+    something a provider chooses for itself; the URL or target is what determines
+    where bytes go. An allowlist pinned to the target stops admitting a provider
+    that later repoints at a different host, rather than letting it inherit trust
+    from its name.
+
+    The public default admits everything, so open-source behaviour is unchanged.
+    """
+
+    def admits_registry(self, kind: str, name: str, api_base: str) -> bool:
+        """Whether the *kind* registry *name* serving ``api_base`` may be queried.
+
+        *kind* is the catalog the provider belongs to — ``"skill"`` or ``"mcp"``.
+        Returning ``False`` means the provider is never registered.
+        """
+        ...
+
+    def admits_cloud_deployment(self, target: str) -> bool:
+        """Whether this deployment may provision infrastructure in a cloud account.
+
+        *target* names the deployment backend (``"aws"`` today). Returning
+        ``False`` makes the deploy surface report itself disabled and refuse every
+        mutating request.
+        """
+        ...
+
+
 class AppRegistryPolicy(Protocol):
     """Trusted git hosts + clone-sandbox-mode decision for the app registry.
 
@@ -693,6 +1018,35 @@ class AppsLoader(Protocol):
         pointing at internal git hosts — which its ``AppRegistryPolicy`` already
         trusts. Each row is the same dict shape as an ``app-registry.json`` entry.
         v1 method addition (no ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+    def default_registries(self) -> List[Dict[str, Any]]:
+        """External app registries the edition ships as defaults (ADD-only merge).
+
+        WIRED: ``apps/registry.py::_effective_registries`` merges these with the
+        operator's ``config.registries`` for EVERY consumer of the registry list —
+        index fetch/refresh, the trusted-host allowlist, row lookup, install, and
+        the blob-proxy allowlist. Merging at the consumption sites rather than
+        inside ``KiroCrewConfig`` is deliberate: an edition default must never be
+        written back into the operator's ``config.json`` by a config save, and must
+        never be shadowed by a stale copy that a past save persisted.
+
+        Each row is the field shape of ``config.loader.ExternalRegistryConfig``
+        (``{"name", "repo", "branch", "trust"}``); dicts, not dataclass instances,
+        so a companion need not import the config module. Missing keys take the
+        dataclass default.
+
+        An edition default WINS on a ``name`` collision with an operator entry.
+        That direction is the fail-closed one: a registry the edition pins carries
+        a ``trust`` tier, and letting a same-named operator entry replace it would
+        let a hand-edited ``config.json`` inherit that tier while repointing
+        ``repo`` somewhere else. An operator can still add registries freely — just
+        not silently repoint one the edition pinned.
+
+        The public Default returns ``[]``, so standalone behaviour is byte-identical
+        to reading ``config.registries`` alone. v1 method addition (no
+        ``CONTRACT_VERSION`` bump).
         """
         ...
 
@@ -824,6 +1178,91 @@ class TunnelProvider(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class MobileConnectMethod:
+    """One way the current deployment hands a phone a live dashboard session.
+
+    A descriptor says WHICH method exists — never how to mint the credential.
+    Minting stays on the method's own endpoint (the tailnet QR handler, the
+    one-time mobile-link handler, a companion's own route), where the caller
+    bounds, owner checks, restricted-session refusals and SEL audits already
+    live; a seam that returned URLs or tokens would move credential minting
+    behind an interface the core cannot audit.
+
+    ``id`` is the governed identifier: the ``methods`` ruleset of the
+    ``capabilities.mobile_connect`` scope narrows on it, and the methods
+    endpoint drops a denied id before the dashboard ever sees it.  ``kind``
+    names the frontend renderer; the dashboard skips a kind it does not
+    recognise (an older frontend renders an edition's new method as absent,
+    never as a broken panel).
+    """
+
+    id: str
+    kind: str
+
+
+class MobileConnectProvider(Protocol):
+    """Edition-contributed phone-connection methods.
+
+    Public default = the personal-install pair (tailnet QR + one-time login
+    link), reproducing today's behavior.  An enterprise companion replaces the
+    list with its own method(s) — or returns ``[]``, which hides the
+    dashboard's "Connect your phone" entry entirely (governance can also pin
+    the capability off without an edition swap; both paths converge on an
+    empty methods list).
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        """Return the deployment's methods, BEFORE governance filtering.
+
+        WIRED: ``dashboard/handlers/mobile_connect.py::api_mobile_connect_methods``
+        reads this via ``safe_context_call`` (fallback: ``[]``, hiding the
+        entry rather than guessing) and filters each id through the
+        ``capabilities.mobile_connect`` governance scope; the mint endpoints
+        re-check the same scope per id, so the filtered list is presentation,
+        never the control.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class OtlpDestination:
+    """One OTLP/HTTP collector this edition sends telemetry to.
+
+    A destination says WHERE telemetry goes and how to authenticate to it —
+    never WHAT may be sent.  The core keeps the signal shape, the consent gate,
+    attribute sanitisation, the histogram views, batching and retry; a
+    destination cannot widen any of them.
+
+    Deliberately signal-agnostic.  ``signals`` names which OTLP signals this
+    collector accepts (``"metrics"`` today), so a later core that also emits
+    traces or logs reads the SAME descriptor rather than needing a second
+    protocol method — the OTLP/HTTP metric, span and log exporters take the same
+    constructor arguments, so one descriptor already describes all three.  A
+    signal the core does not emit is simply never built.
+
+    ``name`` is a short, NON-SECRET label used in logs.  It exists because
+    ``endpoint`` must never be logged (a URL can carry credentials in userinfo or
+    query parameters), which would otherwise leave a multi-destination host with
+    no way to tell which collector failed.
+
+    ``session`` is an authenticated transport handed to the exporter (a
+    ``requests.Session``; typed loosely so this contract does not depend on the
+    HTTP client).  It is the seam a ROTATING credential composes against:
+    ``Session.auth`` is re-evaluated on every request, so a short-lived OIDC/SSO
+    id_token or STS credential is re-read on each export instead of being frozen
+    at construction — which is exactly what ``OTEL_EXPORTER_OTLP_HEADERS``, the
+    only injection point before this seam, cannot avoid.  Static per-destination
+    headers need no field of their own: ``Session.headers`` already carries them
+    per destination, where that env var is process-wide.
+    """
+
+    name: str
+    endpoint: str
+    signals: "frozenset[str]"
+    session: Optional[Any] = None
+
+
 class TelemetryProvider(Protocol):
     """Backend telemetry sink + the frontend RUM config blob.
 
@@ -835,6 +1274,45 @@ class TelemetryProvider(Protocol):
     def record_event(self, event_type: str, data: dict) -> None: ...
 
     def frontend_rum_config(self) -> Optional[dict]: ...
+
+    def otlp_destinations(self, cfg: "TelemetryConfig") -> Sequence[OtlpDestination]:
+        """OTLP collectors this edition sends telemetry to (WHERE, never WHAT).
+
+        WIRED: ``metrics/provider.py::_otlp_destinations`` calls this once per
+        recorder build — after the consent gate, before any reader is
+        constructed — and builds one ``PeriodicExportingMetricReader`` per
+        returned destination that names ``"metrics"`` in its ``signals``,
+        ALONGSIDE (never instead of) the built-in local JSONL reader.  An empty
+        sequence means local-only, with no network egress.
+
+        The public default returns one destination when
+        ``telemetry.otlp_endpoint`` is a non-empty string and nothing when it is
+        not, so a standalone build stays byte-identical to the hardcoded
+        endpoint-only exporter this replaced.  An edition overrides it to reach
+        its own collector — including one whose credential ROTATES during
+        process lifetime, which the once-at-construction
+        ``OTEL_EXPORTER_OTLP_HEADERS`` injection cannot express.
+
+        ADD-only by construction: destinations are appended to the core's reader
+        list, so this can never remove or replace the local sink, and it cannot
+        relax consent, attribute sanitisation, or the histogram views.  A
+        destination with an empty ``endpoint``, or one that does not name the
+        signal being built, is DROPPED rather than trusted — deny-by-default, so
+        a half-populated descriptor cannot start an unintended egress.
+
+        Best-effort: the build path reads it through ``safe_context_call``
+        (fallback ``()``), so a provider that raises contributes no destinations
+        and telemetry keeps working local-only instead of failing.
+
+        MUST be cheap and side-effect-free per call. It is read once per recorder
+        build AND on every egress-posture read — the Privacy panel's status and
+        each ``telemetry.enabled`` config write ask it so their disclosure cannot
+        disagree with what gets attached. So do not acquire a token, mint a
+        credential, or perform any one-shot side effect inside it: build the
+        transport once and hand back the same object. v1 method addition (no
+        ``CONTRACT_VERSION`` bump).
+        """
+        ...
 
 
 class DashboardContributor(Protocol):

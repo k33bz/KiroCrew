@@ -178,21 +178,23 @@ def _workflow_state(**svc_attrs: Any) -> SimpleNamespace:
     return SimpleNamespace(workflow_service=SimpleNamespace(**svc_attrs))
 
 
-async def _drive_watchdog(app: Any, until, timeout: float = 5.0) -> bool:
+async def _drive_watchdog(app: Any, until, timeout: float = 10.0) -> bool:
     """Run one or more real watchdog iterations, stopping as soon as ``until()``.
 
     The loop is a ``while True`` driven by ``asyncio.sleep(POLL_INTERVAL)``;
     callers shorten POLL_INTERVAL, so this polls the observable side effect and
     always cancels the task (no leaked background work).
+
+    Waiting is delegated to ``_await_until`` so both helpers share ONE budget:
+    two call sites here wait on a status commit made from a worker thread AND
+    the SSE emitted from that thread's ``call_soon_threadsafe`` hook, which is
+    two scheduling hops, and the tighter of two budgets is what made those
+    flake on a loaded shard. The timeout is a deadlock backstop; observable
+    state is what ends a successful wait.
     """
     task = asyncio.ensure_future(h._watchdog_loop(app))
     try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-            if until():
-                return True
-        return False
+        return await _await_until(until, timeout=timeout)
     finally:
         task.cancel()
         try:
@@ -415,8 +417,8 @@ class TestPollWorkflowCampaign:
     @pytest.mark.asyncio
     async def test_absent_service_or_run_id_is_a_no_op(self, _isolate: Path, sse):
         cid = _campaign(execution_mode="workflow")
-        await h._poll_workflow_campaign(cid, None)
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock()))
+        await h._poll_workflow_campaign(cid, None, h.get_campaign(cid)["started_at"])
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock()), h.get_campaign(cid)["started_at"])
         assert sse.events == []
 
     @pytest.mark.asyncio
@@ -424,7 +426,7 @@ class TestPollWorkflowCampaign:
         cid = _campaign(execution_mode="workflow")
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.RUNNING
         assert sse.events == []
 
@@ -434,7 +436,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         run_file = h._campaign_dir(cid) / h._WORKFLOW_RUN_FILE
         run_file.write_text(json.dumps({"run_id": "run-1", "ts": time.time() - 7200}))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.FAILED
         assert "snapshot lost" in (h.get_campaign(cid) or {})["error_message"]
         assert sse.types() == ["failed"]
@@ -445,7 +447,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         d = h._campaign_dir(cid)
         (d / h._WORKFLOW_RUN_FILE).write_text(json.dumps({"run_id": "r", "ts": "yesterday"}))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.RUNNING
         assert sse.events == []
 
@@ -458,7 +460,7 @@ class TestPollWorkflowCampaign:
             events=_investigate_events("investigate: how is it rate limited", "plan: outline")
         )
         state = _workflow_state(result=MagicMock(return_value=snap))
-        await h._poll_workflow_campaign(cid, state)
+        await h._poll_workflow_campaign(cid, state, h.get_campaign(cid)["started_at"])
         files = h._list_cycle_files(cid)
         assert len(files) == 1  # only the investigate agent produced a cycle
         finding = json.loads(files[0].read_text())
@@ -474,7 +476,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(events=_investigate_events("investigate: nope", ok=False))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert h._list_cycle_files(cid) == []
         assert sse.events == []
 
@@ -485,9 +487,9 @@ class TestPollWorkflowCampaign:
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(events=_investigate_events("investigate: a"))
         state = _workflow_state(result=MagicMock(return_value=snap))
-        await h._poll_workflow_campaign(cid, state)
+        await h._poll_workflow_campaign(cid, state, h.get_campaign(cid)["started_at"])
         first = h._list_cycle_files(cid)[0].read_text()
-        await h._poll_workflow_campaign(cid, state)
+        await h._poll_workflow_campaign(cid, state, h.get_campaign(cid)["started_at"])
         assert len(h._list_cycle_files(cid)) == 1
         assert h._list_cycle_files(cid)[0].read_text() == first
         assert sse.types() == ["new_finding"]  # no duplicate event
@@ -500,7 +502,7 @@ class TestPollWorkflowCampaign:
         _write_finding(cid, 2)
         h._write_workflow_run_id(cid, "run-2")  # records offset 2
         snap = _snapshot(events=_investigate_events("investigate: resumed"))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         cycles = [json.loads(p.read_text())["cycle"] for p in h._list_cycle_files(cid)]
         assert cycles == [1, 2, 3]
 
@@ -510,7 +512,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(events=_investigate_events("investigate-no-colon"))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         finding = json.loads(h._list_cycle_files(cid)[0].read_text())
         assert finding["key_insight"] == "investigate-no-colon"
 
@@ -520,7 +522,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status="finished", result={"report": "# Report\nAll done."})
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert (h._campaign_dir(cid) / "FINDINGS.md").read_text() == "# Report\nAll done."
         assert _status(cid) == h.CampaignStatus.COMPLETE
         assert sse.types() == ["complete"]
@@ -531,7 +533,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status="finished", result={"findings": ["one", "two"]})
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert (h._campaign_dir(cid) / "FINDINGS.md").read_text() == "one\n\ntwo"
 
     @pytest.mark.asyncio
@@ -540,7 +542,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status="finished", result="not-a-dict")
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert (h._campaign_dir(cid) / "FINDINGS.md").read_text() == "(no findings gathered)"
         assert _status(cid) == h.CampaignStatus.COMPLETE
 
@@ -551,7 +553,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status=status, error="engine exploded")
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.FAILED
         assert (h.get_campaign(cid) or {})["error_message"] == "engine exploded"
         assert sse.types() == ["failed"]
@@ -564,7 +566,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status="failed")
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert "without completing" in (h.get_campaign(cid) or {})["error_message"]
 
     @pytest.mark.asyncio
@@ -577,7 +579,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         snap = _snapshot(status="finished", result={"report": "token=hunter2"})
-        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         written = (h._campaign_dir(cid) / "FINDINGS.md").read_text()
         assert "hunter2" not in written
         assert written == "[REDACTED]"
@@ -588,7 +590,7 @@ class TestPollWorkflowCampaign:
         _running(cid)
         h._write_workflow_run_id(cid, "run-1")
         boom = MagicMock(side_effect=RuntimeError("snapshot store on fire"))
-        await h._poll_workflow_campaign(cid, _workflow_state(result=boom))
+        await h._poll_workflow_campaign(cid, _workflow_state(result=boom), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.RUNNING
 
 
@@ -626,7 +628,12 @@ class TestWatchdogLoop:
         slot = SimpleNamespace(_trust=True, running=False)
         state = SimpleNamespace(_slots={f"research-{cid}": slot})
         assert await _drive_watchdog(
-            {"state": state}, lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT
+            {"state": state},
+            # Wait on BOTH the status commit and the independently-scheduled SSE
+            # emit (see test_new_verified_finding_completes_the_campaign) -- the
+            # assertion below reads sse.types(), so the SSE half must be observed
+            # before _drive_watchdog's finally cancels the loop.
+            lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT and "needs_input" in sse.types(),
         )
         assert slot._trust is False
         question = json.loads((h._campaign_dir(cid) / "questions.json").read_text())
@@ -658,7 +665,8 @@ class TestWatchdogLoop:
         _running(cid)
         (h._campaign_dir(cid) / "questions.json").write_text('{"question": "Which DB?"}')
         assert await _drive_watchdog(
-            {"state": None}, lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT
+            {"state": None},
+            lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT and "needs_input" in sse.types(),
         )
         assert "needs_input" in sse.types()
 
@@ -678,6 +686,13 @@ class TestWatchdogLoop:
             assert await _await_until(lambda: polls["n"] >= 1)  # baseline count recorded
             _write_finding(cid, 2, verification={"passed": True})
             assert await _await_until(lambda: _status(cid) == h.CampaignStatus.COMPLETE)
+            # The status commit (worker thread) and the SSE emit (call_soon_threadsafe
+            # from _sse_from_thread's on_commit hook) are two separate scheduling
+            # events, not one step — waiting on status alone proves the commit
+            # happened, not that the loop has drained the queued SSE callback yet.
+            # Wait on the SIGNAL THIS TEST ASSERTS ON, or task.cancel() below can win
+            # the race and the "complete" event goes missing from sse.types().
+            assert await _await_until(lambda: "complete" in sse.types())
         finally:
             task.cancel()
             try:
@@ -701,6 +716,11 @@ class TestWatchdogLoop:
             assert await _await_until(lambda: polls["n"] >= 1)
             _write_finding(cid, 2)  # unverified, but hits max_cycles
             assert await _await_until(lambda: _status(cid) == h.CampaignStatus.COMPLETE)
+            # See test_new_verified_finding_completes_the_campaign: the status commit
+            # and the SSE emit are scheduled independently, so wait on the SSE signal
+            # this test actually asserts on rather than relying on task.cancel()'s
+            # timing to have let the queued callback run first.
+            assert await _await_until(lambda: "complete" in sse.types())
         finally:
             task.cancel()
             try:
@@ -722,6 +742,10 @@ class TestWatchdogLoop:
             assert await _await_until(lambda: polls["n"] >= 1)
             _write_finding(cid, 6, new_findings_count=0)
             assert await _await_until(lambda: _status(cid) == h.CampaignStatus.STAGNANT)
+            # See test_new_verified_finding_completes_the_campaign: status commit and
+            # SSE emit are scheduled independently, so wait on the SSE signal this
+            # test actually asserts on.
+            assert await _await_until(lambda: "stagnant" in sse.types())
         finally:
             task.cancel()
             try:
@@ -735,16 +759,27 @@ class TestWatchdogLoop:
         self, _isolate: Path, fast_watchdog, sse, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.setattr(h, "_unresponsive_deadline", lambda _idle: 0)
-        stop_loop = AsyncMock()
-        monkeypatch.setattr(h, "_stop_loop", stop_loop)
+        terminating_loop = SimpleNamespace(id="terminating-loop", active=True)
+        svc = SimpleNamespace(
+            get_by_slot=MagicMock(return_value=terminating_loop),
+            remove=AsyncMock(),
+            update=AsyncMock(),
+        )
+        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
         cid = _campaign(auto_approve=True)
         _running(cid)
         _write_finding(cid, 1)
         assert await _drive_watchdog(
-            {"state": None}, lambda: _status(cid) == h.CampaignStatus.FAILED
+            {"state": None},
+            # Wait on BOTH the status commit and the independently-scheduled SSE
+            # emit (see test_new_verified_finding_completes_the_campaign) — the
+            # assertion below reads sse.types(), so the SSE half must be observed
+            # before _drive_watchdog's finally cancels the loop.
+            lambda: _status(cid) == h.CampaignStatus.FAILED and "failed" in sse.types(),
         )
         assert "stalled" in (h.get_campaign(cid) or {})["error_message"]
-        stop_loop.assert_awaited_with(cid, remove=True)
+        svc.update.assert_awaited_once_with(terminating_loop.id, active=False)
+        svc.remove.assert_awaited_once_with(terminating_loop.id)
         assert "failed" in sse.types()
 
     @pytest.mark.asyncio
@@ -1543,6 +1578,39 @@ class TestKnowledgeRoutes:
         assert any("'synced'" in s for s in statuses)
 
     @pytest.mark.asyncio
+    async def test_ingest_store_statements_run_off_the_event_loop(self, _isolate: Path):
+        """Issue #7020's loop-stall class: every store statement for the
+        to-knowledge flow must run in a worker thread, so a lock wait on the
+        store's busy timeout stalls a thread instead of the event loop (which
+        the watchdog would kill). Pins add_source, the syncing/synced UPDATEs,
+        and their commits to non-loop threads."""
+        import threading
+
+        cid = _campaign()
+        (h._campaign_dir(cid) / "FINDINGS.md").write_text("findings body")
+        loop_thread = threading.get_ident()
+        seen_threads: list[int] = []
+
+        def _record(*_a, **_k):
+            seen_threads.append(threading.get_ident())
+            return MagicMock()
+
+        store = MagicMock()
+        store.get_source_by_uri.side_effect = lambda *_a: (_record(), None)[1]
+        store.add_source.side_effect = lambda **_k: (_record(), 11)[1]
+        store.db.execute.side_effect = _record
+        store.db.commit.side_effect = _record
+        pipeline = SimpleNamespace(ingest_file=AsyncMock())
+        app = _app(state=SimpleNamespace(knowledge_store=store), knowledge_pipeline=pipeline)
+        resp = await h._handle_to_knowledge(_mk("POST", "k", app=app, match={"id": cid}))
+        assert resp.status == 201
+        await _drain_bg_tasks(app)
+        # get_source_by_uri + add_source + 2 UPDATEs + 2 commits all recorded,
+        # none on the loop.
+        assert len(seen_threads) >= 6
+        assert all(t != loop_thread for t in seen_threads)
+
+    @pytest.mark.asyncio
     async def test_ingest_failure_marks_the_source_errored(self, _isolate: Path):
         cid = _campaign()
         (h._campaign_dir(cid) / "FINDINGS.md").write_text("findings body")
@@ -1573,7 +1641,7 @@ class TestAssortedHelpers:
     ):
         _campaign()  # create the schema
         state = SimpleNamespace(get_or_create_slot=MagicMock())
-        svc = SimpleNamespace(add=AsyncMock())
+        svc = SimpleNamespace(add=AsyncMock(), get_by_slot=MagicMock(return_value=None))
         monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
         await h._launch_loop(_mk("PATCH", "x", app=_app(state=state)), "deadbeef")
         state.get_or_create_slot.assert_not_called()
@@ -1591,7 +1659,7 @@ class TestAssortedHelpers:
             push_slots_update=MagicMock(),
             conversation_log=None,
         )
-        svc = SimpleNamespace(add=AsyncMock())
+        svc = SimpleNamespace(add=AsyncMock(), get_by_slot=MagicMock(return_value=None))
         monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
         await h._launch_loop(_mk("PATCH", "x", app=_app(state=state)), cid)
         assert slot.title == "Rate limiting study"

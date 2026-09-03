@@ -254,6 +254,48 @@ async def test_create_pin_enforces_per_slot_limit_without_mutation(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_create_pin_quota_is_scoped_per_origin_app(tmp_path, monkeypatch):
+    """One origin's pins filling a slot to the cap must not block another origin.
+
+    The quota is scoped by (slot_key, origin_app) to match the idempotency
+    lookup and api_chat_pins_list. An app-owned slot pre-filled to the cap with
+    foreign-origin records (e.g. legacy pins carrying no origin_app) must still
+    let the app create its own pin -- otherwise it gets a 409 for records it can
+    neither see nor unpin.
+    """
+    monkeypatch.setattr(chat_pins_module, "_MAX_PINS_PER_SLOT", 2)
+    state = _make_state(tmp_path)
+    state.get_or_create_slot("slot-shared", app="app-a")
+    # Slot already at the cap, but every record belongs to a DIFFERENT origin
+    # (legacy blank origin_app here) that the caller cannot see or manage.
+    state._chat_pins = [
+        _pin(f"pin-legacy-{idx}", "slot-shared", f"ts-{idx}", origin_app="") for idx in range(2)
+    ]
+
+    async with _client(tmp_path, state=state, app_name="app-a") as client:
+        resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-shared",
+                "mid": "m-app-a-first-1",
+                "message_ts": "ts-app-a",
+                "role": "assistant",
+                "preview": "app-a pin",
+            },
+        )
+        # Before the fix the global slot count (2) hits the cap and returns 409;
+        # after the fix app-a has zero pins of its own so the pin is created.
+        assert resp.status == 201, await resp.json()
+        created = await resp.json()
+        assert created["origin_app"] == "app-a"
+        assert {p["id"] for p in state._chat_pins} == {
+            "pin-legacy-0",
+            "pin-legacy-1",
+            created["id"],
+        }
+
+
+@pytest.mark.asyncio
 async def test_create_pin_missing_slot_key(tmp_path):
     async with _client(tmp_path) as client:
         resp = await client.post(
@@ -1871,11 +1913,17 @@ async def test_idempotent_create_same_caller_returns_existing(tmp_path):
 
 @pytest.mark.asyncio
 async def test_slot_reuse_same_mid_respects_pin_limit(tmp_path):
-    """Even when a foreign record occupies (slot, mid), the new caller-owned
-    record still counts against the slot-wide pin limit."""
+    """The per-slot pin limit counts only the CALLER's own records.
+
+    A foreign record occupying (slot, mid) does not satisfy idempotency for a
+    different caller, and foreign records do not count against this caller's
+    quota (they are invisible to it via list/delete). The limit still fires
+    once the caller's OWN pins reach the cap.
+    """
     state = _make_state(tmp_path)
     state.get_or_create_slot("slot-limit", app="app-new")
-    # Fill slot to capacity with foreign pins (app-old)
+    # Fill slot to capacity with FOREIGN pins (app-old). These are invisible to
+    # app-new and must NOT count against app-new's quota.
     for i in range(_MAX_PINS_PER_SLOT):
         state._chat_pins.append(
             {
@@ -1891,8 +1939,9 @@ async def test_slot_reuse_same_mid_respects_pin_limit(tmp_path):
         )
 
     async with _client(tmp_path, state=state, app_name="app-new") as client:
-        # Target the same mid as filler-0000 — foreign record exists but
-        # slot is at capacity, so creation should be rejected.
+        # Target the same mid as filler-0000 — a foreign record exists but is
+        # not app-new's, so this is a fresh creation, not idempotent, and the
+        # foreign records do not exhaust app-new's quota.
         resp = await client.post(
             "/api/chat/pins",
             json={
@@ -1903,9 +1952,39 @@ async def test_slot_reuse_same_mid_respects_pin_limit(tmp_path):
                 "preview": "new caller preview",
             },
         )
+        assert resp.status == 201, await resp.json()
+        assert (await resp.json())["origin_app"] == "app-new"
+
+
+@pytest.mark.asyncio
+async def test_slot_pin_limit_counts_only_callers_own_records(tmp_path, monkeypatch):
+    """Once the CALLER's own pins reach the cap, further pins are rejected —
+    foreign-origin records in the same slot neither help nor hurt the count."""
+    monkeypatch.setattr(chat_pins_module, "_MAX_PINS_PER_SLOT", 2)
+    state = _make_state(tmp_path)
+    state.get_or_create_slot("slot-limit", app="app-new")
+    # Foreign filler (does not count) + app-new at its own cap (does count).
+    state._chat_pins.extend(
+        [
+            _pin("foreign-0", "slot-limit", "ts-f0", origin_app="app-old"),
+            _pin("mine-0", "slot-limit", "ts-m0", origin_app="app-new"),
+            _pin("mine-1", "slot-limit", "ts-m1", origin_app="app-new"),
+        ]
+    )
+
+    async with _client(tmp_path, state=state, app_name="app-new") as client:
+        resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-limit",
+                "mid": "m-over-cap-app",
+                "message_ts": "ts-over",
+                "role": "user",
+                "preview": "over cap",
+            },
+        )
         assert resp.status == 409
-        data = await resp.json()
-        assert data["code"] == "pin_limit_reached"
+        assert (await resp.json())["code"] == "pin_limit_reached"
 
 
 # ── Finding 2 (GPT 5.6): Transient I/O error must NOT replace valid in-memory state ──
@@ -2028,3 +2107,204 @@ async def test_load_missing_file_sets_empty(tmp_path, monkeypatch):
     ]
     state.load_chat_pins()
     assert state._chat_pins == []
+
+
+# ── Broadcast (pins_changed) ──
+
+# Helper: inject a MagicMock for broadcast_ws_owners so tests can assert calls.
+
+
+def _make_state_with_broadcast_spy(tmp_path):
+    """_make_state() variant that replaces broadcast_ws_owners with a MagicMock."""
+    state = _make_state(tmp_path)
+    state.broadcast_ws_owners = MagicMock()
+    return state
+
+
+@pytest.mark.asyncio
+async def test_broadcast_fires_after_create_pin(tmp_path):
+    """broadcast_ws_owners is called with pins_changed and the correct slot_key
+    after a successful pin creation."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-create",
+                "mid": "m-bc-create1",
+                "message_ts": "2026-01-01T00:00:00Z",
+                "role": "user",
+                "preview": "broadcast test",
+            },
+        )
+        assert resp.status == 201
+    state.broadcast_ws_owners.assert_called_once_with(
+        "pins_changed", {"slot_key": "slot-bcast-create"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_fires_after_delete_by_id(tmp_path):
+    """broadcast_ws_owners is called with pins_changed after a successful delete-by-id."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        create_resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-del-id",
+                "mid": "m-bc-del-id1",
+                "message_ts": "ts-1",
+                "role": "user",
+                "preview": "to delete",
+            },
+        )
+        assert create_resp.status == 201
+        pin = await create_resp.json()
+        state.broadcast_ws_owners.reset_mock()
+
+        del_resp = await client.delete(f"/api/chat/pins/{pin['id']}")
+        assert del_resp.status == 200
+    state.broadcast_ws_owners.assert_called_once_with(
+        "pins_changed", {"slot_key": "slot-bcast-del-id"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_fires_after_delete_by_query(tmp_path):
+    """broadcast_ws_owners is called with pins_changed after a successful delete-by-query."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        create_resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-del-q",
+                "mid": "m-bc-del-q1",
+                "message_ts": "ts-2",
+                "role": "assistant",
+                "preview": "to delete by query",
+            },
+        )
+        assert create_resp.status == 201
+        pin = await create_resp.json()
+        state.broadcast_ws_owners.reset_mock()
+
+        del_resp = await client.delete(
+            f"/api/chat/pins/by-query?slot=slot-bcast-del-q&mid={pin['mid']}"
+        )
+        assert del_resp.status == 200
+    state.broadcast_ws_owners.assert_called_once_with(
+        "pins_changed", {"slot_key": "slot-bcast-del-q"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_does_not_fire_on_create_persist_failure(tmp_path, monkeypatch):
+    """broadcast_ws_owners must NOT be called when persistence fails on create
+    (rollback path — the in-memory state was reverted)."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        monkeypatch.setattr(state, "save_chat_pins", _raise_os_error)
+        resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-fail-c",
+                "mid": "m-bc-fail-c1",
+                "message_ts": "ts-3",
+                "role": "user",
+                "preview": "should fail",
+            },
+        )
+        assert resp.status == 500
+    state.broadcast_ws_owners.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_does_not_fire_on_delete_persist_failure(tmp_path, monkeypatch):
+    """broadcast_ws_owners must NOT be called when persistence fails on delete-by-id
+    (rollback path — the pin was re-inserted)."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        create_resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-fail-d",
+                "mid": "m-bc-fail-d1",
+                "message_ts": "ts-4",
+                "role": "user",
+                "preview": "persist fail delete",
+            },
+        )
+        assert create_resp.status == 201
+        pin = await create_resp.json()
+        state.broadcast_ws_owners.reset_mock()
+
+        monkeypatch.setattr(state, "save_chat_pins", _raise_os_error)
+        del_resp = await client.delete(f"/api/chat/pins/{pin['id']}")
+        assert del_resp.status == 500
+    state.broadcast_ws_owners.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_does_not_fire_on_query_delete_persist_failure(tmp_path, monkeypatch):
+    """broadcast_ws_owners must NOT be called when persistence fails on delete-by-query
+    (rollback path — the pin was re-inserted)."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        create_resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-bcast-fail-q",
+                "mid": "m-bc-fail-q1",
+                "message_ts": "ts-5",
+                "role": "assistant",
+                "preview": "persist fail query",
+            },
+        )
+        assert create_resp.status == 201
+        pin = await create_resp.json()
+        state.broadcast_ws_owners.reset_mock()
+
+        monkeypatch.setattr(state, "save_chat_pins", _raise_os_error)
+        del_resp = await client.delete(
+            f"/api/chat/pins/by-query?slot=slot-bcast-fail-q&mid={pin['mid']}"
+        )
+        assert del_resp.status == 500
+    state.broadcast_ws_owners.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_does_not_fire_on_validation_failure(tmp_path):
+    """broadcast_ws_owners must NOT be called when the request is rejected for
+    validation reasons (missing required fields, etc.)."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        # Missing both slot_key and mid
+        resp = await client.post("/api/chat/pins", json={"preview": "oops"})
+        assert resp.status == 400
+    state.broadcast_ws_owners.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_payload_contains_only_slot_key(tmp_path):
+    """The broadcast payload must contain slot_key and nothing else (no pin
+    content) so no sensitive material crosses the WebSocket to any listener."""
+    state = _make_state_with_broadcast_spy(tmp_path)
+    async with _client(tmp_path, state=state) as client:
+        resp = await client.post(
+            "/api/chat/pins",
+            json={
+                "slot_key": "slot-payload-check",
+                "mid": "m-payload-chk1",
+                "message_ts": "ts-pc",
+                "role": "user",
+                "preview": "SECRET content must not appear in broadcast",
+            },
+        )
+        assert resp.status == 201
+    call_args = state.broadcast_ws_owners.call_args
+    assert call_args is not None
+    msg_type, payload = call_args[0]
+    assert msg_type == "pins_changed"
+    assert set(payload.keys()) == {"slot_key"}
+    assert "preview" not in payload
+    assert "content" not in payload

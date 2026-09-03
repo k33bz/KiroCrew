@@ -35,7 +35,7 @@ index, first-time setup, and connecting messaging channels.
 | [Research Lab](research-lab.md) | Autonomous multi-cycle research campaigns with scoping, adaptive agent execution, and exportable reports |
 | [Dashboard](dashboard.md) | React web UI with multi-session chat, memory management, and live system metrics |
 | [Agent Questions](agent-questions.md) | Let an agent pause mid-turn and ask you a clickable multiple-choice question |
-| Chat Channels | DM-based chat with tool approval — [Slack](slack-integration.md), [Discord](discord-integration.md), [Telegram](telegram-integration.md), [Teams](teams-integration.md), [Webex](webex-integration.md), [WeCom](wecom-integration.md), [WeChat](weixin-integration.md); per-channel capabilities in each guide |
+| Chat Channels | DM-based chat with tool approval — [Slack](slack-integration.md), [Discord](discord-integration.md), [Telegram](telegram-integration.md), [Teams](teams-integration.md), [Webex](webex-integration.md), [WeCom](wecom-integration.md), [WeChat](weixin-integration.md), [iMessage](imessage-integration.md), [WhatsApp](whatsapp-integration.md), [Feishu](feishu-integration.md); per-channel capabilities in each guide |
 | [Agents](agents.md) | Switch between specialized agents per conversation, thread, or cron job |
 | [Skills](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows |
 
@@ -59,8 +59,11 @@ index, first-time setup, and connecting messaging channels.
 Besides the dashboard and CLI, Kiro Crew ships channel integrations for
 [Slack](slack-integration.md), [Discord](discord-integration.md),
 [Telegram](telegram-integration.md), [Teams](teams-integration.md),
-[Webex](webex-integration.md), [WeCom](wecom-integration.md), and
-[Weixin](weixin-integration.md). They share one channel-neutral core, described
+[Webex](webex-integration.md), [WeCom](wecom-integration.md),
+[Weixin](weixin-integration.md), [iMessage](imessage-integration.md),
+[WhatsApp](whatsapp-integration.md), and
+[Feishu](feishu-integration.md). They
+share one channel-neutral core, described
 in [Messaging Transport](messaging-transport.md).
 
 ## Guides
@@ -69,6 +72,9 @@ in [Messaging Transport](messaging-transport.md).
 - [Configuration](configuration.md): config file reference, environment variables, sandbox
 - [Use Cases](use-cases.md): real-world workflows from the community
 - [Troubleshooting](troubleshooting.md): common issues and fixes
+- [Blocked commands and credential access](blocked-commands.md): why a command was
+  refused, what the agent is told to do instead, and how to check your AWS or SSO
+  credential setup
 - [MCP Apps](mcp-apps.md): render interactive MCP tool output (diagrams, viewers,
   forms) in chat, the two gates that enable it, what a server must declare, and why
   output stays plain text otherwise
@@ -81,7 +87,8 @@ in [Messaging Transport](messaging-transport.md).
 - Credential redaction across every LLM output path
 - HMAC-SHA256 signed, IP-pinned dashboard tokens
 - Denied-command rules enforced at Kiro Crew's own PreToolUse gate, with audit
-  logging
+  logging, and a refusal that names the sanctioned path instead of only the rule
+  ([Blocked commands](blocked-commands.md))
 - Prompt-injection credential-exfiltration protection
 - Slack access is owner-only: multi-user access and open channels are refused
 - [App Platform Trust Model](app-platform-trust-model.md): enabled apps run

@@ -12,7 +12,7 @@ from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
 # ---------------------------------------------------------------------------
 
 
-def _make_app_source(tmp_path, name="cli-test-app", crons=None):
+def _make_app_source(tmp_path, name="cli-test-app", crons=None, hooks=None):
     src = tmp_path / "source" / name
     src.mkdir(parents=True)
     manifest = {
@@ -26,6 +26,8 @@ def _make_app_source(tmp_path, name="cli-test-app", crons=None):
     }
     if crons is not None:
         manifest["crons"] = crons
+    if hooks is not None:
+        manifest["backend"] = {"hooks": hooks}
     (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
     (src / "agents").mkdir()
     (src / "agents" / "test-agent.json").write_text('{"name": "test-agent"}')
@@ -59,7 +61,7 @@ class TestHandleApp:
     def test_install_and_list(self, tmp_path, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path)
 
@@ -76,7 +78,7 @@ class TestHandleApp:
     def test_enable_disable(self, tmp_path, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -99,7 +101,7 @@ class TestHandleApp:
     def test_info(self, tmp_path, app_env, capsys):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -114,7 +116,7 @@ class TestHandleApp:
     def test_uninstall_preserves_data_by_default(self, tmp_path, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -134,7 +136,7 @@ class TestHandleApp:
     def test_uninstall_purge_data_requires_explicit_flag(self, tmp_path, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -151,7 +153,7 @@ class TestHandleApp:
     def test_install_invalid_source(self, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         ns = argparse.Namespace(app_action="install", source="/nonexistent")
         with pytest.raises(SystemExit):
@@ -160,12 +162,85 @@ class TestHandleApp:
     def test_no_action_prints_usage(self, app_env, capsys):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         ns = argparse.Namespace(app_action=None)
         _handle_app(ns)
         captured = capsys.readouterr()
         assert "Usage" in captured.out
+
+
+class TestEnableWarnsHooksNeedRestart:
+    """CLI `app enable` must not imply it loaded the app's backend hooks.
+
+    Hooks are Python modules imported INTO the gateway process, and only the
+    gateway replaces them (``on_app_enable`` -> ``register_app_routes`` ->
+    ``load_app_module``). The CLI is a separate process, so a CLI enable leaves a
+    running gateway executing the code it imported earlier -- printing only
+    "enabled <app>" reads as though the new code were live (issue #7880).
+    """
+
+    HOOKS = {
+        "routes": "backend.routes:register_routes",
+        "on_startup": "backend.hooks:on_startup",
+    }
+
+    def _enable(self):
+        import argparse
+
+        from kiro_crew.cli_commands import _handle_app
+
+        _handle_app(argparse.Namespace(app_action="enable", name="cli-test-app"))
+
+    def test_enable_warns_when_the_app_declares_backend_hooks(
+        self, tmp_path, app_env, capsys
+    ):
+        install_app(_make_app_source(tmp_path, hooks=self.HOOKS))
+
+        self._enable()
+
+        out = capsys.readouterr().out
+        assert "backend hooks" in out
+        # Names the declared hooks, so the operator can tell which code is stale.
+        assert "routes" in out and "on_startup" in out
+        # Names the recovery, not just the problem.
+        assert "restart" in out
+        # The enable itself still reports success -- the notice is additive.
+        from kiro_crew.apps.manager import _read_installed
+
+        meta = _read_installed("cli-test-app")
+        assert meta is not None and meta.enabled is True
+
+    def test_enable_says_nothing_for_an_app_without_hooks(
+        self, tmp_path, app_env, capsys
+    ):
+        """No hooks means nothing in-process can be stale -- stay quiet."""
+        install_app(_make_app_source(tmp_path))
+
+        self._enable()
+
+        out = capsys.readouterr().out
+        assert "backend hooks" not in out
+        assert "restart" not in out
+
+    def test_notice_helper_tolerates_a_malformed_backend_block(
+        self, tmp_path, app_env
+    ):
+        """A hand-edited app.json must not turn the notice into a crash.
+
+        ``backend`` and ``backend.hooks`` are user-editable JSON, so either can
+        arrive as a non-dict. The helper reports "nothing to warn about" rather
+        than raising out of a successful enable.
+        """
+        from kiro_crew.cli_commands import _warn_hooks_need_restart
+
+        install_app(_make_app_source(tmp_path))
+        app_json = app_env["home"] / "apps" / "cli-test-app" / APP_MANIFEST_FILENAME
+        data = json.loads(app_json.read_text())
+        data["backend"] = {"hooks": "backend.routes:register_routes"}
+        app_json.write_text(json.dumps(data))
+
+        assert _warn_hooks_need_restart("cli-test-app") is False
 
 
 class TestEnableRegistersCrons:
@@ -191,7 +266,7 @@ class TestEnableRegistersCrons:
     def _enable(self):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         ns = argparse.Namespace(app_action="enable", name="cli-test-app")
         _handle_app(ns)
@@ -263,7 +338,7 @@ class TestEnableRegistersCrons:
     def test_disable_removes_registered_crons(self, tmp_path, app_env):
         import argparse
 
-        from kiro_crew.cli import _handle_app
+        from kiro_crew.cli_commands import _handle_app
 
         src = _make_app_source(tmp_path, crons=self.CRONS)
         install_app(src)

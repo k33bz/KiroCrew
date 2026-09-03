@@ -6,6 +6,14 @@ import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import type { Artifact } from '../types'
 
+// The sandboxed frame mints its document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
+
 vi.mock('../api/client')
 vi.mock('../pages/ChatPage', () => ({
   default: () => <div data-testid="chat-page" />,
@@ -39,7 +47,10 @@ function renderRoute() {
 describe('ArtifactDetailPage — sticky header', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
+    // Well-formed blob: URI, not a bare 'blob:test' literal — see the note in
+    // WidgetFrame.test.tsx's beforeEach for why a malformed mock value here
+    // risks a deferred ECONNREFUSED crashing an unrelated shard.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:http://localhost:6776/test')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     vi.mocked(api).artifactEvents = vi.fn().mockResolvedValue({ slug: 'cr-queue', events: [] })
     vi.mocked(api).artifactComments = vi.fn().mockResolvedValue({ comments: [] })

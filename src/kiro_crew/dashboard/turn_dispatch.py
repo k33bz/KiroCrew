@@ -32,7 +32,7 @@ from collections.abc import Coroutine
 from contextvars import ContextVar
 from typing import Any
 
-from kiro_crew.acp.client import _DEFAULT_PROMPT_TIMEOUT
+from kiro_crew.acp.client import resolve_prompt_timeout
 from kiro_crew.config.loader import (
     APPROVAL_TURN_MARGIN_SECS,
     TOOL_APPROVAL_TIMEOUT_MIN,
@@ -68,10 +68,16 @@ def _turn_budget_remaining() -> float | None:
 def _acp_prompt_ceiling() -> float:
     """The transport's own per-prompt timeout.
 
+    Resolves through :func:`~kiro_crew.acp.client.resolve_prompt_timeout`, which
+    follows a configured ceiling ABOVE the 2h default (plus a margin so this
+    module's card always fires before the transport cut). The clamp in
+    :func:`chat_turn_timeout_secs` therefore no longer fires in normal operation;
+    it stays as the fail-safe for a resolver that could not read config.
+
     A function rather than a bare constant reference so tests can substitute it
     without reaching into ``acp.client``.
     """
-    return float(_DEFAULT_PROMPT_TIMEOUT)
+    return float(resolve_prompt_timeout())
 
 
 def chat_turn_timeout_secs() -> float:
@@ -247,6 +253,27 @@ def finish_turn_task(
         logger.warning(
             "Chat turn in slot %s hit the %.0fs ceiling", getattr(slot, "key", "?"), timeout_secs
         )
+        # Hang-resilience series: THE deadline path for the 2h-ceiling hang
+        # class — _bounded_turn cancels _run_chat before any EVENT_COMPLETE,
+        # so the in-turn emit never fires here. _run_chat's finally stashed
+        # the attribution snapshot on the slot just before teardown.
+        try:
+            from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
+
+            emit_counter(
+                TURN_TIMEOUT_CAUSE,
+                {
+                    "path": "dashboard_ceiling",
+                    "awaiting_permission": bool(
+                        getattr(slot, "_last_turn_awaiting_permission", False)
+                    ),
+                    "children_announced": bool(
+                        getattr(slot, "_last_turn_children_announced", False)
+                    ),
+                },
+            )
+        except Exception:
+            logger.debug("timeout-cause metric emit failed", exc_info=True)
         try:
             # slot.append persists the card AND broadcasts it once; do not also
             # broadcast_ws here or the UI renders a duplicate.
@@ -265,7 +292,12 @@ def finish_turn_task(
     )
 
 
-async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -> Any:
+async def _bounded_turn(
+    coro: "Coroutine[Any, Any, Any]",
+    timeout_secs: float,
+    *,
+    _started: "list[None] | None" = None,
+) -> Any:
     """Run *coro* under a wall-clock ceiling, raising even on a suppressed deadline.
 
     ``asyncio.wait_for`` cannot be used directly here. It cancels the coroutine
@@ -286,12 +318,19 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
     result. ``_run_chat``'s cancellation semantics are untouched — they are
     shared with the user's Stop button.
     """
+    # ``spawn_guarded_turn`` uses this yield-free marker to distinguish a
+    # wrapper that claimed its input coroutine from one cancelled before its
+    # first event-loop step.  In the latter case this function's ``finally``
+    # never runs, so the dispatch helper must close the still-unclaimed input.
+    if _started is not None:
+        _started.append(None)
+
     loop = asyncio.get_running_loop()
     deadline_fired = False
 
     def _on_deadline() -> None:
         nonlocal deadline_fired
-        if not task.done():
+        if task is not None and not task.done():
             deadline_fired = True
             task.cancel()
 
@@ -301,18 +340,30 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
     # copy carries it; reset in the finally so a direct `await _bounded_turn(...)`
     # cannot leak a spent deadline into the caller's context and starve the next
     # turn dispatched there.
-    deadline_token = _TURN_DEADLINE.set(loop.time() + timeout_secs)
-    task: "asyncio.Task[Any]" = asyncio.ensure_future(coro)
-    handle = loop.call_later(timeout_secs, _on_deadline)
+    previous_deadline = _TURN_DEADLINE.get()
+    _TURN_DEADLINE.set(loop.time() + timeout_secs)
+    task: "asyncio.Task[Any] | None" = None
+    handle: "asyncio.TimerHandle | None" = None
+    _generator_exit = False
     try:
+        try:
+            task = asyncio.ensure_future(coro)
+        except BaseException:
+            # Ownership was not transferred to a Task.
+            coro.close()
+            raise
+
+        # Keep timer creation inside the same ownership transaction.  Although
+        # the real event loop almost never rejects ``call_later``, a closing or
+        # instrumented loop can: the just-created Task must not outlive that
+        # failed dispatch.
+        handle = loop.call_later(timeout_secs, _on_deadline)
         try:
             result = await task
         except asyncio.CancelledError:
             if deadline_fired:
                 # Our ceiling cut it and the turn let the cancellation through.
-                raise TimeoutError(
-                    f"turn exceeded the {timeout_secs:.0f}s ceiling"
-                ) from None
+                raise TimeoutError(f"turn exceeded the {timeout_secs:.0f}s ceiling") from None
             # Cancelled by something else (Stop button, shutdown) — propagate.
             raise
         if deadline_fired:
@@ -320,12 +371,61 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
             # the production path: without this the ceiling is silently absorbed.
             raise TimeoutError(f"turn exceeded the {timeout_secs:.0f}s ceiling")
         return result
+    except GeneratorExit:
+        # This wrapper is being torn down directly -- its own coroutine object
+        # is being ``close()``-d, which happens when nothing ever awaited or
+        # cancelled it through a live Task and the garbage collector reclaims
+        # it instead (an orphaned ``spawn_guarded_turn`` dispatch nobody
+        # joined). Unlike a live ``CancelledError`` unwind, there is no
+        # guarantee the event loop that would drive ``task`` to completion is
+        # even still running -- ``close()`` resumes this frame synchronously
+        # from whatever thread the collector runs on, not from a loop
+        # callback. A coroutine that suspends again while unwinding a
+        # GeneratorExit gets "coroutine ignored GeneratorExit" from the
+        # interpreter, so ``_generator_exit`` below tells the ``finally`` to
+        # skip the join and only cancel best-effort.
+        _generator_exit = True
+        raise
     finally:
-        handle.cancel()
-        _TURN_DEADLINE.reset(deadline_token)
-        if not task.done():
-            # The wrapper itself was cancelled; don't orphan the turn.
-            task.cancel()
+        if handle is not None:
+            handle.cancel()
+        # Restore by value instead of retaining a ContextVar token. Test and
+        # shutdown harnesses may resume coroutine finalization in a copied
+        # Context (notably Windows xdist); reset(token) then raises and can take
+        # down the whole worker because tokens are context-bound.
+        _TURN_DEADLINE.set(previous_deadline)
+        if task is not None and not task.done():
+            # The wrapper itself was cancelled, or setup failed after Task
+            # creation.  Cancel AND join it: cancellation alone can leave an
+            # unstarted coroutine pending until a later GC cycle.
+            try:
+                task.cancel()
+            except RuntimeError:
+                # The loop that owned ``task`` is already closed (the
+                # GeneratorExit case, or a shutdown race). Nothing left to
+                # schedule the cancellation on.
+                pass
+            if not _generator_exit:
+                try:
+                    await task
+                except BaseException:
+                    # Cleanup must preserve the exception already leaving the
+                    # wrapper (setup failure or caller cancellation).
+                    pass
+
+
+async def bounded_chat_turn(coro: "Coroutine[Any, Any, Any]") -> Any:
+    """Bound *coro* by the configured turn ceiling, resolved OFF the event loop.
+
+    For task-creation sites that cannot ``await`` (sync callbacks, dispatch
+    helpers): ``asyncio.create_task(bounded_chat_turn(_run_chat(...)))`` moves
+    the :func:`chat_turn_timeout_secs` resolution — a ``KiroCrewConfig.load()``
+    whose cache-miss path reads and re-validates the config file — into the
+    task itself via ``asyncio.to_thread``, so an edited config never stalls
+    the loop shared by every session.
+    """
+    timeout = await asyncio.to_thread(chat_turn_timeout_secs)
+    return await asyncio.wait_for(coro, timeout=timeout)
 
 
 def spawn_guarded_turn(
@@ -345,8 +445,27 @@ def spawn_guarded_turn(
     keep doing so; this helper deliberately does not own those fields, because
     they carry site-specific stop/steer semantics.
     """
-    timeout = chat_turn_timeout_secs() if timeout_secs is None else timeout_secs
-    task = asyncio.create_task(_bounded_turn(coro, timeout))
+    started: list[None] = []
+    bounded = None
+    try:
+        timeout = chat_turn_timeout_secs() if timeout_secs is None else timeout_secs
+        bounded = _bounded_turn(coro, timeout, _started=started)
+        task = asyncio.create_task(bounded)
+    except BaseException:
+        # The caller created ``coro`` before entering this helper.  If timeout
+        # resolution or task creation fails, no Task owns either coroutine.
+        if bounded is not None:
+            bounded.close()
+        coro.close()
+        raise
     state._background_tasks.add(task)
-    task.add_done_callback(lambda t: finish_turn_task(state, slot, t, timeout))
+
+    def _finish(t: "asyncio.Task[Any]") -> None:
+        if not started:
+            # A Task cancelled before its first loop step closes the bounded
+            # wrapper but not the input coroutine stored in its arguments.
+            coro.close()
+        finish_turn_task(state, slot, t, timeout)
+
+    task.add_done_callback(_finish)
     return task

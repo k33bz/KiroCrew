@@ -33,6 +33,11 @@ import type { CompanionStats, McpServerInfo } from '../apps/mochi/src/shared/typ
 const mocks = vi.hoisted(() => {
   /** `onSettingsCloseRequested` subscribers, so a native close can be replayed. */
   const closeRequested = new Set<() => void>()
+  /** Default subscribe: register only. Restored after any test that replaces it. */
+  const subscribeClose = (cb: () => void) => {
+    closeRequested.add(cb)
+    return () => { closeRequested.delete(cb) }
+  }
   const api = {
     hasShell: true,
     getConfig: vi.fn<() => Promise<unknown>>(),
@@ -45,16 +50,15 @@ const mocks = vi.hoisted(() => {
     getMcpServers: vi.fn<() => Promise<unknown>>(),
     discoverMcpTools: vi.fn<(name: string) => Promise<unknown>>(),
     getModels: vi.fn<() => Promise<unknown>>(),
-    setModel: vi.fn<(m: string) => Promise<boolean>>(),
+    getSlotModel: vi.fn<() => Promise<string>>(),
+    setModel: vi.fn<(m: string) => Promise<{ ok: boolean; code?: string }>>(),
     galleryOpen: vi.fn(),
     openExternal: vi.fn(),
-    onSettingsCloseRequested: (cb: () => void) => {
-      closeRequested.add(cb)
-      return () => { closeRequested.delete(cb) }
-    },
+    onSettingsCloseRequested: subscribeClose,
   }
   return {
     api,
+    subscribeClose,
     /** Replay the native window-close request the shell sends on the red ×. */
     requestClose: () => { for (const cb of [...closeRequested]) cb() },
     clearCloseRequested: () => closeRequested.clear(),
@@ -162,9 +166,17 @@ function openSection(label: string): void {
   fireEvent.click(screen.getByRole('button', { name: label }))
 }
 
-/** The label-wrapped radio rows (behavior / trust / tier) have no role. */
+/**
+ * The radio rows (behavior / trust / tier), reached by their visible text.
+ *
+ * They carry `role="radio"` rather than being `<label>`s: a label with no control
+ * inside is not a label, and the rows used to be mouse-only — no focus, no
+ * arrow-key movement, nothing announced. Selected by ROLE now, which is what a
+ * user's assistive technology sees, so the query cannot drift from the semantics
+ * again the way a tag-name query did.
+ */
 function clickRow(text: string): void {
-  const row = screen.getByText(text).closest('label')
+  const row = screen.getByText(text).closest('[role="radio"]')
   if (!row) throw new Error(`no option row for ${text}`)
   fireEvent.click(row)
 }
@@ -188,7 +200,8 @@ beforeEach(() => {
   api.getMcpServers.mockReset().mockResolvedValue([])
   api.discoverMcpTools.mockReset().mockResolvedValue(null)
   api.getModels.mockReset().mockResolvedValue([])
-  api.setModel.mockReset().mockResolvedValue(true)
+  api.getSlotModel.mockReset().mockResolvedValue('')
+  api.setModel.mockReset().mockResolvedValue({ ok: true })
   api.galleryOpen.mockReset()
   api.openExternal.mockReset()
   // The background section reads its usage ledger over plain fetch. Default to a
@@ -198,6 +211,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // Tests may replace this to fire during subscribe; put the register-only
+  // default back so the next case does not inherit an early-fire mock.
+  api.onSettingsCloseRequested = mocks.subscribeClose
 })
 
 /* ── loading gate ─────────────────────────────────────────────── */
@@ -370,8 +386,8 @@ describe('SettingsPanel behavior section', () => {
     await mount()
     openSection('Behavior')
 
-    const quiet = screen.getByText('Quiet').closest('label') as HTMLElement
-    const normal = screen.getByText('Normal').closest('label') as HTMLElement
+    const quiet = screen.getByText('Quiet').closest('[role="radio"]') as HTMLElement
+    const normal = screen.getByText('Normal').closest('[role="radio"]') as HTMLElement
     expect(normal.style.background).toBe('var(--accent-glow)')
 
     fireEvent.click(quiet)
@@ -425,15 +441,15 @@ describe('SettingsPanel background activity section', () => {
     await mount()
     openSection('Background Activity')
 
-    expect((screen.getByText('Balanced').closest('label') as HTMLElement).style.background)
+    expect((screen.getByText('Balanced').closest('[role="radio"]') as HTMLElement).style.background)
       .toBe('var(--accent-glow)')
     clickRow('Economy')
-    expect((screen.getByText('Economy').closest('label') as HTMLElement).style.background)
+    expect((screen.getByText('Economy').closest('[role="radio"]') as HTMLElement).style.background)
       .toBe('var(--accent-glow)')
 
     // Behavior is a separate key and must be untouched by a tier pick.
     openSection('Behavior')
-    expect((screen.getByText('Normal').closest('label') as HTMLElement).style.background)
+    expect((screen.getByText('Normal').closest('[role="radio"]') as HTMLElement).style.background)
       .toBe('var(--accent-glow)')
   })
 
@@ -493,6 +509,49 @@ describe('SettingsPanel model section', () => {
     // The chat model is applied now, not staged, so Save stays disabled.
     await waitFor(() => expect(screen.queryByText('Switching model...')).toBeNull())
     expect(saveButton().disabled).toBe(true)
+    // A confirmed switch keeps the picked value — the refusal rollback below
+    // must never fire on {ok: true}.
+    expect((chat as HTMLSelectElement).value).toBe('claude-x')
+  })
+
+  it('hydrates the selector from the slot model instead of opening on Auto', async () => {
+    api.getModels.mockResolvedValue([{ model_name: 'gpt-y' }])
+    api.getSlotModel.mockResolvedValue('gpt-y')
+    await mount()
+    openSection('LLM Model')
+
+    const [chat] = await screen.findAllByRole('combobox')
+    await waitFor(() => expect((chat as HTMLSelectElement).value).toBe('gpt-y'))
+  })
+
+  it('rolls back to the hydrated model and says why when the switch is refused mid-turn', async () => {
+    api.getModels.mockResolvedValue([{ model_name: 'claude-x' }, { model_name: 'gpt-y' }])
+    api.getSlotModel.mockResolvedValue('claude-x')
+    api.setModel.mockResolvedValue({ ok: false, code: 'turn_in_flight' })
+    await mount()
+    openSection('LLM Model')
+
+    const [chat] = await screen.findAllByRole('combobox')
+    await waitFor(() => expect((chat as HTMLSelectElement).value).toBe('claude-x'))
+    fireEvent.change(chat, { target: { value: 'gpt-y' } })
+
+    // The gateway kept claude-x, so the selector must not claim gpt-y — and
+    // the user must be told the refusal is temporary, not a breakage.
+    await waitFor(() => expect((chat as HTMLSelectElement).value).toBe('claude-x'))
+    expect(await screen.findByText('A turn is running — try again when it finishes.')).toBeTruthy()
+  })
+
+  it('names a generic reported refusal instead of snapping back silently', async () => {
+    api.getModels.mockResolvedValue([{ model_name: 'gpt-y' }])
+    api.setModel.mockResolvedValue({ ok: false })
+    await mount()
+    openSection('LLM Model')
+
+    const [chat] = await screen.findAllByRole('combobox')
+    fireEvent.change(chat, { target: { value: 'gpt-y' } })
+
+    await waitFor(() => expect((chat as HTMLSelectElement).value).toBe(''))
+    expect(await screen.findByText('Something went wrong')).toBeTruthy()
   })
 
   it('stages the background model instead of applying it, since it is config', async () => {
@@ -1117,5 +1176,30 @@ describe('SettingsPanel close', () => {
     mocks.requestClose()
 
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+  })
+
+  it('survives a native close that fires during subscribe', () => {
+    // Pins the TDZ: subscribe used to close over handleClose declared later in
+    // the component body, so an early fire threw ReferenceError.
+    api.onSettingsCloseRequested = (cb: () => void) => {
+      cb()
+      return mocks.subscribeClose(cb)
+    }
+
+    expect(() => render(<SettingsPanel onClose={onClose} />)).not.toThrow()
+  })
+
+  it('keeps the native-close handler current after re-renders', async () => {
+    // Pins the empty-deps stale-closure case: the first handleClose always saw
+    // isDirty false (config not landed yet), so a later close skipped the prompt.
+    await mount()
+    openSection('Appearance')
+    openSection('Behavior')
+    openSection('General')
+    fireEvent.change(screen.getByDisplayValue('Mochi'), { target: { value: 'Tofu' } })
+
+    mocks.requestClose()
+    expect(await screen.findByText('Unsaved Changes')).toBeTruthy()
+    expect(onClose).not.toHaveBeenCalled()
   })
 })

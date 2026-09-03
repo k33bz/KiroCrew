@@ -45,7 +45,7 @@ by name; the two together are why a single missed AST pattern is not an escape.
 | Gate | Guarantees | Pinned by | Constrains |
 |---|---|---|---|
 | B1 | A workflow script may not `import` anything, and may not reference `eval` / `exec` / `compile` / `open` / `__import__` / `globals` / `locals` / `getattr` / `setattr` / `vars` / `input` / `__builtins__`. The rejection message names the offending symbol. | `test_workflows_invariants.py::test_b1_imports_rejected`, `::test_b1_forbidden_builtins_rejected` | `validate.py` |
-| B2 | No dunder attribute or name access (`().__class__`, `__builtins__`, and the rest), and an inline adversarial-escape corpus is rejected wholesale. | `test_workflows_invariants.py::test_b2_dunder_attribute_rejected`, `::test_b2_adversarial_escapes_rejected` | `validate.py` |
+| B2 | No dunder attribute or name access (`().__class__`, `__builtins__`, and the rest), no private (`_`-prefixed) attribute access, and no `.format` / `.format_map` call — their template is interpreted at run time, so a traversal can be assembled from parts no static fold can resolve (f-strings are the replacement: their fields are real AST and are already checked). An inline adversarial-escape corpus is rejected wholesale. | `test_workflows_invariants.py::test_b2_dunder_attribute_rejected`, `::test_b2_adversarial_escapes_rejected` | `validate.py` |
 | B3 | The nondeterminism modules (`time`, `random`, `uuid`) are unreachable, statically (they cannot be imported) and at run time (no `__import__` in the sandbox namespace, and `SAFE_BUILTINS` excludes nondeterministic and I/O builtins). Determinism is what makes a run stream resume-stable. | static: `test_workflows_invariants.py::test_b3_determinism_modules_rejected`, `::test_b3_safe_builtins_exclude_nondeterminism_and_io`; runtime: `test_workflows_context.py::test_import_statement_fails_in_safe_globals`, `::test_hostile_snippet_fails_at_runtime_in_safe_globals` | `validate.py`, `context.py` (`build_safe_globals`) |
 | B4 | Event persistence is JSON only: `serialize_events` / `deserialize_events` round-trip through `json`, reject non-JSON and non-array input, and the module imports no `pickle` / `marshal` / `shelve`. | `test_workflows_events.py::test_round_trip_through_json`, `::test_serialize_output_is_pure_json`, `::test_deserialize_rejects_non_json`, `::test_events_module_has_no_pickle_import` | `events.py` |
 | B5 | A wall-clock timeout terminates a runaway run and reports it as a clean `run_failed` with `where == "ceiling"` and `error == "timeout"`. The guard must never let an `asyncio.CancelledError` escape `run()` to the caller. | `test_workflows_runner.py::test_wall_clock_timeout_kills_runaway`, `::test_timeout_never_leaks_cancellederror` | `runner.py` |
@@ -93,7 +93,9 @@ crashing.
 The backend half of the tab is covered without gate ids, in
 `test_workflows_app.py` (manifest shape, `handle_validate` / `handle_run` /
 `handle_examples`, and redaction of credentials and exfiltration URLs before a
-run payload leaves the handler).
+run payload leaves the handler) and `test_workflow_handler_json_contract.py`
+(every legacy mutation handler rejects a non-object JSON body with a coded 400
+before service dispatch, while object bodies still reach that service).
 
 ## Group F: fitness gates on the engine itself
 
@@ -118,6 +120,7 @@ scripts, so the rate is a measurement and not a tautology.
 |---|---|---|---|
 | G1 | The first-try valid-script rate over the candidate set is at or above `G1_TARGET = 0.80`, every shipped example validates, and each deliberately flawed candidate is actually rejected. | `test_workflows_authoring_eval.py::test_g1_shipped_examples_all_validate`, `::test_g1_first_try_valid_rate_meets_target`, `::test_g1_flawed_candidates_are_caught` | `validate.py`, the shipped example scripts the test resolves |
 | G2 | Every script that validates terminates cleanly against a stub provider: `run_started` first, `run_finished` or `run_failed` last, `seq` contiguous. It never hangs, and no exception escapes the runner (a run that ends `run_failed` still satisfies G2, which is about termination and stream shape). | `test_workflows_authoring_eval.py::test_g2_valid_scripts_run_to_completion`, `::test_g2_simple_authored_script_fully_succeeds` | `runner.py`, `validate.py` |
+| G3 | Author-session startup retries only transient ACP startup failures, uses a fresh isolated key for each attempt, destroys a partial session before retrying, and preserves the final startup error when the bounded attempt budget is exhausted. Successfully acquired author sessions are stateless and destroyed after authoring, so their provider, registry entry, and SessionMap entry do not survive. Arbitrary failures are not retried. | `test_workflows_service.py::test_author_retries_transient_startup_with_fresh_session`, `::test_author_destroys_partial_session_before_startup_retry`, `::test_author_does_not_retry_arbitrary_startup_failure`, `::test_author_startup_retry_exhaustion_preserves_last_error`, `::test_author_uses_isolated_destroyed_lite_session` | `service.py`, `session.py` |
 
 ## Adding or changing a gate
 

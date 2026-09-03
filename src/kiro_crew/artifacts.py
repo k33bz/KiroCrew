@@ -60,6 +60,7 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
     WebAppTeardown,
     webapp_metadata_from_dict,
 )
+from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
 from kiro_crew.security import is_sensitive_path
 
@@ -158,9 +159,8 @@ MAX_EVENTS_PER_ARTIFACT = 500
 #: are dropped (a thread root + its replies together), never a reply orphaned.
 MAX_COMMENTS_PER_ARTIFACT = 500
 
-#: Maximum number of tags per artifact, and max length per tag.
+#: Maximum number of tags per artifact. Per-tag length is bounded by ``_TAG_RE``.
 MAX_TAGS = 16
-MAX_TAG_LEN = 64
 
 # Slug pattern: lowercase letters, digits, hyphens. 1-80 chars. No leading or
 # trailing hyphen. Single-character slugs are allowed for trivial names.
@@ -252,6 +252,9 @@ class ArtifactPublication:
     collab_mode: str = "mirror"
     last_pushed_sha256: str = ""  # concurrency guard for the next version push
     last_synced_kirocrew_version: int = 0
+    #: Wrapper envelope revision at the time of the last push — compared against
+    #: ``publish_sync.WRAPPER_REVISION`` to detect wrapper-only staleness (#3373).
+    wrapper_revision: int = 0
     # Maps str(kirocrew_version) -> remote_version_number.
     version_map: dict[str, int] = field(default_factory=dict)
     published_at: str = ""
@@ -466,9 +469,9 @@ class Artifact:
     #: the live read of it FAILED — the file was deleted or moved, is no longer
     #: readable, or resolves outside the roots that authorize it. The store
     #: falls back to the last snapshot in that case so the artifact stays
-    #: viewable, which used to make a dead pointer indistinguishable from a
-    #: healthy one (``live_dirty`` was computed against the fallback and so
-    #: read "in sync"). This field is the signal that the pointer is dead.
+    #: viewable, which on its own makes a dead pointer indistinguishable from a
+    #: healthy one (``live_dirty`` is computed against the fallback and so
+    #: reads "in sync"). This field is the signal that the pointer is dead.
     #: Not persisted; set by ``get()`` — same contract as ``live_dirty``.
     source_missing: bool = False
     #: Structured metadata for ``kind="webapp"`` artifacts — a deployed application
@@ -649,6 +652,55 @@ def is_document_path(path: str) -> bool:
     if not path:
         return False
     return os.path.splitext(path)[1].lower() in DOC_EXTENSIONS
+
+
+# Literal-color detector backing the theme-contrast warning. Lives here (the
+# store module) so every artifact-authoring surface computes the SAME verdict:
+# the gateway handlers stamp it on save/update responses, and the MCP tool
+# phrases its own hint from it. Hex colors are 3/4/6/8 digits -- 5 and 7 are
+# excluded on purpose so hex-ish CSS id selectors ("#added1") don't fire. The
+# leading [:=(\s"'] anchors the literal to a value position (color:#111,
+# fill="#111") rather than a fragment anchor or an id selector at line start.
+# IGNORECASE is what lets RGB(...) / HSL(...) match -- CSS functions are
+# case-insensitive. Fragment/URL hrefs (href="#abc") are excluded by
+# stripping href attributes BEFORE scanning (see _HREF_ATTR_RE) rather than
+# by a lookbehind: Python lookbehinds must be fixed-width, so a lookbehind
+# cannot tolerate `href = "#abc"` spacing -- the strip is whitespace-tolerant
+# and covers xlink:href and any case for free.
+# Accepted noise, documented rather than parsed away: a whitespace-preceded
+# hex-ish id selector ("... } #decade {") can still fire, but whitespace must
+# stay in the prefix class or true positives like "border: 1px solid #ccc"
+# are lost -- and every consumer surfaces this as a soft warning, never a
+# rejection.
+_HARDCODED_COLOR_RE = re.compile(
+    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"
+    r"|\brgba?\("
+    r"|\bhsla?\(",
+    re.IGNORECASE,
+)
+
+# href / xlink:href attribute (quoted value), whitespace-tolerant around the
+# ``=``. An href value is a URL or fragment, never a rendered color, so it is
+# removed before the color scan to keep the warning's false-positive rate low.
+_HREF_ATTR_RE = re.compile(r"href\s*=\s*(\"[^\"]*\"|'[^']*')", re.IGNORECASE)
+
+
+def has_unthemed_hardcoded_colors(kind: str, content: str) -> bool:
+    """True when iframe-rendered content hardcodes its palette.
+
+    Only widget/html kinds render inside the dashboard's themed iframe, so
+    only they can clash with the injected theme defaults. Content carrying a
+    single ``var(--`` reference is treated as theme-aware -- including the
+    recommended fallback form ``color:var(--text,#111)`` -- and never flags.
+    A full foreground/background *pairing* check needs a CSS parser; this
+    zero-var heuristic catches the observed failure class (partially styled
+    content clashing with the injected theme) with one regex.
+    """
+    if kind not in ("widget", "html"):
+        return False
+    if not content or "var(--" in content:
+        return False
+    return bool(_HARDCODED_COLOR_RE.search(_HREF_ATTR_RE.sub("href=x", content)))
 
 
 def _infer_kind(content: str, source_path: str = "", explicit: str | None = None) -> str:
@@ -835,12 +887,12 @@ def _validate_description(description: str | None) -> str:
 def _validate_source_path(value: str | None, field_name: str = "source_path") -> str:
     """Validate a filesystem-pointer field (``source_path`` / ``source_root``).
 
-    REJECTS an over-long value instead of truncating it. Truncation used to be
-    silent (``source_path[:512]``), which turned a too-long-but-valid path into
-    a shorter path that points somewhere else — practically always somewhere
-    that doesn't exist. The artifact then looked file-backed while its live read
-    could never succeed. Failing the save is the honest outcome: the caller
-    learns immediately instead of the user discovering a hollow artifact later.
+    REJECTS an over-long value instead of truncating it. Silent truncation
+    (``source_path[:512]``) turns a too-long-but-valid path into a shorter path
+    that points somewhere else — practically always somewhere that doesn't
+    exist. The artifact then looks file-backed while its live read can never
+    succeed. Failing the save is the honest outcome: the caller learns
+    immediately instead of the user discovering a hollow artifact later.
     """
     if value is None:
         return ""
@@ -980,16 +1032,41 @@ def _sniff_webp_dimensions(data: bytes) -> tuple[int | None, int | None]:
 # ── Store ────────────────────────────────────────────────────────────────────
 
 
+#: One lock per resolved artifact root, shared across every ``ArtifactStore``
+#: instance pointed at that root -- not just the process-wide singleton
+#: (:func:`get_default_store`). A caller that constructs its own
+#: ``ArtifactStore()`` against the default root (as opposed to threading the
+#: singleton through) would otherwise get its own private
+#: ``threading.Lock()``, unserialized against every other instance on the
+#: same root: two writers (or a writer and a reader) could interleave their
+#: file operations, corrupting a version or serving a stale read. Keyed by
+#: the resolved root path so distinct roots (tests' isolated tmp_path stores)
+#: still get independent locks.
+_root_locks: dict[str, threading.Lock] = {}
+_root_locks_guard = threading.Lock()
+
+
+def _lock_for_root(root: Path) -> threading.Lock:
+    key = str(root)
+    with _root_locks_guard:
+        lock = _root_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _root_locks[key] = lock
+        return lock
+
+
 class ArtifactStore:
     """File-system backed store for artifacts.
 
-    Thread-safe via a coarse-grained lock; concurrent writes to the same
-    artifact are serialized.
+    Thread-safe via a coarse-grained lock, shared across every instance
+    pointed at the same root (see :func:`_lock_for_root`) -- concurrent
+    writes to the same artifact are serialized regardless of how many
+    ``ArtifactStore`` objects address it.
     """
 
     def __init__(self, root: Path | None = None) -> None:
         self._root = (root or (config_dir() / "artifacts")).expanduser()
-        self._lock = threading.Lock()
         # Optional change-listener fired after a content-affecting mutation
         # (create / content-update / delete). Lets the gateway observe every
         # write path — agent (MCP-proxied), dashboard, bookmark, CLI, and the
@@ -1002,6 +1079,9 @@ class ArtifactStore:
         resolved = self._root.resolve(strict=False)
         if is_sensitive_path(str(resolved)):
             raise ArtifactError(f"refusing to use sensitive path as artifact root: {resolved}")
+        # Keyed by the RESOLVED root so a symlinked alias of the same
+        # directory still shares the lock, not just a literal path match.
+        self._lock = _lock_for_root(resolved)
         self._root.mkdir(parents=True, exist_ok=True)
 
     # ── public API ────────────────────────────────────────────────────────
@@ -1144,6 +1224,14 @@ class ArtifactStore:
             self._write_artifact(art, content)
             logger.info("artifact created: slug=%s name=%s kind=%s", slug, name, kind)
         self._fire_change("upsert", slug)
+        # After the write, so a failed create contributes nothing. ``kind`` and
+        # ``source`` are the values ``_validate_kind`` / ``_validate_source``
+        # already restrict to closed sets, and ``kind_auto`` says whether the
+        # kind was inferred rather than pinned by the caller.
+        emit_counter(
+            ARTIFACTS_CREATED,
+            {"kind": kind, "source": source, "kind_auto": bool(kind_auto)},
+        )
         return art
 
     def create_image(
@@ -1363,8 +1451,8 @@ class ArtifactStore:
                 else:
                     # Fall through to the snapshot fallback — file moved /
                     # deleted / unreadable / outside the authorized root. Flag
-                    # it: the fallback keeps the artifact viewable, which
-                    # previously made a dead pointer look completely healthy.
+                    # it: the fallback keeps the artifact viewable, which on its
+                    # own makes a dead pointer look completely healthy.
                     meta.source_missing = True
                     meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
             else:
@@ -1496,12 +1584,11 @@ class ArtifactStore:
                 return None
             # Bound the read at the FILE level, not after-the-fact: read
             # MAX_CONTENT_BYTES+1 bytes from disk, decode (errors='replace'
-            # for invalid sequences). Previously called
-            # p.read_text() which loads the entire file into memory before
-            # the size check — a multi-GB file pointed to by source_path
-            # would exhaust memory before truncation triggered. Bounding
-            # the read caps memory at MAX_CONTENT_BYTES+1 regardless of
-            # file size.
+            # for invalid sequences). p.read_text() would load the entire
+            # file into memory before the size check — a multi-GB file
+            # pointed to by source_path would exhaust memory before
+            # truncation triggered. Bounding the read caps memory at
+            # MAX_CONTENT_BYTES+1 regardless of file size.
             # Read through the descriptor-pinned helper rather than by name.
             # The containment check above is on a RESOLVED path, which still
             # leaves a check-to-use window: the final component, or an ancestor
@@ -1777,11 +1864,12 @@ class ArtifactStore:
                     # Lifecycle event. Caller-specified event_type wins
                     # (revert flow uses 'reverted'); otherwise actor-based
                     # default: agent → iterated, user → edited.
-                    resolved_event_type = (
-                        event_type
-                        if event_type is not None
-                        else ("iterated" if actor == "agent" else "edited")
-                    )
+                    if event_type is not None:
+                        resolved_event_type = event_type
+                    elif actor == "agent":
+                        resolved_event_type = "iterated"
+                    else:
+                        resolved_event_type = "edited"
                     self._append_event(
                         art,
                         type=resolved_event_type,
@@ -2225,7 +2313,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ) as exc:
@@ -2296,7 +2383,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ) as exc:
@@ -2381,7 +2467,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -2437,7 +2522,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -2482,7 +2566,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -3298,6 +3381,10 @@ class ArtifactStore:
             last_synced = int(raw_pub.get("last_synced_kirocrew_version", 0) or 0)
         except (TypeError, ValueError):
             last_synced = 0
+        try:
+            wrapper_rev = int(raw_pub.get("wrapper_revision", 0) or 0)
+        except (TypeError, ValueError):
+            wrapper_rev = 0
         return ArtifactPublication(
             artifact_id=str(artifact_id),
             view_url=str(raw_pub.get("view_url") or ""),
@@ -3308,6 +3395,7 @@ class ArtifactStore:
             collab_mode=("live" if raw_pub.get("collab_mode") == "live" else "mirror"),
             last_pushed_sha256=str(raw_pub.get("last_pushed_sha256") or ""),
             last_synced_kirocrew_version=last_synced,
+            wrapper_revision=wrapper_rev,
             version_map=version_map,
             published_at=str(raw_pub.get("published_at") or ""),
             published_by=str(raw_pub.get("published_by") or ""),
@@ -3902,13 +3990,6 @@ def get_default_store() -> ArtifactStore:
         return _default_store
 
 
-def reset_default_store() -> None:
-    """Drop the cached default store (test-only helper)."""
-    global _default_store
-    with _default_store_lock:
-        _default_store = None
-
-
 _default_folder_store: "ArtifactFolderStore | None" = None
 _default_folder_store_lock = threading.Lock()
 
@@ -3920,10 +4001,3 @@ def get_default_folder_store() -> "ArtifactFolderStore":
         if _default_folder_store is None:
             _default_folder_store = ArtifactFolderStore()
         return _default_folder_store
-
-
-def reset_default_folder_store() -> None:
-    """Drop the cached default folder store (test-only helper)."""
-    global _default_folder_store
-    with _default_folder_store_lock:
-        _default_folder_store = None

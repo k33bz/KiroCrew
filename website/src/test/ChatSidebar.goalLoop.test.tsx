@@ -28,21 +28,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -70,14 +70,16 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatSlot, SubagentActivity } from '../types'
 
 const UNREAD_DOT_TITLE = 'Agent finished — your turn'
 
 /** Minimal SubagentActivity — subagentCounts only reads `.status`. */
-const sa = (status: string) => ({ id: `id-${status}-${Math.random()}`, status } as any)
+const sa = (status: string) => ({ id: `id-${status}-${Math.random()}`, status } as unknown as SubagentActivity)
 
 function renderSidebar(
-  slots: any[],
+  slots: ChatSlot[],
   chat: Record<string, unknown>,
   { activeSlotProp = null, unreadSlots = [] }: { activeSlotProp?: string | null; unreadSlots?: string[] } = {},
 ) {
@@ -88,8 +90,8 @@ function renderSidebar(
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, goalLoops: {}, ...chat } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, goalLoops: {}, ...chat } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -195,5 +197,61 @@ describe('chat sidebar — goal-loop progress subtitle', () => {
     )
     expect(getByText('loop session')).toBeTruthy() // kept: active loop counts as in-progress
     expect(queryByText('idle session')).toBeNull() // filtered out: genuinely idle
+  })
+})
+
+describe('chat sidebar — interrupted goal loop', () => {
+  const STALLED_TITLE = 'Goal loop armed — last turn was interrupted; resume the chat or wait for the next cycle'
+
+  it('flashes the whole card danger-red and reads "interrupted" when the loop session sits behind Resume', () => {
+    // The reported bug: the turn died on a transient model error (trailing
+    // error row → summary interrupted=true) and the pill kept pulsing as if a
+    // cycle were executing — for up to idle_secs, until the next fire.
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, interrupted: true, last_message: 'cycle output' }]
+    const { getByText, getByTitle, container } = renderSidebar(
+      slots,
+      { goalLoops: { k: { cycle_count: 47, max_cycles: 72 } } },
+    )
+    expect(getByText(/Loop 47\/72 — interrupted/)).toBeTruthy()
+    const pill = getByTitle(STALLED_TITLE)
+    expect(pill).toBeTruthy()
+    // The pulse MEANS "work is happening" — the stalled glyph is STATIC danger
+    // ink; the flashing lives on the row container (`session-loop-stalled`,
+    // index.css), which pulses the WHOLE card red until the user resumes.
+    const glyph = container.querySelector('.lucide-goal')
+    expect(glyph).toBeTruthy()
+    expect(glyph!.classList.contains('animate-pulse')).toBe(false)
+    expect(glyph!.classList.contains('text-danger')).toBe(true)
+    const row = container.querySelector('[data-session-row="k"]')
+    expect(row).toBeTruthy()
+    expect(row!.classList.contains('session-loop-stalled')).toBe(true)
+    expect(container.querySelector('[title="Goal loop · cycle 47 of 72"]')).toBeNull()
+  })
+
+  it('keeps the pulse mid-turn — a trailing error row is superseded once a new turn runs', () => {
+    const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, interrupted: false }]
+    const { getByText, getByTitle, container } = renderSidebar(
+      slots,
+      { activeSlot: 'k', goalLoops: { k: { cycle_count: 47, max_cycles: 72 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { activeSlotProp: 'k' },
+    )
+    expect(getByText('Loop 47/72')).toBeTruthy()
+    expect(getByTitle('Goal loop · cycle 47 of 72')).toBeTruthy()
+    // Pulse lives on the gutter Goal glyph now (moved off the inline subtitle dot).
+    expect(container.querySelector('.lucide-goal.animate-pulse')).toBeTruthy()
+  })
+
+  it('keeps the pulse while a subagent wave is executing on the loop\'s behalf', () => {
+    // interrupted only describes the parent turn; children still working means
+    // the loop IS working.
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, interrupted: true }]
+    const { getByText, container } = renderSidebar(slots, {
+      goalLoops: { k: { cycle_count: 9, max_cycles: 24 } },
+      slotActivity: { k: { toolLog: [], subagents: { a: sa('running') } } },
+    })
+    expect(getByText(/1 agent running/)).toBeTruthy()
+    // The loop outranks the sub-agent count in the gutter, and a running child
+    // means the loop is working — so the gutter Goal glyph pulses.
+    expect(container.querySelector('.lucide-goal.animate-pulse')).toBeTruthy()
   })
 })

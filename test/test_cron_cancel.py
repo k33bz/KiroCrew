@@ -228,14 +228,25 @@ class TestSubprocessRegistry:
             assert "cancelme" in _RUNNING_PROCS
             started = time.time()
             assert kill_running_process("cancelme") is True
-            t.join(timeout=10)
-        assert not t.is_alive()
-        assert time.time() - started < 10  # died well before the 30s sleep
+            # Poll for thread death (same pattern as the registration wait
+            # above) instead of one fixed-budget join: an instantaneous
+            # is_alive() read behind a single join can report a still-dying
+            # thread on a loaded runner even when SIGTERM worked. The 20s
+            # deadline stays comfortably below the child's 30s sleep, so
+            # passing still proves death-by-cancellation, not natural expiry.
+            deadline = started + 20
+            while time.time() < deadline and t.is_alive():
+                t.join(timeout=0.1)
+        assert not t.is_alive(), "thread still alive 20s after SIGTERM"
+        # 25, not 20: the final join may return ~0.1s past the poll deadline
+        # with the thread already dead; the headroom keeps that success from
+        # failing here while staying well below the 30s natural expiry.
+        assert time.time() - started < 25  # died well before the 30s sleep
         assert result["status"] == "cancelled"
         assert "cancelme" not in _RUNNING_PROCS
         assert "cancelme" not in _CANCELLED_PROC_JOBS  # flag consumed
 
-    def test_run_command_without_job_id_not_registered(self) -> None:
+    def test_run_command_without_job_id_not_registered(self, posix_test_shell) -> None:
         # Patch the sandbox wrap to identity for the same reason as the mid-run
         # test above: GH Actions blocks the namespace sandbox (unshare NEWNS),
         # so the real launcher aborts with status "error". What's under test is
@@ -248,7 +259,7 @@ class TestSubprocessRegistry:
         ), patch(
             # Bypass the runtime shell probe (which itself spawns a child) — the
             # test is about the registry, not shell fingerprinting.
-            "kiro_crew.cron_script._resolve_command_shell", return_value="sh"
+            "kiro_crew.cron_script._resolve_command_shell", return_value=posix_test_shell
         ):
             result = run_command_sandboxed("echo hi", timeout=10)
         assert result["status"] == "ok"

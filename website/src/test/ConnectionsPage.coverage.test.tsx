@@ -20,6 +20,7 @@
 // broadcasts. Interactions use `fireEvent` (no fake timers anywhere, so no
 // clock to keep in sync) and every assertion waits on rendered output.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { StrictMode } from 'react'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 
 import type { ChatMessage, McpServer, RootState } from '../types'
@@ -28,8 +29,16 @@ const mcpServers = vi.fn()
 const mcpProbe = vi.fn()
 const mcpApply = vi.fn()
 const mcpCustomAdd = vi.fn()
+const mcpCustomGet = vi.fn()
 const mcpCustomUpdate = vi.fn()
 const mcpOAuthRelay = vi.fn()
+const connectionsMint = vi.fn()
+const connectionsMintState = vi.fn()
+const connectionsPremint = vi.fn()
+const connectionsStatus = vi.fn()
+const connectionsCancel = vi.fn()
+const connectionsDisconnect = vi.fn()
+const connectionsTest = vi.fn()
 
 vi.mock('../api/client', () => ({
   api: {
@@ -37,8 +46,16 @@ vi.mock('../api/client', () => ({
     mcpProbe: (...a: unknown[]) => mcpProbe(...a),
     mcpApply: (...a: unknown[]) => mcpApply(...a),
     mcpCustomAdd: (...a: unknown[]) => mcpCustomAdd(...a),
+    mcpCustomGet: (...a: unknown[]) => mcpCustomGet(...a),
     mcpCustomUpdate: (...a: unknown[]) => mcpCustomUpdate(...a),
     mcpOAuthRelay: (...a: unknown[]) => mcpOAuthRelay(...a),
+    connectionsMint: (...a: unknown[]) => connectionsMint(...a),
+    connectionsMintState: (...a: unknown[]) => connectionsMintState(...a),
+    connectionsPremint: (...a: unknown[]) => connectionsPremint(...a),
+    connectionsStatus: (...a: unknown[]) => connectionsStatus(...a),
+    connectionsCancel: (...a: unknown[]) => connectionsCancel(...a),
+    connectionsDisconnect: (...a: unknown[]) => connectionsDisconnect(...a),
+    connectionsTest: (...a: unknown[]) => connectionsTest(...a),
   },
 }))
 
@@ -80,7 +97,7 @@ interface ChatSeed {
 }
 
 function mount(
-  { servicesEnabled = true, chat = {} }: { servicesEnabled?: boolean; chat?: ChatSeed } = {},
+  { servicesEnabled = true, chat = {}, strict = false }: { servicesEnabled?: boolean; chat?: ChatSeed; strict?: boolean } = {},
 ) {
   const store = createTestStore({
     chat: {
@@ -88,7 +105,8 @@ function mount(
       slotMessages: chat.slotMessages ?? {},
     } as unknown as RootState['chat'],
   })
-  return renderWithProviders(<ConnectionsPage servicesEnabled={servicesEnabled} />, { store })
+  const tree = <ConnectionsPage servicesEnabled={servicesEnabled} />
+  return renderWithProviders(strict ? <StrictMode>{tree}</StrictMode> : tree, { store })
 }
 
 /** The card for one provider, addressed the way the DOM exposes it. */
@@ -112,8 +130,40 @@ beforeEach(() => {
   mcpProbe.mockReset().mockResolvedValue([])
   mcpApply.mockReset().mockResolvedValue({ ok: true })
   mcpCustomAdd.mockReset().mockResolvedValue({ ok: true, added: [], enabled: true })
+  // Stored spec deliberately carries OAuth hints, so the reconnect assertions
+  // pin that a url rewrite round-trips them instead of clearing them.
+  mcpCustomGet.mockReset().mockResolvedValue({
+    name: 'notion',
+    spec: { url: 'https://old.example/mcp', scopes: ['read'], clientId: 'client-1' },
+    enabled: true,
+  })
   mcpCustomUpdate.mockReset().mockResolvedValue({ ok: true, name: 'notion' })
   mcpOAuthRelay.mockReset().mockResolvedValue({ ok: true })
+  connectionsMint.mockReset().mockResolvedValue({
+    ok: true, slug: 'notion', state: 'minting', token: 'tok1',
+  })
+  connectionsMintState.mockReset().mockResolvedValue({
+    slug: 'notion', state: 'minting', token: 'tok1',
+  })
+  connectionsPremint.mockReset().mockResolvedValue({ ok: true, preminting: ['notion'] })
+  // Authorization axis: empty by default, so the reachability-derived card states
+  // these tests assert on are unchanged by the status feed.
+  connectionsStatus.mockReset().mockResolvedValue({ schema_version: 1, connections: [] })
+  connectionsCancel.mockReset().mockResolvedValue({ ok: true, slug: 'notion', dropped: true })
+  connectionsDisconnect.mockReset().mockResolvedValue({
+    ok: true,
+    grantRemoved: true,
+    grantSurviving: [],
+    entryRemoved: true,
+    grantSharedWith: [],
+  })
+  connectionsTest.mockReset().mockResolvedValue({
+    schema_version: 1,
+    slug: 'notion',
+    verdict: 'usable',
+    code: 'tools_available',
+    toolCount: 2,
+  })
 })
 
 describe('the held-back gallery', () => {
@@ -129,6 +179,68 @@ describe('the held-back gallery', () => {
   })
 })
 
+// Warming the approval URLs ahead of any click. The engine (POST
+// /api/connections/premint) shipped with zero callers; this is the caller, and
+// what these tests pin is the shape of the call rather than its result — the
+// response is never a verdict, so nothing about the rendered gallery may depend
+// on it.
+describe('premint on mount', () => {
+  it('warms the mintable providers once, with no body, when the gallery mounts', async () => {
+    mount()
+
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+    // Bodyless by contract: what is mintable is the server's to decide, so the
+    // caller passes nothing — no source, no provider list, no telemetry.
+    expect(connectionsPremint).toHaveBeenCalledWith()
+  })
+
+  it('warms once under StrictMode, where the mount effect is double-invoked', async () => {
+    // The real double-fire hazard: an in-flight warm is not cancellable, so a
+    // teardown flag cannot un-spawn the first activation and only a latching ref
+    // holds. Asserting "once" on a plain mount proves nothing about the guard —
+    // that render invokes the effect a single time either way.
+    mount({ strict: true })
+
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+  })
+
+  it('does not warm while the services flag is off', async () => {
+    mount({ servicesEnabled: false })
+
+    // The gate offers no card and no Connect button, so there is nothing a warm
+    // URL could serve — and warming spawns a process.
+    expect(await screen.findByText('No services match this search.')).toBeInTheDocument()
+    expect(connectionsPremint).not.toHaveBeenCalled()
+  })
+
+  it('warms when the flag arrives after the first render, still only once', async () => {
+    // The flag rides the config query, so the page's first render is ALWAYS
+    // gated-off. A mount-only effect would either warm every install that never
+    // opted in, or never warm at all — this pins the keyed-on-the-flag shape.
+    const { rerender } = mount({ servicesEnabled: false })
+    expect(connectionsPremint).not.toHaveBeenCalled()
+
+    rerender(<ConnectionsPage servicesEnabled />)
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+
+    rerender(<ConnectionsPage servicesEnabled />)
+    expect(connectionsPremint).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders the gallery unchanged when the warm request rejects', async () => {
+    // A non-owner session is denied by design and the gateway may be older than
+    // the endpoint; either way the cold mint on Connect is the fallback, so the
+    // rejection must reach neither the cards nor an alert.
+    connectionsPremint.mockRejectedValue(new Error('403 forbidden'))
+
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    expect(within(card('notion')).getByRole('button', { name: 'Connect' })).toBeEnabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
 describe('the provider gallery', () => {
   it('renders one card per launch-gated provider and withholds the rest', async () => {
     mount()
@@ -140,12 +252,33 @@ describe('the provider gallery', () => {
     expect(screen.getByText(`${CONNECTION_PROVIDERS.length} available`)).toBeInTheDocument()
   })
 
+  it('keeps feedback slots out of the compact gallery until feedback exists', async () => {
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    expect(document.querySelectorAll('[data-slot="connection-feedback"]')).toHaveLength(0)
+  })
+
+  it('reserves a feedback slot on every displayed card when one card has feedback', async () => {
+    mcpServers.mockResolvedValue([server()])
+    mcpProbe.mockResolvedValue([server()])
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    fireEvent.click(within(card('notion')).getByRole('button', { name: 'Test' }))
+    await screen.findByText('Connection is healthy.')
+
+    const slots = document.querySelectorAll('[data-slot="connection-feedback"]')
+    expect(slots).toHaveLength(CONNECTION_PROVIDERS.length)
+    expect(Array.from(slots).filter(slot => slot.querySelector('[role="status"]'))).toHaveLength(1)
+  })
+
   it('shows an unconnected provider its docs link and a Connect button', async () => {
     mount()
 
     const notion = await waitFor(() => card('notion'))
     expect(notion).toHaveAttribute('data-state', 'not-connected')
-    expect(within(notion).getByText('Let agents use Notion through its official MCP server.')).toBeInTheDocument()
+    expect(within(notion).getByText('Search your Notion workspace and read pages and databases.')).toBeInTheDocument()
     expect(within(notion).getByRole('link', { name: /Documentation/ })).toHaveAttribute('target', '_blank')
     expect(within(notion).getByRole('button', { name: 'Connect' })).toBeEnabled()
   })
@@ -244,7 +377,7 @@ describe('the two tabs', () => {
 describe('a connected provider', () => {
   const connected = [server({ accountLabel: 'ada@example.com', connectedSince: '2026-03-04T10:00:00Z' })]
 
-  it('reports the account, the recommended scopes and the connection date', async () => {
+  it('reports the connection date and nothing it cannot know', async () => {
     mcpServers.mockResolvedValue(connected)
     mount()
 
@@ -253,16 +386,17 @@ describe('a connected provider', () => {
       expect(el).toHaveAttribute('data-state', 'connected')
       return el
     })
-    expect(within(notion).getByText('ada@example.com')).toBeInTheDocument()
-    expect(within(notion).getByText('Recommended scopes: default')).toBeInTheDocument()
     expect(within(notion).getByText('Mar 4, 2026')).toBeInTheDocument()
-    expect(within(notion).getByRole('link', { name: /Revoke at Notion/ })).toHaveAttribute(
-      'href',
-      'https://app.notion.com',
-    )
+    // The card never invents identity or permissions: the status API carries
+    // no account or scope facts, so no Account/Access rows may render.
+    expect(within(notion).queryByText('Account')).not.toBeInTheDocument()
+    expect(within(notion).queryByText('ada@example.com')).not.toBeInTheDocument()
+    expect(within(notion).queryByText(/Recommended scopes/)).not.toBeInTheDocument()
+    // Revoke guidance appears only after Disconnect, not as standing boilerplate.
+    expect(within(notion).queryByRole('link', { name: /Revoke at Notion/ })).not.toBeInTheDocument()
   })
 
-  it('falls back to a generic account label and the tool-controlled access line', async () => {
+  it('omits the connection date row when no date is known', async () => {
     mcpServers.mockResolvedValue([server({ name: 'stripe', url: STRIPE_URL })])
     mount()
 
@@ -271,26 +405,74 @@ describe('a connected provider', () => {
       expect(el).toHaveAttribute('data-state', 'connected')
       return el
     })
-    // Stripe ships no recommended scopes, and the probe reported no account.
-    expect(within(stripe).getByText('Authorized account')).toBeInTheDocument()
-    expect(within(stripe).getByText('Access is controlled by enabled tools.')).toBeInTheDocument()
     expect(within(stripe).queryByText('Connected since')).not.toBeInTheDocument()
+    expect(within(stripe).queryByText('Authorized account')).not.toBeInTheDocument()
+    expect(within(stripe).queryByText('Access is controlled by enabled tools.')).not.toBeInTheDocument()
   })
 
-  it('confirms a healthy probe as success feedback', async () => {
+  it('confirms authenticated usable tools as success feedback', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockResolvedValue(connected)
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
 
     expect(await screen.findByText('Connection is healthy.')).toBeInTheDocument()
-    expect(mcpProbe).toHaveBeenCalled()
+    expect(connectionsTest).toHaveBeenCalledWith('notion')
+    expect(mcpProbe).not.toHaveBeenCalled()
   })
 
-  it('surfaces a failing probe as an error on the card', async () => {
+  it('shows connected but zero exposed tools as an honest warning', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockResolvedValue([server({ status: 'error' })])
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'notion',
+      verdict: 'no_tools',
+      code: 'no_tools_exposed',
+      toolCount: 0,
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
+
+    const warning = await screen.findByRole('alert')
+    expect(warning).toHaveTextContent('Offered no tools to inspect')
+    expect(card('notion')).toHaveAttribute('data-state', 'connected')
+    expect(screen.queryByText('Connection is healthy.')).toBeNull()
+  })
+
+  it('links GitLab zero-tools guidance to its separately maintained prerequisites', async () => {
+    mcpServers.mockResolvedValue([
+      server({ name: 'gitlab', url: 'https://gitlab.com/api/v4/mcp' }),
+    ])
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'gitlab',
+      verdict: 'no_tools',
+      code: 'no_tools_exposed',
+      toolCount: 0,
+    })
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'gitlab', status: 'connected', grantPresent: true }],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('gitlab')).getByRole('button', { name: 'Test' })))
+
+    const warning = await screen.findByRole('alert')
+    expect(within(warning).getByRole('link', { name: 'Documentation' }))
+      .toHaveAttribute('href', 'https://docs.gitlab.com/user/model_context_protocol/mcp_server/')
+  })
+
+  it('surfaces an authenticated failure as an error on the card', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'notion',
+      verdict: 'failed',
+      code: 'mcp_server_failed',
+      toolCount: 0,
+    })
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
@@ -299,10 +481,10 @@ describe('a connected provider', () => {
     expect(failure).toHaveTextContent('Action failed: The provider did not pass the connection test.')
   })
 
-  it('shows the busy label while the probe is in flight', async () => {
-    const pending = deferred<McpServer[]>()
+  it('shows the busy label while authenticated enumeration is in flight', async () => {
+    const pending = deferred<{ verdict: string }>()
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockReturnValue(pending.promise)
+    connectionsTest.mockReturnValue(pending.promise)
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
@@ -311,7 +493,7 @@ describe('a connected provider', () => {
     expect(testing).toBeDisabled()
     expect(within(card('notion')).getByRole('button', { name: /Disconnect/ })).toBeDisabled()
 
-    pending.resolve(connected)
+    pending.resolve({ verdict: 'usable' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Test' })).toBeEnabled())
   })
 
@@ -326,12 +508,221 @@ describe('a connected provider', () => {
       'Disconnected locally. Revoke access at the provider to cancel the grant completely.',
     )
     expect(within(note).getByRole('link', { name: /Revoke at Notion/ })).toBeInTheDocument()
-    expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', uninstall: true }])
+    expect(connectionsDisconnect).toHaveBeenCalledWith('notion')
+  })
+
+  it('announces a surviving grant artifact as an alert, not a success', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: true,
+      grantSurviving: ['registration'],
+      entryRemoved: true,
+      grantSharedWith: [],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // role=alert rather than role=status: a local grant outliving the click is the
+    // exact state this endpoint exists to prevent, so rendering it as a green
+    // success would be the dishonesty the slice was written to remove. The revoke
+    // link still shows, because acting at the provider is now the user's next step.
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(
+      'Part of the stored grant could not be removed. Revoke access at the provider.',
+    )
+    expect(within(alert).getByRole('link', { name: /Revoke at Notion/ })).toBeInTheDocument()
+  })
+
+  it('says the grant was kept when another entry shares the endpoint', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      // A pair kept for a sharer is never re-stat'd, so grantSurviving is empty
+      // by construction -- survivors now mean a FAILED unlink and nothing else.
+      grantSurviving: [],
+      entryRemoved: true,
+      grantSharedWith: ['notion-work'],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // Artifacts surviving BY DESIGN are not the same event as a failed unlink, so
+    // this is role=status, not role=alert. But the user must not be told their
+    // access here was removed when it deliberately was not.
+    const note = await screen.findByRole('status')
+    expect(note).toHaveTextContent(
+      'The stored grant was kept because the same endpoint is also configured by: notion-work. Revoking at the provider would cut off their access too.',
+    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('names every entry the kept grant is shared with, not just that one exists', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      grantSurviving: [],
+      entryRemoved: true,
+      grantSharedWith: ['notion-work', 'notion-personal'],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // The response already carries the names. Saying only that "another server"
+    // uses the endpoint leaves the user unable to find the entry that blocked the
+    // revoke -- and it under-reports when more than one did.
+    const note = await screen.findByRole('status')
+    expect(note).toHaveTextContent(
+      'The stored grant was kept because the same endpoint is also configured by: notion-work, notion-personal. Revoking at the provider would cut off their access too.',
+    )
+  })
+
+  it('reports the kept entry alongside the kept grant, never "Entry removed"', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      grantSurviving: [],
+      entryRemoved: false,
+      grantSharedWith: ['notion-work'],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // The backend's own `if not ours` early return: grant kept for a sharer AND
+    // entry left alone. Each fact gets its own clause; asserting either removal
+    // would be the dishonesty two review rounds landed on in this span.
+    const note = await screen.findByRole('status')
+    expect(note).toHaveTextContent(
+      'The stored grant was kept because the same endpoint is also configured by: notion-work. Revoking at the provider would cut off their access too. Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.',
+    )
+    expect(note).not.toHaveTextContent('Entry removed')
+  })
+
+  it('says the entry was left alone when it is not ours by endpoint', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: true,
+      grantSurviving: [],
+      entryRemoved: false,
+      grantSharedWith: [],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // Telling the user their entry came out while it is still configured would be
+    // the same dishonesty class this slice exists to remove.
+    const note = await screen.findByRole('status')
+    expect(note).toHaveTextContent(
+      'The stored grant was removed. Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.',
+    )
+  })
+
+  it('warns with the MCP Servers recourse when nothing here was ours', async () => {
+    mcpServers.mockResolvedValue(connected)
+    // The not-ours outcome: no grant existed and no purge-eligible entry
+    // matched, so the backend changed nothing at all.
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      grantSurviving: [],
+      entryRemoved: false,
+      grantSharedWith: [],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // role=alert with WARN styling, not a green role=status success: the card
+    // still shows Connected with a live Disconnect button, so a bare "left
+    // unchanged" success reads as an action that worked yet changed nothing,
+    // and the user's only move is to click again. The message must carry the
+    // recourse (the MCP Servers tab) — and it must state no cause, because
+    // entryRemoved=false cannot prove WHY the entry was kept.
+    const note = await screen.findByRole('alert')
+    expect(note).toHaveClass('text-warn')
+    expect(note).not.toHaveClass('text-ok')
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(note).toHaveTextContent(
+      'Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.',
+    )
+    expect(note).not.toHaveTextContent('points at a different server')
+  })
+
+  it('reports a census-incomplete keep as a deliberate refusal, never a failed removal', async () => {
+    mcpServers.mockResolvedValue(connected)
+    // The backend's fail-closed path: an unreadable spec source can HIDE a sharer,
+    // so the grant is kept with census_incomplete=true and no sharer to name.
+    // Nothing is attempted, so nothing is re-stat'd and grantSurviving is empty --
+    // the keep must still read as a deliberate refusal with a next step.
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      grantSurviving: [],
+      entryRemoved: true,
+      grantSharedWith: [],
+      grantCensusIncomplete: true,
+      grantCensusUnreadable: ['dev.json'],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    // role=alert, and WARN rather than OK styling. This is the one outcome that
+    // tells the user their access was NOT withdrawn and hands them a repair to
+    // make; rendering it green under role=status announced a chore as a success
+    // and let a screen reader treat it as a passing status update. It is still not
+    // an `error`: nothing failed, a safety rule declined to act.
+    const note = await screen.findByRole('alert')
+    expect(note).toHaveClass('text-warn')
+    expect(note).not.toHaveClass('text-ok')
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    // The instruction has to name the file. "Fix the unreadable file" with no file
+    // named is a repair the user cannot locate, and the census already knows it.
+    expect(note).toHaveTextContent(
+      'The stored grant was kept because dev.json could not be read to rule out another server using it. Fix or remove that file and disconnect again.',
+    )
+    expect(note).not.toHaveTextContent('could not be removed')
+  })
+
+  it('falls back to the source-less census wording when no file can be named', async () => {
+    mcpServers.mockResolvedValue(connected)
+    // The other half of census_incomplete: an entry whose URL could not be safely
+    // compared. There is no unreadable FILE, so the list is empty and the message
+    // must not interpolate a blank name into "fix that file".
+    connectionsDisconnect.mockResolvedValue({
+      ok: true,
+      grantRemoved: false,
+      grantSurviving: [],
+      entryRemoved: true,
+      grantSharedWith: [],
+      grantCensusIncomplete: true,
+      grantCensusUnreadable: [],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
+
+    const note = await screen.findByRole('alert')
+    expect(note).toHaveTextContent(
+      'The stored grant was kept because a configuration source could not be read to rule out another server using it. Check your server configuration and disconnect again.',
+    )
+    // The source-less trigger can be an entry whose URL could not be compared,
+    // which involves no file — the guidance must not name one.
+    expect(note).not.toHaveTextContent('unreadable file')
   })
 
   it('reports a failed disconnect as an error instead of claiming success', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpApply.mockRejectedValue(new Error('config is read-only'))
+    connectionsDisconnect.mockRejectedValue(new Error('config is read-only'))
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
@@ -341,7 +732,7 @@ describe('a connected provider', () => {
 
   it('names an unknown thrown value rather than rendering "undefined"', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpApply.mockRejectedValue('not an Error')
+    connectionsDisconnect.mockRejectedValue('not an Error')
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Disconnect/ })))
@@ -388,7 +779,9 @@ describe('a provider that needs attention', () => {
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Reconnect/ })))
 
-    await waitFor(() => expect(mcpCustomUpdate).toHaveBeenCalledWith('notion', { url: NOTION_URL }))
+    await waitFor(() => expect(mcpCustomUpdate).toHaveBeenCalledWith('notion', {
+      url: NOTION_URL, scopes: ['read'], clientId: 'client-1',
+    }))
     // Global scopes are passed through unchanged; only Kiro Crew's own is turned on.
     expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', kirocrew: true, kiroGlobal: true, ccGlobal: false }])
   })
@@ -399,7 +792,9 @@ describe('a provider that needs attention', () => {
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Reconnect/ })))
 
-    await waitFor(() => expect(mcpCustomUpdate).toHaveBeenCalledWith('notion', { url: NOTION_URL }))
+    await waitFor(() => expect(mcpCustomUpdate).toHaveBeenCalledWith('notion', {
+      url: NOTION_URL, scopes: ['read'], clientId: 'client-1',
+    }))
     expect(mcpApply).not.toHaveBeenCalled()
   })
 })
@@ -413,18 +808,183 @@ describe('connecting a new provider', () => {
     await waitFor(() => expect(mcpCustomAdd).toHaveBeenCalledWith({ notion: { url: NOTION_URL } }, true))
     expect(mcpProbe).toHaveBeenCalled()
     await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
-    expect(screen.getByText('Finish approving in your browser…')).toBeInTheDocument()
+    // jsdom grants no window, so `window.open` returns null and this click lands
+    // on the refused-tab path -- where the neutral heading is the correct copy,
+    // because there is no browser page to finish approving in. Asserted as an
+    // absence: the neutral wording shares its text with the state badge, so a
+    // positive match cannot tell the two apart. The granted-tab wording is
+    // asserted in `the approval tab` below, against a stubbed open.
+    expect(screen.queryByText('Finish approving in your browser…')).toBeNull()
   })
 
-  it('reports an install failure on the card', async () => {
-    mcpCustomAdd.mockRejectedValue(new Error('name already taken'))
+  it('asks for the approval URL instead of waiting for one', async () => {
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Action failed: name already taken')
-    expect(card('notion')).toHaveAttribute('data-state', 'not-connected')
+    // Ordered after the install: the mint activates a spec derived from the entry.
+    await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+    expect(mcpCustomAdd).toHaveBeenCalled()
   })
+
+  it('renders the minted approval link once the mint is waiting', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=minted'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+
+    const link = await waitFor(() =>
+      within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+    )
+    expect(link).toHaveAttribute('href', minted)
+  })
+
+  it('offers no link while the mint has not produced one', async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+    expect(within(card('notion')).queryByRole('link', { name: /Re-open approval/ })).toBeNull()
+  })
+
+  it('never enters the waiting state when the mint request is rejected', async () => {
+    connectionsMint.mockRejectedValue(new Error('mint refused'))
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+
+    // A suppressed rejection left the card spinning on a mint that was never
+    // started; the failure has to reach the card's error surface instead.
+    await waitFor(() => expect(screen.getByText(/mint refused/)).toBeInTheDocument())
+    expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval')
+  })
+
+  it.each(['failed', 'expired'] as const)('stops waiting when the mint reports %s', async state => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state, reason: 'mint_timeouterror' })
+
+    // Terminal means no URL is coming: the spinner must not outlive the mint.
+    await waitFor(
+      () => expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval'),
+      { timeout: 8000 },
+    )
+  }, 15000)
+
+  it.each([
+    {
+      reason: 'mint_timeouterror',
+      state: 'failed',
+      expected: 'Action failed: Authorization setup timed out before an approval address was ready. Try connecting again.',
+    },
+    {
+      reason: 'mint_process_gone',
+      state: 'expired',
+      expected: 'Action failed: The authorization process stopped before approval finished. Try connecting again.',
+    },
+    {
+      reason: 'mint_server_absent',
+      state: 'failed',
+      expected: 'Action failed: The MCP server entry disappeared before authorization could start. Try connecting again.',
+    },
+    {
+      reason: 'mint_url_rejected',
+      state: 'failed',
+      expected: 'Action failed: The provider returned an approval address containing credential-like data, so it was not displayed.',
+    },
+    {
+      reason: 'mint_future_reason',
+      state: 'failed',
+      expected: 'Action failed: Authorization setup failed before an approval address was ready. Try connecting again.',
+    },
+  ])('explains $state mint reason $reason', async ({ reason, state, expected }) => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state, reason, token: 'tok1' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+
+    await waitFor(() => {
+      expect(within(card('notion')).getByRole('alert')).toHaveTextContent(expected)
+    })
+  })
+
+  it("does not surface another tab's expired mint reason", async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting', token: 'tok1' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    connectionsMintState.mockResolvedValue({
+      slug: 'notion', state: 'expired', reason: 'mint_process_gone', token: 'tok2',
+    })
+
+    await waitFor(
+      () => expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval'),
+      { timeout: 8000 },
+    )
+    expect(within(card('notion')).queryByRole('alert')).toBeNull()
+  }, 15000)
+
+  it('probes for fresh status when the mint reports granted', async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+    mcpProbe.mockClear()
+    connectionsStatus.mockClear()
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'granted' })
+
+    // The cached status predates consent; without a re-probe the card keeps its
+    // pre-consent error after authorization succeeded.
+    await waitFor(() => expect(mcpProbe).toHaveBeenCalled(), { timeout: 8000 })
+    // Same staleness on the authorization axis: the 30s status poll would
+    // otherwise keep serving the pre-consent verdict (grantPresent=false),
+    // downgrading the just-connected card for up to a full interval.
+    await waitFor(() => expect(connectionsStatus).toHaveBeenCalled(), { timeout: 8000 })
+  }, 15000)
+
+  it('clears the wait on an expired mint and keeps the entry', async () => {
+    let installed = false
+    const installedList = () => (installed ? [server({ status: 'unknown' })] : [])
+    mcpCustomAdd.mockImplementation(async () => {
+      installed = true
+      return { ok: true, added: ['notion'], enabled: true }
+    })
+    mcpServers.mockImplementation(async () => installedList())
+    mcpProbe.mockImplementation(async () => installedList())
+    connectionsMint.mockResolvedValue({ ok: true, slug: 'notion', state: 'minting', token: 'aaa' })
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting', token: 'aaa' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    mcpApply.mockClear()
+    const callsAtFlip = connectionsMintState.mock.calls.length
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'expired', token: 'aaa' })
+
+    // Wait for the feed to deliver the expired row. Exactly one delivery is what
+    // the effect needs -- and all it will get, since clearing the wait disables
+    // the query.
+    await waitFor(
+      () => expect(connectionsMintState.mock.calls.length).toBeGreaterThan(callsAtFlip),
+      { timeout: 8000 },
+    )
+
+    // Nothing deletes configuration on a timeout: the entry stays so the user can
+    // retry with Connect or remove it with Disconnect.
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
+    expect(installed).toBe(true)
+  }, 15000)
 
   it('shows the connecting label while the install is in flight', async () => {
     const pending = deferred<{ ok: boolean }>()
@@ -448,6 +1008,9 @@ describe('connecting a new provider', () => {
     // The probe has not surfaced the entry yet, so Cancel falls back to the slug
     // the connect just wrote — and says nothing, because the user asked for this.
     await waitFor(() => expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', uninstall: true }]))
+    // Cancel must never reach the revoking endpoint: the grant is endpoint-keyed,
+    // so revoking here could deauthorize a different entry at the same URL.
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
     await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-connected'))
   })
@@ -461,7 +1024,7 @@ describe('connecting a new provider', () => {
     fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
 
     await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
-    expect(mcpApply).not.toHaveBeenCalledWith([{ name: 'notion', uninstall: true }])
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
   })
 
   it('clears the local wait once the gateway reports the server healthy', async () => {
@@ -648,4 +1211,543 @@ describe('relaying the loopback return address', () => {
     pending.resolve({ ok: true })
     await waitFor(() => expect(relayInput()).toBeEnabled())
   })
+})
+
+describe('the authorization status feed', () => {
+  it('disposes the backend mint when a new connect is cancelled, and still uninstalls', async () => {
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    // The mint's process, listener and spec are released by the backend...
+    await waitFor(() => expect(connectionsCancel).toHaveBeenCalledWith('notion', 'tok1'))
+    // ...and the entry this connect created is still removed, unchanged.
+    await waitFor(() => expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', uninstall: true }]))
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
+  })
+
+  it('disposes the mint on a cancelled reconnect without destroying the entry', async () => {
+    mcpServers.mockResolvedValue([server({ status: 'error', enabled: true })])
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Reconnect/ })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    // This is what main leaked: a cancelled reconnect dropped only the local wait
+    // and left the mint held to its TTL.
+    await waitFor(() => expect(connectionsCancel).toHaveBeenCalledWith('notion', 'tok1'))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
+  })
+
+  it('a failed dispose never blocks the local cancel', async () => {
+    connectionsCancel.mockRejectedValue(new Error('gateway down'))
+    mcpServers.mockResolvedValue([server({ status: 'error', enabled: true })])
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Reconnect/ })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+  })
+
+  /**
+   * Disposal waits on a child process shutdown, bounded only by the gateway's
+   * ~10s shutdown timeout. Awaiting it would leave Cancel un-actioned and
+   * re-clickable for that whole window, so the local withdrawal must not depend
+   * on the dispose settling at all.
+   */
+  it('completes a reconnect cancel while the backend dispose is still in flight', async () => {
+    const hanging = deferred<{ ok: boolean }>()
+    connectionsCancel.mockReturnValue(hanging.promise)
+    mcpServers.mockResolvedValue([server({ status: 'error', enabled: true })])
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: /Reconnect/ })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    // Never resolved: the local wait clears anyway, and the token still travelled.
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+    expect(connectionsCancel).toHaveBeenCalledWith('notion', 'tok1')
+    expect(connectionsDisconnect).not.toHaveBeenCalled()
+  })
+
+  it('uninstalls a cancelled new connect while the backend dispose is still in flight', async () => {
+    const hanging = deferred<{ ok: boolean }>()
+    connectionsCancel.mockReturnValue(hanging.promise)
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    // The uninstall must not wait on the dispose either.
+    await waitFor(() => expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', uninstall: true }]))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-connected'))
+  })
+
+  it('a failed uninstall after cancel never strands the waiting card', async () => {
+    // The mint dies with the Cancel click, so if the wait outlived a rejected
+    // uninstall no outcome could ever clear it -- the card would show a waiting
+    // state with no live flow behind it. The wait must clear unconditionally.
+    let installed = false
+    mcpCustomAdd.mockImplementation(async () => {
+      installed = true
+      return { ok: true, added: ['notion'], enabled: true }
+    })
+    mcpServers.mockImplementation(async () => (installed ? [server({ status: 'error' })] : []))
+    mcpProbe.mockImplementation(async () => (installed ? [server({ status: 'error' })] : []))
+    mount()
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    mcpApply.mockRejectedValue(new Error('uninstall failed'))
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    await waitFor(() => expect(mcpApply).toHaveBeenCalledWith([{ name: 'notion', uninstall: true }]))
+    // The entry is still installed (uninstall failed) and reports an error --
+    // the honest card -- but the dead wait state is gone.
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+  })
+
+  it('renders the connected-since time the status feed reports', async () => {
+    mcpServers.mockResolvedValue([server({ status: 'ok' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{
+        slug: 'notion',
+        status: 'connected',
+        grantPresent: true,
+        connectedSince: '2026-03-04T10:00:00Z',
+      }],
+    })
+    mount()
+
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'connected'))
+    // The row appears only because a source-backed timestamp exists; nothing is
+    // fabricated at render time.
+    await waitFor(() => expect(within(card('notion')).getByText(/Connected since/i)).toBeInTheDocument())
+  })
+
+  it('omits connected-since when no date is recorded for a connected grant', async () => {
+    mcpServers.mockResolvedValue([server({ status: 'ok' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'connected', grantPresent: true }],
+    })
+    mount()
+
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'connected'))
+    expect(within(card('notion')).queryByText(/Connected since/i)).not.toBeInTheDocument()
+  })
+
+  it('cancel escapes the waiting card even while the poll cached awaiting_consent', async () => {
+    // The refresh-mid-consent state: no per-tab wait survives a reload, so the
+    // waiting card here comes entirely from the backend's awaiting_consent
+    // verdict -- and Cancel must not appear broken because the status poll
+    // cached that verdict for up to 30 seconds.
+    mcpServers.mockResolvedValue([server({ status: 'needs_auth' })])
+    mcpProbe.mockResolvedValue([server({ status: 'needs_auth' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'awaiting_consent', grantPresent: false }],
+    })
+    mount()
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    // From here the backend truth is "flow disposed": the re-fetch that the
+    // cancel triggers must land on the fresh verdict, not the cached one.
+    connectionsStatus.mockClear()
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'not_connected', grantPresent: false }],
+    })
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+    await waitFor(() => expect(connectionsCancel).toHaveBeenCalledWith('notion', undefined))
+    // Immediately out of waiting (optimistic drop of the stale cached verdict)...
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-verified'))
+    // ...and the authorization feed re-fetched rather than waiting out the poll.
+    await waitFor(() => expect(connectionsStatus).toHaveBeenCalled())
+  })
+
+  it('a stale in-flight status fetch cannot re-render waiting after cancel', async () => {
+    // The fence under test: a 30s poll already in flight at click time was
+    // fetched BEFORE the cancel. Unfenced, its resolution would land after the
+    // optimistic drop and repopulate the stale awaiting_consent verdict.
+    mcpServers.mockResolvedValue([server({ status: 'needs_auth' })])
+    mcpProbe.mockResolvedValue([server({ status: 'needs_auth' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'awaiting_consent', grantPresent: false }],
+    })
+    const { queryClient } = mount()
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    // Put a PRE-CANCEL fetch in flight, then make every later fetch (the
+    // settlement invalidation) return the post-dispose truth.
+    const stale = deferred<{ schema_version: number; connections: unknown[] }>()
+    connectionsStatus.mockReturnValueOnce(stale.promise).mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'not_connected', grantPresent: false }],
+    })
+    void queryClient.invalidateQueries({ queryKey: ['connections-status'] })
+
+    fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-verified'))
+
+    // The stale response arrives late; the fence cancelled its query, so it
+    // must be discarded rather than resurrecting the waiting card.
+    stale.resolve({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'awaiting_consent', grantPresent: false }],
+    })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval')
+  })
+
+  it('a reload mid-consent still loads the approval URL from the live mint', async () => {
+    // The refresh-survival gap both review lanes flagged: after a reload the
+    // per-tab wait map is empty, so if the mint poll keyed off it alone the
+    // waiting card would render with no approval link and copy telling the
+    // user to start a flow that is already running. The backend's
+    // awaiting_consent verdict must feed the poll too.
+    mcpServers.mockResolvedValue([server({ status: 'needs_auth' })])
+    mcpProbe.mockResolvedValue([server({ status: 'needs_auth' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'awaiting_consent', grantPresent: false }],
+    })
+    connectionsMintState.mockResolvedValue({
+      slug: 'notion',
+      state: 'waiting',
+      oauth_url: 'https://example.com/approve',
+    })
+    mount()
+
+    // No Connect click in this tab -- the waiting card and its link come
+    // entirely from backend state.
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+    const link = await waitFor(() =>
+      within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+    )
+    expect(link).toHaveAttribute('href', 'https://example.com/approve')
+  })
+
+  it('downgrades a cached-ok card when the grant is confirmed absent', async () => {
+    // The reachability probe is cached, so `ok` outlives revocation: the fresher
+    // authorization fact (a CONFIRMED absent grant) must win over the stale badge.
+    mcpServers.mockResolvedValue([server({ status: 'ok' })])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'notion', status: 'not_connected', grantPresent: false }],
+    })
+    mount()
+
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-verified'))
+    // The verdict is CONFIRMED at this render, so the copy must name the held
+    // fact ("is not authorized"), not hedge that it cannot see the
+    // authorization -- the hedge misdirects the reauthorize decision this card
+    // exists to serve.
+    expect(within(card('notion')).getByText(/is not authorized/)).toBeInTheDocument()
+    expect(within(card('notion')).queryByText(/cannot see the authorization/)).toBeNull()
+  })
+
+  it('a failing status feed leaves the reachability-derived card intact', async () => {
+    connectionsStatus.mockRejectedValue(new Error('status unavailable'))
+    mcpServers.mockResolvedValue([server({ status: 'needs_auth' })])
+    mount()
+
+    // No grant fact available -> the honest pre-status verdict, not a claim.
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'not-verified'))
+    // ...and with the verdict indeterminate, the HEDGE is the honest copy:
+    // claiming "is not authorized" here would assert a fact nobody holds.
+    expect(within(card('notion')).getByText(/cannot see the authorization/)).toBeInTheDocument()
+    expect(within(card('notion')).queryByText(/is not authorized/)).toBeNull()
+  })
+})
+
+// Provider brand marks. The art inventory and the card roster are maintained
+// separately, so a provider can ship without a mark -- GitLab does today, while
+// the inventory carries GitHub, which the launch set holds back. That case must
+// degrade to the lettered tile rather than to an empty gap, and it did not: the
+// card built `<ProviderLogo …/>` unconditionally, which is a truthy element even
+// for a slug with no mark, so the `??` fallback beside it was unreachable.
+describe('the card brand mark', () => {
+  it('renders a lettered tile for a provider that ships no mark', async () => {
+    mount()
+
+    await waitFor(() => expect(card('gitlab')).toBeInTheDocument())
+    // The mark slot only -- the header also carries the provider NAME, so asserting
+    // on the header's own text would match the name's first letter either way.
+    const slot = card('gitlab').querySelector('header [role="img"]')
+    if (!slot) throw new Error('no brand-mark slot on the gitlab card')
+    expect(slot.querySelector('[data-testid="provider-logo-gitlab"]')).toBeNull()
+    // ...so the initial stands in, rather than the slot sitting empty.
+    expect(slot.textContent).toBe('G')
+  })
+
+  it('renders the mark, and no letter, for a provider that ships one', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    const slot = card('notion').querySelector('header [role="img"]')
+    if (!slot) throw new Error('no brand-mark slot on the notion card')
+    expect(slot.querySelector('[data-testid="provider-logo-notion"]')).not.toBeNull()
+    // The tile must not double up with the mark.
+    expect(slot.textContent).toBe('')
+  })
+})
+
+// sizes to its own copy makes the row it sits in ragged. jsdom runs no layout
+// engine, so the reserved box IS the observable here: asserting the floor/clamp
+// pair on the description is what a browser's equal-height rows reduce to, and it
+// is what a later "tidy up the classes" edit would break.
+describe('the card description box', () => {
+  it('reserves two lines for every description and allows a third', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    // GitLab's copy wraps to two lines where Notion's takes one: both cards must
+    // still reserve the same vertical space.
+    for (const slug of ['notion', 'gitlab']) {
+      const description = card(slug).querySelector('p')
+      if (!description) throw new Error(`no description paragraph on the ${slug} card`)
+      // A FLOOR, not a fixed height: a locale whose copy needs a third line grows
+      // rather than clipping a write-scope disclosure behind a hover-only title.
+      expect(description).toHaveClass('min-h-[34px]')
+      expect(description).not.toHaveClass('h-[34px]')
+      expect(description).toHaveClass('line-clamp-3')
+      // An explicit line-height is what makes the reserved height hold whole
+      // lines instead of cutting one mid-glyph.
+      expect(description).toHaveClass('leading-[17px]')
+    }
+  })
+})
+
+// Connect opens the approval tab. The requirement is that one click lands the
+// user on the provider's consent page; the "Re-open approval" link is the
+// recovery path for a tab the browser refused, not the primary route. What makes
+// it delicate is the ordering: POST /api/connections/mint answers BEFORE the URL
+// exists, so the tab has to be opened by the click -- while the user activation
+// is still current -- and filled when the poll produces a URL.
+//
+// `window.open` is swapped by hand rather than with vi.spyOn so the restore is
+// guaranteed by try/finally even when an assertion throws: a leaked stub would
+// silently change every test that ran after it.
+describe('the approval tab', () => {
+  type FakeTab = { closed: boolean; location: { href: string }; close: () => void }
+
+  const fakeTab = () => {
+    const body = { style: '', text: '', setAttribute: (_: string, v: string) => { body.style = v } }
+    const tab = {
+      closed: false,
+      location: { href: '' },
+      closeCalls: 0,
+      // Only the surface the card touches: a body it can style and fill, and a
+      // title. Deliberately not a real DOM -- the assertion is that the card
+      // writes TEXT rather than markup, which a string field states plainly.
+      document: {
+        title: '',
+        get body() {
+          return {
+            setAttribute: body.setAttribute,
+            set textContent(v: string) { body.text = v },
+            get textContent() { return body.text },
+          }
+        },
+      },
+      body,
+      close() {
+        tab.closeCalls += 1
+        tab.closed = true
+      },
+    }
+    return tab
+  }
+
+  const withOpen = async (
+    tab: FakeTab | ReturnType<typeof fakeTab> | null,
+    body: (calls: unknown[][]) => Promise<void>,
+  ): Promise<void> => {
+    const original = window.open
+    const calls: unknown[][] = []
+    window.open = ((...args: unknown[]) => {
+      calls.push(args)
+      return tab as unknown as Window
+    }) as typeof window.open
+    try {
+      await body(calls)
+    } finally {
+      window.open = original
+    }
+  }
+
+  const clickConnect = async () => {
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+  }
+
+  it('opens the tab on the click, before any URL exists', async () => {
+    // The mint stays in `minting`, so no URL is available at any point here: the
+    // tab must still have been opened, which is the whole popup-blocker fix.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(fakeTab(), async calls => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+      expect(calls).toEqual([['', '_blank']])
+    })
+  })
+
+  it('sends the approval URL to the tab the click opened', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=minted'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.location.href).toBe(minted))
+      // ...and the heading may now say the browser page exists, because it does.
+      expect(within(card('notion')).getByText(/Finish approving in your browser/)).toBeInTheDocument()
+    })
+  })
+
+  it('leaves the link as the way in when the browser refuses the tab', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=blocked'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    // A blocked popup is a null handle, not a throw.
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+      // No tab was granted, so the heading must NOT claim a browser page is open.
+      // Asserted as an absence on purpose: the neutral heading shares its wording
+      // with the state badge, so a positive match would not tell them apart.
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('reclaims the blank tab when the attempt fails', async () => {
+    connectionsMint.mockRejectedValue(new Error('mint refused'))
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      // The mint never starts, so no URL will ever arrive: leaving the blank tab
+      // open would make the user close it by hand.
+      await waitFor(() => expect(screen.getByText(/mint refused/)).toBeInTheDocument())
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
+  })
+
+  it('drops a tab the user closed instead of reopening it', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=closed'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      // Simulate the user closing the placeholder before the URL landed. Racing
+      // the poll would make this flaky, so close it and assert on the end state:
+      // whatever the ordering, the card must never resurrect a closed window.
+      tab.closed = true
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+    })
+  })
+
+  it('tells the user what the blank tab is for while the mint polls', async () => {
+    // The mint stays in `minting`, which is the whole poll window: a tab left on a
+    // bare about:blank for those seconds reads as a failure of the click.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.body.text).toBe('Connecting…'))
+      expect(tab.document.title).toBe('Connecting…')
+      // Written as text, never markup, so a translated string cannot become nodes.
+      expect(tab.body.text).not.toMatch(/[<>]/)
+      // And laid out without hardcoded colours, so it cannot clash with the theme.
+      expect(tab.body.style).toContain('color-scheme:light dark')
+    })
+  })
+
+  it('never claims an open browser page while the tab stands refused', async () => {
+    // The refused-tab case during the POLL is the gap a boolean gated on
+    // `oauth.minted` could not express: minted is still false here, so the card
+    // used to tell a blocked-popup user to finish in a browser page they never
+    // got -- the same false claim this change set out to remove.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('takes the blank tab back when the user cancels mid-mint', async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+      fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+      // Cancel ends the attempt, so no URL is ever coming. Leaving the tab open
+      // also left the ref stale, and the NEXT Connect click then overwrote it and
+      // orphaned this tab for good -- so the ref being cleared is the half that
+      // matters beyond tidiness.
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
+  })
+
+  it('opens the tab for Reconnect too, not just Connect', async () => {
+    // Reconnect and Authorize run the IDENTICAL mint-and-poll path through
+    // `onReconnect`. Wiring the tab to the Connect button alone left two of the
+    // card's three mint-starting buttons opening nothing at all.
+    mcpServers.mockResolvedValue([server({ status: 'error', error: 'invalid_grant' })])
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(fakeTab(), async calls => {
+      mount()
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+
+      fireEvent.click(within(card('notion')).getByRole('button', { name: /Reconnect/ }))
+
+      await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+      expect(calls).toEqual([['', '_blank']])
+    })
+  })
+
+  // NOT pinned here, deliberately, and stated rather than faked: the stale-outcome
+  // path (a granted tab whose attempt ended, leaving `clickTab` at `open` so a
+  // LATER mint re-made the browser-page claim) is only observable when the card
+  // re-enters `waiting-for-approval` WITHOUT a click, because a second click sets
+  // the outcome explicitly and masks it. This harness could not produce that
+  // second entry in the same mount: once a URL is published the card holds the
+  // waiting state through `expired`, and a fresh mount resets the state under
+  // test. Driving it would need a seeded gateway-published banner arriving after a
+  // completed click attempt. The fix itself is a two-line reordering -- the reset
+  // moved above the ref guard, since delivery nulls the ref -- reviewed against
+  // the trace that found it.
 })

@@ -122,10 +122,6 @@ OPERATOR_ONLY_KEYS: tuple[str, ...] = (
     PRIMARY_KEY,
 )
 
-#: Owner-only, matching the secret file. The value is not a credential, but it IS a control
-#: whose confidentiality and integrity both matter, so it gets the same lockdown.
-_POLICY_FILE_MODE = 0o600
-
 
 def policy_path() -> Path:
     """Absolute path to the keystone policy file (honors ``KIROCREW_HOME``)."""
@@ -133,9 +129,48 @@ def policy_path() -> Path:
 
 
 def _read() -> dict[str, Any]:
+    """The stored ceiling, or ``{}`` when there is nothing readable.
+
+    A DISPLAY/GATE read: it must degrade to the caller's DEFAULT rather than
+    raise, because every reader here backs a security decision that has a safe
+    answer -- an unreadable ceiling reads as ``observe`` with no act-rules, which
+    is the most restrictive state, not a permissive one. See
+    :func:`_read_for_update` for why a writer may not stand on the same answer.
+    """
     try:
         raw = json.loads(policy_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _read_for_update() -> dict[str, Any]:
+    """The ceiling a read-modify-write is allowed to publish over.
+
+    ``_PolicyLock`` documents that every writer here is a read-modify-write and
+    that ``atomic_write`` REPLACES the whole file. So an empty base is not
+    "nothing to carry forward" -- it is "discard every other operator-only key",
+    and this file holds ALL of them: the autonomy ceiling, the outbound ledger
+    remote and Slack channel, the rotation identity, the primary-instance flag.
+    Only a MISSING file makes that base true.
+
+    Losing them is not a preference reset. Each key is fenced onto the keystone
+    floor precisely because the agent must not be able to set it, and every one
+    reverts to a value the agent CAN influence: ``mode`` and ``autonomy_rules``
+    fall back to a default the route re-derives, and the destination and identity
+    keys fall back to absent, which is how the off-shift refusal and the
+    ``not_primary`` gate get their inputs. Silently dropping the operator's
+    ceiling on one transient EACCES is the failure this file exists to prevent,
+    arriving by accident instead of by attack. The error propagates and the
+    write is abandoned instead.
+
+    Corruption keeps reading as empty, matching :func:`_read`: the document
+    parsed to nothing usable, so there is no stored ceiling left to lose by
+    replacing it.
+    """
+    try:
+        raw = json.loads(policy_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
 
@@ -182,18 +217,22 @@ class _PolicyLock:
 
 def _write(data: dict[str, Any]) -> None:
     payload = json.dumps(data, indent=2, sort_keys=True)
-    atomic_write(policy_path(), payload, mode=_POLICY_FILE_MODE)
-    # Fail-loud lockdown, same as the secret store: ``atomic_write``'s mode covers POSIX,
-    # and this applies the owner-only DACL on Windows. A lockdown failure must not leave the
-    # ceiling world-readable, so unlink and re-raise rather than continue.
-    try:
-        platform_compat.restrict_to_owner(policy_path())
-    except OSError:
-        try:
-            policy_path().unlink()
-        except OSError:
-            logger.exception("failed to remove ops policy file after lockdown failure")
-        raise
+    # Fail-loud lockdown BEFORE any content lands, same as the secret store:
+    # ``restrict_to_owner=True`` applies the owner-only DACL to the temp file
+    # before the payload reaches it (a post-rename lockdown left the ceiling
+    # readable under the inherited DACL on Windows for the write window, issue
+    # #5285) and implies the owner-only POSIX mode. The default
+    # ``restrict_on_error="raise"`` refuses to publish a ceiling it cannot
+    # protect.
+    #
+    # No cleanup on failure: every failure inside ``atomic_write`` happens
+    # BEFORE the final path is touched, so an unprotectable file never exists
+    # at ``policy_path()`` at all. The unlink the old code ran on lockdown
+    # failure existed to remove a NEW file already PUBLISHED at a wide DACL;
+    # that state is unreachable now, and keeping the unlink would instead
+    # delete the PREVIOUS, healthy governance ceiling on one transient lockdown
+    # failure — silently resetting the operator's autonomy policy.
+    atomic_write(policy_path(), payload, restrict_to_owner=True)
 
 
 def read_mode(default: str) -> str:
@@ -224,11 +263,15 @@ def set_ceiling(*, mode: str | None = None, rules: list[Any] | None = None) -> N
     could fix because the interleaving comes from another request.
 
     ``None`` means "leave unchanged", so this is also the single-field writer.
+
+    Raises ``OSError`` when the existing ceiling could not be read; see
+    :func:`_read_for_update` for why that is not collapsed to an empty document
+    here.
     """
     if mode is None and rules is None:  # pragma: no cover — programming error, not input
         raise ValueError("set_ceiling requires at least one of mode/rules")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         if mode is not None:
             data[_MODE_KEY] = mode
         if rules is not None:
@@ -269,11 +312,15 @@ def get(key: str, default: Any = None) -> Any:
 
 
 def put(key: str, value: Any) -> None:
-    """Write one operator-only value. Dashboard-PUT only — see the module docstring."""
+    """Write one operator-only value. Dashboard-PUT only — see the module docstring.
+
+    Raises ``OSError`` when the existing ceiling could not be read, for the reason
+    :func:`_read_for_update` gives.
+    """
     if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
         raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         data[key] = value
         _write(data)
 

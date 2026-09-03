@@ -1,7 +1,8 @@
 ---
 name: pod-e2e
-description: "Run end-to-end tests (backend API + frontend Playwright) for a KiroCrew feature worktree against an ISOLATED throwaway pod instance, without touching the live gateway. Use when asked to e2e-test / smoke-test / verify a worktree's feature hands-off, run API + browser tests on a pod, or prove a new backend route + UI work together. NOT for testing the live instance."
+description: "ONLY for developing Kiro Crew itself -- if the project you are working on is anything else, ignore this skill: it drives Kiro Crew's own pod tooling, which does not exist in another repository. Runs end-to-end tests (backend API + frontend Playwright) for a Kiro Crew feature worktree against an ISOLATED throwaway pod instance, without touching the live gateway. Use when asked to e2e-test / smoke-test / verify a Kiro Crew worktree's feature hands-off, run API + browser tests on a pod, or prove a new backend route + UI work together. NOT for testing the live instance, and NOT a general-purpose e2e or smoke-test skill."
 triggers: e2e test, smoke test, pod test, verify worktree, test pod, run e2e, end to end
+repo_scope: src/kiro_crew
 ---
 
 # pod-e2e — test a worktree against an isolated full-stack pod
@@ -104,8 +105,14 @@ green). Flags:
 1. **up** — `kirocrew pod up <wt> --json`. If already active, reuses it (and
    won't stop it on exit). Boots the worktree's own gateway with `--no-crons`,
    blank-seed DB, isolated HOME.
-2. **health** — polls `base_url/api/health` until 200/401/403 (≤45s). On timeout
-   it dumps logs to `boot-fail.log` and aborts.
+2. **health** — polls `kirocrew pod status <wt> --json` until its `health` is
+   200/401/403 (≤60s). Deliberately not a bare `curl base_url/api/health`: a
+   derived port is routinely held by another pod or by the live gateway, every
+   gateway answers that path identically, so a 200 there proves only that
+   *something* is listening. `pod status` reports the pod's OWN health and returns
+   `-2` when the responder is provably somebody else's, which this phase reports
+   as a port conflict naming `PORT=`. On timeout it dumps logs to `boot-fail.log`
+   and aborts.
 3. **auth** — proves auth: `/api/sessions` → 200 with token, 403 without.
    Token comes from `kirocrew pod up --json` output (no manual minting needed).
 4. **API tests** — runs the fixed command `python -m pytest -q` with cwd=the

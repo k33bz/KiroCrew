@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { act, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
@@ -79,6 +79,13 @@ function seed({
   m.artifactFolders = vi.fn().mockResolvedValue({ folders })
   m.artifactSessionDocs = vi.fn().mockResolvedValue({ docs })
   m.getArtifactPublishProviders = vi.fn().mockResolvedValue({ providers: [], kind: 'widget' })
+  // Most coverage cases exercise the public-deploy edition. Keep that product
+  // capability stable from the query's loading state through its resolved
+  // state; an empty provider list legitimately removes "Not deployed" labels
+  // and made the webapp assertions race the provider response.
+  m.publishProviders = vi.fn().mockResolvedValue({
+    providers: [{ id: 'deploy-web-aws', endpoint: '/api/deploy/deploy' }],
+  })
   m.themeBoot = vi.fn().mockResolvedValue({})
   m.artifact = vi.fn().mockImplementation((slug: string) => {
     const base = artifacts.find((a) => a.slug === slug) ?? mkArtifact(slug)
@@ -117,9 +124,29 @@ afterEach(() => {
 describe('ArtifactsPage — card previews per kind', () => {
   it('renders a markdown artifact through the markdown renderer', async () => {
     const arts = [mkArtifact('daily-notes', { kind: 'markdown' })]
-    seed({ artifacts: arts, full: { content: '# Heading one\n\nbody text' } })
+    const m = seed({ artifacts: arts })
+    let resolveArtifact!: (artifact: Artifact) => void
+    let signalArtifactRequest!: () => void
+    const artifactRequested = new Promise<void>((resolve) => {
+      signalArtifactRequest = resolve
+    })
+    const pending = new Promise<Artifact>((resolve) => {
+      resolveArtifact = resolve
+    })
+    m.artifact.mockImplementation(() => {
+      signalArtifactRequest()
+      return pending
+    })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Heading one' })).toBeInTheDocument())
+    // Wait on the actual query call, not a polling deadline: resolving before
+    // LocalCardBody mounts can leave the cache notification behind its
+    // subscriber under a loaded full suite.
+    await artifactRequested
+    await act(async () => {
+      resolveArtifact({ ...arts[0], content: '# Heading one\n\nbody text' })
+      await pending
+    })
+    expect(screen.getByRole('heading', { name: 'Heading one' })).toBeInTheDocument()
     expect(screen.getByText('body text')).toBeInTheDocument()
   })
 
@@ -895,6 +922,8 @@ describe('ArtifactsPage — session document filters', () => {
 })
 
 // ── Library drag and drop ────────────────────────────────────────────────
+// Driven with MOUSE events: the library's sensors are MouseSensor (6px
+// distance) + TouchSensor (250ms hold). A pointerdown activates neither.
 describe('ArtifactsPage — dragging a card', () => {
   it('raises a drag ghost naming the artifact, and clears it when the drag is cancelled', async () => {
     seed({ artifacts: [mkArtifact('cr-queue')], folders: [mkFolder('ops', 'Ops')] })
@@ -902,8 +931,8 @@ describe('ArtifactsPage — dragging a card', () => {
     await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
 
     const card = screen.getByText('cr queue').closest('[role="button"]') as HTMLElement
-    fireEvent.pointerDown(card, { pointerId: 1, clientX: 0, clientY: 0, isPrimary: true, button: 0 })
-    fireEvent.pointerMove(document, { pointerId: 1, clientX: 40, clientY: 40 })
+    fireEvent.mouseDown(card, { clientX: 0, clientY: 0, button: 0 })
+    fireEvent.mouseMove(document, { clientX: 40, clientY: 40 })
 
     // The overlay ghost is a second rendering of the artifact's name.
     await waitFor(() => expect(screen.getAllByText('cr queue').length).toBeGreaterThan(1))
@@ -918,14 +947,37 @@ describe('ArtifactsPage — dragging a card', () => {
     renderWithProviders(<ArtifactsPage />)
     const card = await screen.findByRole('button', { name: 'Open folder Ops' })
 
-    fireEvent.pointerDown(card, { pointerId: 1, clientX: 0, clientY: 0, isPrimary: true, button: 0 })
-    fireEvent.pointerMove(document, { pointerId: 1, clientX: 40, clientY: 40 })
+    fireEvent.mouseDown(card, { clientX: 0, clientY: 0, button: 0 })
+    fireEvent.mouseMove(document, { clientX: 40, clientY: 40 })
 
     await waitFor(() => expect(screen.getAllByText('Ops').length).toBeGreaterThan(1))
 
-    fireEvent.pointerUp(document, { pointerId: 1, clientX: 40, clientY: 40 })
+    fireEvent.mouseUp(document, { clientX: 40, clientY: 40 })
 
     await waitFor(() => expect(screen.getAllByText('Ops')).toHaveLength(1))
+  })
+
+  it('hands a finger SWIPE back to the browser instead of picking the card up', async () => {
+    // The reported bug: a swipe that began on a card was swallowed by the drag
+    // sensor, so the gallery did not pan (while a swipe beginning in the gap
+    // between cards did). TouchSensor's DELAY constraint cancels the sensor as
+    // soon as the finger travels past the tolerance, so no drag starts and the
+    // browser keeps the gesture. jsdom cannot pan, so what is asserted is the
+    // observable half: no ghost is raised.
+    seed({ artifacts: [mkArtifact('cr-queue')], folders: [] })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
+
+    const card = screen.getByText('cr queue').closest('[role="button"]') as HTMLElement
+    fireEvent.touchStart(card, { touches: [{ identifier: 1, clientX: 0, clientY: 0 }] })
+    // Well past the 5px tolerance, well under the 250ms hold — a scroll gesture.
+    fireEvent.touchMove(document, { touches: [{ identifier: 1, clientX: 0, clientY: 60 }] })
+
+    // Give the ghost every chance to appear before concluding it did not.
+    await new Promise(r => setTimeout(r, 60))
+    expect(screen.getAllByText('cr queue')).toHaveLength(1)
+
+    fireEvent.touchEnd(document, { touches: [] })
   })
 })
 

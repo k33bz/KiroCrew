@@ -6,39 +6,57 @@ persona injection, and other helpers used across chat_*.py modules.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
     from kiro_crew.slack.outbound import PostedOptions
 
+from kiro_crew.context_blocks import attributable_user_chars
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
+    COMPACTION_RECOVERY_PREFIX,
     CONN_RECOVERY_PREFIX,
     CRON_NOTIFY_PREFIX,
     EMPTY_RESPONSE_RECOVERY_PREFIX,
     MANUAL_RESUME_RECOVERY_PREFIX,
     POSTTOKEN_RECOVERY_PREFIX,
+    PROMISE_ONLY_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
     _normalize_slot_key,
+    append_and_surface,
     parse_cls_meta,
 )
+from kiro_crew.history import transcript_sort_key
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.quick_prompts import QUICK_PROMPTS
+from kiro_crew.security import (
+    oauth_url_contains_credential,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import SecurityEvent, sel
 from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
-from kiro_crew.slack.outbound import expire_options, mark_options_terminal, options_edit_lock
+from kiro_crew.slack.outbound import (
+    decode_options_token,
+    encode_options_token,
+    expire_options,
+    mark_options_terminal,
+    options_edit_lock,
+)
 from kiro_crew.validation import (
     MAX_TOOL_NAME_LEN,
     THEME_CONSENT_SHA_RE,
@@ -46,6 +64,65 @@ from kiro_crew.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def run_config_write(fn, /, *args, **kwargs):
+    """Run a blocking ``config.json`` writer under BOTH config locks.
+
+    Every ``config.json`` read-modify-write must serialize against two writer
+    generations at once: the sidecar advisory flock that ``update_config_locked``
+    takes (covering CLI / boot-refresh / other-process writers), and the
+    loop-side :func:`_get_config_lock` asyncio lock that the dashboard's legacy
+    handlers still rely on *alone* (bare ``read_config_for_update`` +
+    ``write_config_atomically``). A writer that holds only one of the two can
+    interleave with the other family and silently revert its settings from a
+    stale snapshot. The memory-settings PUT was such a writer and is not one
+    any more: ``handlers/memory.py`` routes every config mutation through this
+    helper.
+
+    This helper is the one async entry point that holds both: the asyncio lock
+    is acquired on the event loop, then ``fn`` (a sync callable that itself
+    routes through ``update_config_locked``) runs in a worker thread so the
+    flock wait never blocks the loop. Mirrors the boot-time meta-stamp refresh
+    in ``server.py``, which established the pattern.
+    """
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # lazy: import cycle
+
+    async with _get_config_lock():
+        # The worker is SHIELDED and drained before the lock is released. A
+        # thread cannot be cancelled, so cancelling this coroutine -- a gateway
+        # shutdown cancelling the boot migration, a client disconnecting mid-PUT
+        # -- would otherwise unwind the `async with` while ``fn`` is still inside
+        # its read-modify-write. The next writer would then enter the critical
+        # section against a file the previous one is still rewriting, and land a
+        # config derived from a snapshot taken before it: the earlier caller's
+        # settings silently revert.
+        #
+        # The invariant is NOT "drain once after a cancellation": it is that once
+        # a cancellation has been observed, the lock cannot leave this block until
+        # the worker is done. A single drain does not give that -- awaiting the
+        # drain is itself a suspension point, so a SECOND cancel (a graceful
+        # shutdown escalating after its timeout, which is exactly when a config
+        # write is most likely to be in flight) unwinds the `async with` with the
+        # thread still writing. Hence the loop: every cancellation is absorbed,
+        # and only a finished future ends it.
+        #
+        # Draining cannot change WHETHER the write happens -- the thread runs to
+        # completion either way -- so this only decides whether the lock outlives
+        # it. The cancellation is re-raised once, never swallowed.
+        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            break
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
 
 # Per-turn compaction-failure backoff. See
 # _broadcast_compaction_result for the full rationale. Kept small: this is a
@@ -123,17 +200,6 @@ def _build_stream_chunk(msg: dict) -> str:
     )
 
 
-def _extract_bash_command(tool_input: str) -> str:
-    """Extract the command string from execute_bash tool_input (JSON or raw)."""
-    try:
-        data = json.loads(tool_input)
-        if isinstance(data, dict):
-            return data.get("command", "")
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return tool_input
-
-
 # Deprecated -1m model aliases → base model (Anthropic 1M GA, April 2026)
 _DEPRECATED_MODEL_MAP = {
     "claude-opus-4.6-1m": "claude-opus-4.6",
@@ -181,6 +247,7 @@ _SLASH_COMMANDS = frozenset(
         "/todos",
         "/tools",
         "/usage",
+        "/workflow",
     }
 )
 
@@ -233,7 +300,66 @@ SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/tools": "Show available tools",
     "/usage": "Show billing and usage information",
     "/workflows": "List and manage dynamic workflow runs",
+    "/workflow": "List or run a saved workflow by name",
 }
+
+
+def parse_workflow_command(message: str) -> tuple[str, str] | None:
+    """Parse ``/workflow <slug> [input]`` without interpreting the input."""
+    parts = message.strip().split(None, 2)
+    if not parts or parts[0] != "/workflow":
+        return None
+    workflow_ref = parts[1] if len(parts) > 1 else ""
+    input_text = parts[2] if len(parts) > 2 else ""
+    return workflow_ref, input_text
+
+
+def user_text_span(
+    offset: int,
+    typed_len: int,
+    *,
+    quick_prompt: bool,
+    prompt_expanded: bool,
+) -> tuple[int, int]:
+    """WHERE the user's typed text sits in the message handed to ``build_message``.
+
+    Deliberately NOT the same question as how much of the turn is ATTRIBUTABLE to
+    the user, which is :func:`attributable_user_chars`. Conflating the two is a live
+    trap: a quick-prompt turn credits the user zero characters, so deriving the
+    span from the attributable count hands ``build_message`` an EMPTY slice — and
+    since that slice is what the quick-prompt matcher reads, the token silently
+    stops expanding altogether.
+
+    So a quick prompt reports its REAL typed span (the matcher has to see the
+    token; ``build_message`` zeroes the attribution itself once it has expanded),
+    while an ``@prompt`` turn — already replaced before this point, so its typed
+    text is gone from the message — reports the empty span the attribution rule
+    asks for.
+    """
+    length = (
+        typed_len
+        if quick_prompt
+        else attributable_user_chars(typed_len, prompt_expanded=prompt_expanded)
+    )
+    return offset, offset + length
+
+
+def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
+    """Whether *first_word* should be forwarded to the harness as a command.
+
+    Two rules, and the second exists because of a trap. A member of
+    :data:`_SLASH_COMMANDS` is a command on every provider. Under ``claude_code``
+    the harness owns its own command set, so ANY leading slash is forwarded —
+    except a quick-prompt token, which is not a command at all but a macro
+    :meth:`ContextBuilder.build_message` expands into an instruction. Forwarding one
+    would hand the harness a command it has no definition for, and the token would
+    silently do nothing on that provider while working everywhere else.
+    """
+    if first_word in _SLASH_COMMANDS:
+        return True
+    if not (cc_provider and first_word.startswith("/")):
+        return False
+    return first_word.lower() not in QUICK_PROMPTS
 
 
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:
@@ -269,7 +395,7 @@ def _append_compaction_notice(
 
     This is the single chokepoint for emitting a compaction notice — every
     compaction path (auto-compaction status events and the ``/compact`` slash
-    command, the kiro backend and the dormant claude seam alike) must route
+    command, the kiro and claude backends alike) must route
     through here so the tag is never accidentally dropped.
 
     Defense-in-depth: callers already redact, but since this chokepoint posts to
@@ -280,16 +406,8 @@ def _append_compaction_notice(
     msg_text, _ = redact_credentials(msg_text)
     msg_text, _ = redact_exfiltration_urls(msg_text)
     meta = {"kind": "compaction"}
-    slot.append("assistant", msg_text, "msg msg-a", meta=meta)
-    state.broadcast_ws(
-        "chat_message",
-        {
-            "slot": slot.key,
-            "role": "assistant",
-            "content": msg_text,
-            "kind": "compaction",
-            "meta": meta,
-        },
+    append_and_surface(
+        state, slot, "assistant", msg_text, "msg msg-a", meta=meta, extra={"kind": "compaction"}
     )
 
 
@@ -543,6 +661,48 @@ def effective_session_key(slot: _ChatSlot) -> str:
     return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
 
 
+def subagents_attached(
+    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+) -> bool:
+    """Whether sub-agent children are attached to *session_key*.
+
+    True means an action that tears the session down, or dispatches into it,
+    would discard a child's work. Every such caller shares THIS predicate: a
+    second copy is how the probes diverge, and both callers must fail toward
+    keeping a child's work.
+
+    Three probes, none optional:
+
+    * ``running_agents_for`` on the true session key. QUEUED children count too:
+      a spawn that hit the concurrency/stagger gate is deliberately absent from
+      ``_agents`` (see ``SubagentInfo.queued``), yet it WILL start on its own.
+    * IN-FLIGHT RESULT DELIVERY: the last child can finish — emptying both
+      probes — while its ``[Subagent completion event]`` injection is still
+      landing, and that injection needs both the transcript order and the
+      session it reports to.
+    * Fail closed on a None running-probe: that is the probe FAILING, not a slot
+      with no children, and mistaking the two is exactly the hazard this guard
+      exists to prevent.
+
+    A state with no ``subagents`` registry answers False — there is no runtime
+    for a child to be attached to.
+    """
+    subs = getattr(state, "subagents", None)
+    if subs is None:
+        return False
+    running = subs.running_agents_for(session_key)
+    queued = 0
+    if running is not None:
+        try:
+            queued = subs._queued_depth(session_key)
+        except Exception:
+            # An unreadable queue is unknown children, not zero children.
+            logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
+            queued = 1
+    inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
+    return bool(running is None or running or queued or inflight)
+
+
 def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
     """The slot holding *session_key*'s Slack OPTIONS state, if one exists.
 
@@ -587,36 +747,6 @@ def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | N
         return None
     except Exception:
         logger.debug("Slack OPTIONS slot lookup failed", exc_info=True)
-        return None
-
-
-def slack_options_turn_counter(state: DashboardState | None, session_key: str) -> int | None:
-    """*session_key*'s monotonic turn counter, or None if it cannot be read.
-
-    Tells "a turn happened" from "a turn is running", which
-    ``SessionManager.is_busy`` cannot: a turn that starts and finishes inside a
-    single await window reports idle at both ends. ``_ChatSlot.total_messages``
-    is a lifetime count that survives the slot's trim cap, so it moves for a turn
-    that came and went.
-
-    Lives here, beside the resolver it depends on, because more than one Slack
-    posting path needs it and a second copy would drift from this one.
-
-    Returns None on any failure. This feeds best-effort OPTIONS cleanup and must
-    never abort the turn that triggered it; a None on either side of a comparison
-    simply reads as "no observed change".
-
-    Only comparable against itself: two counters read from DIFFERENT sessions say
-    nothing about each other, so a caller whose owner may have changed has to
-    treat that change as supersession instead of comparing.
-    """
-    try:
-        if state is None:
-            return None
-        slot = slack_options_slot(state, session_key)
-        return None if slot is None else int(slot.total_messages)
-    except Exception:
-        logger.debug("Could not read the turn counter for OPTIONS bookkeeping", exc_info=True)
         return None
 
 
@@ -846,6 +976,96 @@ def slack_options_owner_keys_snapshot(
     return tuple(slack_options_session_keys(state, thread_ts))
 
 
+def mint_options_token(
+    state: DashboardState | None,
+    asker_key: str,
+    row_ts: str | None = None,
+) -> str | None:
+    """The staleness token to post with a control asked by *asker_key*.
+
+    Pairs the asking conversation with how far it had got when the question was
+    asked.
+
+    *asker_key* is supplied by the caller rather than resolved from the thread.
+    The caller knows which session ran the turn; resolving the thread's owner here
+    would name whoever owns it at MINT time, and a link landing between the turn
+    starting and its footer going out would stamp the control with a conversation
+    that never asked the question.
+
+    *row_ts* likewise comes from the caller when it already holds the value. That
+    keeps this free of I/O: reading the tail off disk takes the transcript's
+    cross-process flock, so on a contended session it is not a bounded cost and
+    has no business on the event loop. Passing the row the caller already has in
+    memory is the same value -- a replayed row preserves its ``ts`` verbatim.
+
+    Falls back to a disk read only when the caller has nothing, and that path is
+    BLOCKING: run it in a thread. ``None`` means the control posts untokened,
+    which the check reads as "cannot prove staleness" and honours.
+    """
+    try:
+        if not asker_key:
+            return None
+        if not row_ts:
+            log = getattr(state, "conversation_log", None)
+            if log is None:
+                return None
+            row_ts = log.last_row_ts(asker_key)
+        if not row_ts:
+            return None
+        return encode_options_token(asker_key, row_ts)
+    except Exception:
+        logger.debug("Could not mint an OPTIONS staleness token", exc_info=True)
+        return None
+
+
+async def options_control_is_stale(
+    state: DashboardState | None, block_id: str | None, thread_ts: str
+) -> bool:
+    """Whether the control carrying *block_id* is answering a superseded question.
+
+    The whole check: the token says which conversation asked and where that
+    conversation stood at the time; the transcript on disk says where it stands
+    now. A conversation that has moved on has superseded its own question.
+
+    Nothing in gateway memory takes part, which is what makes this survive a
+    restart -- the token is in the Slack message and the comparand is a persisted
+    transcript row, so neither half is lost when the process dies. The counter a
+    previous design compared against could NOT be used here: it is rebuilt from a
+    windowed replay of the transcript on startup, so it climbs back through values
+    it has already issued and reads a pre-restart token as current.
+
+    ABSTAINS to False -- honour the click -- whenever staleness cannot be PROVEN:
+    no token, a token this build cannot parse, an unreadable transcript, or an
+    unparseable timestamp. Refusing a legitimate answer is worse than accepting a
+    late one, and a control posted before this check existed carries no token at
+    all.
+    """
+    token = decode_options_token(block_id)
+    if token is None:
+        return False
+    asker_key, minted_ts = token
+    try:
+        # ONE comparison: has the conversation that ASKED moved on?
+        #
+        # Deliberately no ownership check. It would answer the wrong question now
+        # that an accepted click carries its destination: the answer reaches the
+        # conversation that asked it whatever the thread's ownership has since
+        # done, so a thread changing hands does not make a still-pending question
+        # unanswerable -- and refusing on that basis would reject a click the user
+        # was legitimately shown. Handover is not supersession; only the asker's
+        # own transcript advancing is.
+        log = getattr(state, "conversation_log", None)
+        if log is None:
+            return False
+        current_ts = await asyncio.to_thread(log.last_row_ts, asker_key)
+        if not current_ts:
+            return False
+        return transcript_sort_key(current_ts) > transcript_sort_key(minted_ts)
+    except Exception:
+        logger.debug("Could not judge whether an OPTIONS control is stale", exc_info=True)
+        return False
+
+
 def forget_slack_options_for_thread(
     state: DashboardState | None,
     thread_ts: str,
@@ -955,6 +1175,81 @@ async def expire_slack_options(
             session_key,
             tuple(p for p in options_records(state, session_key) if p not in settled),
         )
+
+
+def slack_mirror_is_paused(state: Any, session_key: str) -> bool:
+    """True when a turn must NOT be mirrored to the session's linked thread.
+
+    A pause retains the thread binding, so every inbound resolver still sees the
+    link and a reply still reaches the session that owns the thread. This is the
+    one predicate that tells outbound egress apart from that: consult it before
+    SENDING, never before routing. Gating a routing decision on it would fork a
+    new session out of a reply the user expected to continue this one.
+
+    Scope is deliberately turn mirroring — the user echo, its tool stream, the
+    assistant reply, an auth-required error and the linked approval prompt.
+    Deliveries that merely reuse the thread as an ADDRESS (a cron result, a
+    subagent completion, a requested file, an auto-nudge tick) are NOT gated: an
+    absent link makes those fall back to the owner's DM, and one of them deletes
+    the auto-nudge loop outright, so treating paused as no-link there would
+    reroute messages the user asked for and destroy a live monitor.
+
+    The channel compaction notice is also not gated, and belongs with the
+    address-based deliveries above rather than with turn output: it reports that
+    the session's own history was compacted, which stays true whether or not the
+    conversation is currently connected. (An earlier version of this note claimed
+    it "cannot reach a paused link" because an origin had no disconnect control.
+    Origin rows now DO carry one, so that reasoning is void — the exclusion
+    stands on the delivery's kind, not on the row's affordances.)
+
+    Strict ``is True`` rather than truthiness, and fails OPEN: ``sessions`` is a
+    bare ``MagicMock`` across much of the suite and returns a truthy child for
+    any unstubbed accessor, so truthiness here would silence every linked thread
+    in the test suite. Failing open leaves a muted thread noisy at worst; failing
+    closed would make a live thread silently dead.
+    """
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return False
+    try:
+        return sessions.is_slack_paused(session_key) is True
+    except Exception:
+        logger.debug("slack pause lookup failed for %s", session_key, exc_info=True)
+        return False
+
+
+def mirror_is_paused(state: Any, session_key: str, *, origin: bool = False) -> bool:
+    """True when a turn must NOT be mirrored to one of the session's non-Slack deliveries.
+
+    The channel-neutral twin of :func:`slack_mirror_is_paused`, and what a
+    dashboard disconnect suppresses for a non-Slack channel.
+
+    ``origin`` names WHICH delivery is being asked about, because a session can
+    hold two at once — the conversation it was born in and an explicit mirror —
+    and they mute independently. Callers that resolve a single outbound target
+    pass the flag matching the row the user acted on; see
+    :meth:`SessionMap.set_mirror_paused`.
+
+    The scope is narrower than Slack's because the hazard Slack has does not
+    exist here: no cron result, subagent completion, requested file or auto-nudge
+    tick reads a mirror binding at all — those address a channel explicitly — so
+    gating this cannot reroute a delivery to the owner's DM or destroy a monitor
+    loop. It covers the two sites that carry turn output: the user echo and the
+    assistant reply.
+
+    Same ``is True`` / fail-open contract as the Slack gate, for the same
+    MagicMock reason. A muted binding must stay visible to
+    ``find_mirror_sessions``, to the resume-conflict check and to both clear
+    paths, or in-channel ``!unlink`` and conflict detection break.
+    """
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return False
+    try:
+        return sessions.is_mirror_paused(session_key, origin=origin) is True
+    except Exception:
+        logger.debug("mirror pause lookup failed for %s", session_key, exc_info=True)
+        return False
 
 
 _INCOGNITO_PREFIX = (
@@ -1124,13 +1419,10 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 #      consent URL never carries credential patterns; presence of
                 #      one means it's tampered/bogus.
                 #
-                # The generic EXFIL heuristic is deliberately NOT applied, matching
-                # `_oauth_url_contains_credential` (chat_runner.py), whose docstring
-                # says it omits the long-query heuristic because that heuristic
-                # "would reject every real OAuth URL". test/oauth_url_corpus.py is
-                # the contract: real provider URLs routinely exceed 200 query chars
-                # and carry a 43-char base64url `code_challenge`, so the exfil
-                # heuristic fires on all of them.
+                # The exfiltration gate is parameter-aware: standard high-entropy
+                # OAuth values are exempt only at exact code-owned endpoints, while
+                # fixed/encoded credentials, heavy percent encoding, and unknown
+                # params remain fail-closed.
                 #
                 # This function runs on the EMIT path (_prepare_messages), which
                 # serves the slot-detail endpoint that the frontend refetches on
@@ -1142,8 +1434,7 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 # aligned is what prevents that.
                 lower = v.lower()
                 safe_scheme = lower.startswith("https://") or lower.startswith("http://")
-                _, hit_cred = redact_credentials(v)
-                out[k] = v if (safe_scheme and not hit_cred) else ""
+                out[k] = v if (safe_scheme and not oauth_url_contains_credential(v)) else ""
             else:
                 out[k] = _redact_value(v)
         return out
@@ -1233,12 +1524,601 @@ _EMPTY_AUTO_CONTINUE_MSG = (
     "conversation above and respond now — do NOT restart from scratch and do "
     "NOT re-run steps or tools that already completed successfully."
 )
+_PROMISE_ONLY_CONTINUE_MSG = (
+    f"{PROMISE_ONLY_RECOVERY_PREFIX}\n"
+    "Your previous turn ended right after you said you would perform an action "
+    "immediately (for example, opening a PR or running a tool), but the turn "
+    "yielded before that action was carried out, so nothing actually happened. "
+    "Carry out that action now by making the tool call you announced. But if you "
+    "were actually waiting on the user's approval or confirmation, or on a "
+    "condition that is not yet satisfied, do NOT perform the action — say what you "
+    "are waiting for instead. If it turns out you cannot, say what is blocking it "
+    "and what you need instead — do NOT just restate the intention. Do NOT re-run "
+    "any tool that already completed successfully above."
+)
+_COMPACTION_CONTINUE_MSG = (
+    f"{COMPACTION_RECOVERY_PREFIX}\n"
+    "The conversation above was summarized mid-turn because the context window "
+    "filled up, and your previous turn then ended without finishing the request. "
+    "The summary is authoritative — earlier messages are gone, so work from what "
+    "remains above. Continue the pending request now and respond. Do NOT restart "
+    "from scratch, and do NOT re-run any tool or step that already completed "
+    "successfully — the summary records what was done. If the summary left you "
+    "without something you need, say what is missing instead of guessing."
+)
 _SYNTHETIC_RECOVERY_MSGS = (
     _CONN_RECOVER_MSG,
     _BUSY_RECOVER_MSG,
     _POSTTOKEN_RECOVER_MSG,
     _EMPTY_AUTO_CONTINUE_MSG,
+    _PROMISE_ONLY_CONTINUE_MSG,
+    _COMPACTION_CONTINUE_MSG,
 )
+
+# High-confidence "I will do it right now" endings. Kept deliberately NARROW: a
+# broad natural-language detector risks false positives, duplicate writes, and
+# continuation loops (see #2686 fix direction), so this matches only a terminal
+# first-person commitment to an IMMEDIATE action, with an explicit now/right-away
+# marker. "I'll explain that now: ..." is NOT caught, because the detector also
+# requires that the promise be the LAST thing in the text (nothing substantive
+# follows it) — an announcement followed by the actual content is a normal answer.
+# The immediacy markers are deliberately RESTRICTIVE: only true "right now"
+# adverbs. `next` and `go ahead and` were removed after the #2696 AI review found
+# they matched "I'll do that next week" and permission-seeking closers — `next`
+# is a sequencer, not an immediacy signal. The bare `going to` alternative was
+# also removed (#2696 GPT round): with no first-person subject it matched
+# third-person statements like "The deployment is going to start now", firing an
+# unrelated continuation. Only the subject-bound `i'm going to` form remains.
+_PROMISE_NOW_RE = re.compile(
+    r"\b(?:i(?:'|’)?ll|i\s+will|let\s+me|i(?:'|’)?m\s+going\s+to)\b"
+    r"[^.!?\n]*?"
+    r"\b(?:now|right\s+away|right\s+now|immediately)\b"
+    r"[^.!?\n]*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+# A trailing sentence that is ONLY a promise (no colon-introduced content, no
+# code fence, no list) — used to confirm the promise is terminal, not a preamble.
+_PROMISE_HAS_FOLLOWING_CONTENT_RE = re.compile(r":\s*\S|```|\n\s*[-*\d]")
+# Permission-seeking / no-action closers that a naive immediacy match misfires on
+# (found by the #2696 AI review). These are the OPPOSITE of a promise-to-act: the
+# turn is correctly yielding to the user or explicitly declining to act. If any
+# appears in the final segment, it is never a promise-only turn. "let me know ...
+# now"/"...next" reads as immediate to the regex but is a hand-off; "for now" /
+# "as-is" / "stop here" are explicit non-actions.
+_NO_ACTION_CLOSER_RE = re.compile(
+    r"\blet\s+me\s+know\b"
+    r"|\bfor\s+now\b"
+    r"|\bfor\s+the\s+moment\b"
+    r"|\bas[-\s]is\b"
+    r"|\bstop\s+here\b"
+    r"|\bleave\s+(?:it|that|this)\b",
+    re.IGNORECASE,
+)
+# An APPROVAL-GATED closer keeps the decision with the user, even when the
+# sentence otherwise reads as a promise-to-act ("If that looks good, I'll push
+# it now.", "Just say the word and I'll open the PR right away."). The current
+# no-action list does not cover these because they contain both a real
+# commitment ("I'll ... now") and a conditional opener; auto-continuing them
+# dispatches an unattended action the user was still being asked to approve.
+# Found by the #2696 UX review. Bias, like the negation gate, is toward reject
+# on ambiguous conditionals — a false reject just lands the turn normally
+# (pre-fix behaviour, safe); a false accept executes a possibly-irreversible
+# side effect (push, merge, delete) without consent.
+_APPROVAL_GATED_RE = re.compile(
+    # ANY conditional `if` opener, not just specific pronouns: "If CI passes, I'll
+    # delete it now" is as gated as "If you approve ...". Bias toward reject is
+    # safe here (a false reject just lands normally); the #2696 GPT round widened
+    # this from the pronoun list after "If CI passes ..." slipped through.
+    r"\bif\b"
+    r"|\bjust\s+say\s+the\s+word\b"
+    r"|\bwant\s+me\s+to\b"
+    r"|\bshall\s+i\b"
+    # Consent DEFERRAL: the action is gated on the user's approval/confirmation,
+    # even when the sentence reads as "I'll ... now" ("I'll wait for your approval
+    # before I delete it right now"). The earlier list only caught "with your
+    # approval" and missed the far more common "wait for / for / pending your
+    # approval", "your go-ahead/sign-off/confirmation", "before you approve", and
+    # "you to confirm" forms — auto-continuing any of them dispatches an action the
+    # model explicitly said it would hold for consent (#2696 GPT round, blocking).
+    # The forms are kept PRECISE (a possessive consent-noun, or a deferral verb
+    # bound to you/your) rather than bare "pending"/"await"/"before you", so a
+    # genuine promise like "merge the pending PR now" is not falsely rejected —
+    # closing the consent CLASS without the over-broad reject the design review
+    # warned about. Reject-bias is still safe (a false reject just lands).
+    r"|\byour\s+(?:approval|go[-\s]?ahead|sign[-\s]?off|confirmation|permission|ok(?:ay)?|blessing)\b"
+    r"|\bwait(?:ing)?\s+for\s+(?:you|your|approval|confirmation|sign[-\s]?off|permission|the\s+go[-\s]?ahead)\b"
+    r"|\bbefore\s+you\s+(?:approve|confirm|decide|sign\s+off|review|say|weigh\s+in|ok(?:ay)?)\b"
+    r"|\byou\s+to\s+(?:approve|confirm|decide|sign\s+off|review|weigh\s+in|say|tell)\b"
+    # Temporal/conditional gates in ANY form ("once tests are green", "when the
+    # build passes", "after CI", "until you confirm"), not only "... you ...".
+    # Closes the conditional CLASS in one rule rather than enumerating each noun;
+    # reject-bias is safe.
+    r"|\b(?:once|when|after|as\s+soon\s+as|until)\b"
+    # Remaining subordinating-conditional conjunctions ("Unless you object, I'll
+    # merge now", "Assuming you're fine, I'll push now"). The risky ones are bound
+    # to a following pronoun/complementizer so a benign adjective ("the provided
+    # config", "the given file") is NOT falsely rejected (#2696 GPT/design rounds).
+    r"|\bunless\b"
+    r"|\bassuming\s+(?:you|that|we|it|the|your)\b"
+    r"|\bprovided\s+(?:that|you)\b"
+    r"|\bgiven\s+(?:that|you)\b"
+    r"|\b(?:as|so)\s+long\s+as\b",
+    # NOTE (residual risk, #2696 design review): this is a deny-list, and the
+    # DANGEROUS direction for the consent class is the false ACCEPT (auto-continuing
+    # an action the user was still being asked to approve), which enumeration cannot
+    # fully close — a novel conditional phrasing will always slip through. Two
+    # mitigations bound the blast radius: (1) `_PROMISE_ONLY_CONTINUE_MSG` itself
+    # instructs the model NOT to act if it was waiting on approval/a condition (a
+    # semantic backstop independent of this regex), and (2) recovery only INJECTS a
+    # continuation — the tool call still flows through the normal approval path, so
+    # only auto-approve/yolo turns an escape into an unattended side effect. The
+    # accept-list inversion (fire only on a proven-unconditional commitment) is the
+    # real long-term fix but is a behaviour-changing redesign, out of scope here.
+    # A cheaper structural bound worth considering: skip promise-only recovery (or
+    # downgrade it to the notice-only arm) under auto-approve/yolo, so a detector
+    # false-accept can never become an unattended side effect.
+    re.IGNORECASE,
+)
+# A NEGATED commitment before the immediacy marker ("I'm not going to open the PR
+# now", "I won't do that now", "I can't right now") is the OPPOSITE of a promise
+# to act, but the bare `going to`/`i'll` alternatives above still match it (found
+# by the #2696 GPT review). Reject when a negated-commitment form is followed,
+# within the same sentence, by an immediacy marker. Bias is deliberately toward
+# REJECTING on ambiguous negation: a false reject just lands the turn normally
+# (pre-fix behaviour, safe), whereas a false accept injects an unwanted action.
+_NEGATED_PROMISE_RE = re.compile(
+    r"\b(?:not\s+going\s+to|never\s+going\s+to|won(?:'|’)?t|will\s+not"
+    r"|i(?:'|’)?ll\s+not|can(?:'|’)?t|cannot|not\s+able\s+to|unable\s+to"
+    r"|do(?:es)?n(?:'|’)?t|do(?:es)?\s+not|no\s+longer)\b"
+    r"[^.!?\n]*?"
+    r"\b(?:now|right\s+away|right\s+now|immediately)\b",
+    re.IGNORECASE,
+)
+# The promise gate (`_PROMISE_NOW_RE`) is TERMINAL-ANCHORED (`...$`): any promise
+# it matches lives entirely in the final sentence. The three reject gates must be
+# scoped to that SAME sentence, not `.search()` the whole segment — otherwise an
+# everyday `if`/`when`/`after`/`let me know`/negation in an EARLIER sentence
+# ("When you asked about X, I fixed it. I'll open the PR now.") vetoes a genuine
+# terminal promise, landing the exact #2686 symptom unrecovered (asymmetric-scope
+# false negative, #2696 design review). Splitting on sentence + newline boundaries
+# keeps the reject-bias but only where the promise can actually be.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?\n]+")
+
+
+def _terminal_sentence(text: str) -> str:
+    """Return the last sentence of ``text`` — the span the terminal promise gate
+    matches. Reject gates are scoped to this so a subordinate clause earlier in a
+    multi-sentence closer cannot veto a promise that sits only at the end."""
+    parts = [p.strip() for p in _SENTENCE_BOUNDARY_RE.split(text) if p.strip()]
+    return parts[-1] if parts else text
+
+
+def is_promise_only_terminal(final_segment_text: str) -> bool:
+    """True when the turn's FINAL segment is a promise to act immediately, with no
+    action taken and nothing substantive following the promise.
+
+    ``final_segment_text`` MUST be the assistant text emitted AFTER the last tool
+    call of the turn (the runner resets its segment buffer at each tool boundary,
+    so its final ``assistant_text`` already is exactly that). Evaluating only the
+    post-last-tool text is what keeps an already-executed action from being
+    replayed: a turn that DID call the tool and then summarised has a final
+    segment that is a summary, not a promise, so it does not match.
+
+    Narrow by construction (three gates, all required):
+      1. there is a first-person commitment to an immediate action
+         (``I'll ... now`` / ``let me ... now`` / ``going to ... right away``);
+      2. that promise sits at the END of the text (``...now.`` is the last
+         sentence), so ``I'll explain now: <the explanation>`` does NOT match;
+      3. no colon-introduced content, code fence, or list follows — those mean
+         the "promise" was actually a lead-in to delivered content.
+    Returns False on empty/whitespace so a genuinely empty turn stays on the
+    dedicated empty-response path."""
+    text = (final_segment_text or "").strip()
+    if not text:
+        return False
+    # The three reject gates are scoped to the terminal sentence (where a matched
+    # promise must live), NOT the whole segment — see `_SENTENCE_BOUNDARY_RE`.
+    terminal = _terminal_sentence(text)
+    # Gate 0: a permission-seeking or explicit-no-action closer is the OPPOSITE of
+    # a promise-to-act, even when it contains an immediacy word ("let me know what
+    # you'd like to do next", "I'll leave that as-is for now"). Reject up front so
+    # the guard never overrides a user decision point with an unsolicited action.
+    if _NO_ACTION_CLOSER_RE.search(terminal):
+        return False
+    # Gate 0b: a negated commitment ("I'm not going to ... now", "I won't ... now")
+    # is an explicit NON-action, not an unfulfilled promise. Reject it before the
+    # immediacy match, which would otherwise fire on the bare commitment token.
+    if _NEGATED_PROMISE_RE.search(terminal):
+        return False
+    # Gate 0c: an approval-gated closer ("If that looks good, I'll push it now")
+    # leaves the decision with the user; auto-continuing it dispatches the
+    # action the user was still being asked to approve.
+    if _APPROVAL_GATED_RE.search(terminal):
+        return False
+    # Gate 3: a promise that introduces content (colon + text, a fence, a list)
+    # is a preamble to a real answer, not an unfulfilled action. Scanned over the
+    # WHOLE text on purpose: the content that unmasks the promise as a preamble
+    # follows it (a colon tail on the same line, or a fence/list on later lines),
+    # so it is outside the terminal sentence by construction.
+    if _PROMISE_HAS_FOLLOWING_CONTENT_RE.search(text):
+        return False
+    # Gates 1 + 2: an immediate-action commitment that is the terminal sentence.
+    return bool(_PROMISE_NOW_RE.search(text))
+
+
+# Fenced code blocks (``` or ~~~, any length ≥3) and inline code spans (a
+# backtick run closed by an equal-length run on the same line) are QUOTED
+# content: a user pasting a leak transcript, or the model explaining tool
+# syntax, legitimately shows an invoke block inside them. Both are stripped
+# before the leak scan so quoted machine syntax never triggers the notice.
+# Only PAIRED delimiters are removed — an unpaired fence or tick run inside a
+# genuinely leaked payload leaves the surrounding invoke tags visible (failure
+# direction: a missed notice, never a suppressed one).
+#
+# LINEAR BY CONSTRUCTION, deliberately. The scan runs on the event loop at
+# every turn completion over model-authored text, so it must stay linear on
+# ADVERSARIAL input too: a variable-length backreference pattern like
+# ``(`{3,}|~{3,}).*?(?P=fence)`` backtracks over every possible delimiter
+# split, and a few thousand consecutive backticks stall the loop for tens of
+# seconds — long enough for the liveness watchdog to kill the gateway. So the
+# delimiters are tokenized with a fixed-alternative regex (no backreferences)
+# and paired in one forward pass.
+_CODE_DELIM_RE = re.compile(r"`+|~{3,}")
+
+
+def _strip_quoted_code(text: str) -> str:
+    """*text* with paired code fences and inline code spans removed, linearly.
+
+    One forward pass over the delimiter tokens:
+
+    * A run of ≥3 backticks or ≥3 tildes OPENS a fence; the next run of the
+      same character AT LEAST AS LONG (CommonMark's closer rule) CLOSES it,
+      and everything between is dropped — so a four-backtick quote can carry
+      triple-backtick content without being cut short. Delimiters of the
+      other kind, and shorter runs of the same kind, inside an open fence are
+      content.
+    * Outside a fence, a backtick run of length L opens an inline span; the
+      next run of exactly length L on the SAME line closes it. A newline
+      discards all pending span opens (spans cannot contain newlines), and a
+      pending open that never closes is emitted as literal text.
+
+    Every token is visited once and every output chunk is appended/discarded
+    at most once, so the pass is linear whatever the input shape.
+    """
+    out: list[str] = []
+    # Pending inline-span opens: run length -> index in ``out`` where the
+    # opening run was appended. Cleared on every newline and on fence entry.
+    span_open_at: dict[int, int] = {}
+    fence_char = ""  # non-empty while inside an open fence
+    fence_open_len = 0
+    fence_open_out_idx = 0
+    pos = 0
+    for tok in _CODE_DELIM_RE.finditer(text):
+        seg = text[pos : tok.start()]
+        delim = tok.group()
+        pos = tok.end()
+        if fence_char:
+            # Inside a fence: append tentatively — the content is dropped only
+            # when a closer actually arrives, so an UNPAIRED fence leaves every
+            # byte in place (fail toward detection, never suppression).
+            out.append(seg)
+            if delim[0] == fence_char and len(delim) >= fence_open_len:
+                del out[fence_open_out_idx:]  # drop the fence and its content
+                fence_char = ""
+            else:
+                out.append(delim)
+            continue
+        out.append(seg)
+        if "\n" in seg:
+            span_open_at.clear()
+        if len(delim) >= 3:
+            # Fence opener (either character). Tentatively append; the closer
+            # (if any) truncates back to this index.
+            fence_open_out_idx = len(out)
+            out.append(delim)
+            fence_char = delim[0]
+            fence_open_len = len(delim)
+            span_open_at.clear()
+            continue
+        opened = span_open_at.pop(len(delim), None)
+        if opened is not None:
+            del out[opened:]  # drop the span, its delimiters, and its content
+            # Pending opens recorded INSIDE the just-dropped span went with it;
+            # keeping their indices would point past the truncated output.
+            span_open_at = {ln: i for ln, i in span_open_at.items() if i < opened}
+        else:
+            span_open_at[len(delim)] = len(out)
+            out.append(delim)
+    # An unpaired fence needs no special handling here: its tentatively-
+    # appended delimiter is already in ``out`` as literal text.
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# The leaked block's signature: an invoke open tag with a name attribute
+# (optionally namespace-prefixed the way some harnesses emit it). MACHINE-SHAPED
+# on purpose — unlike the promise-only detector this is not a natural-language
+# inference, so the false-positive surface is quoted syntax (handled by the
+# stripping above), not phrasing.
+_LEAKED_INVOKE_OPEN_RE = re.compile(
+    r"<(?:[A-Za-z][\w.-]*:)?invoke\s+name\s*=\s*[\"'][^\"'<>]+[\"']"
+)
+# Corroboration: the block must also carry a parameter tag or its own close tag,
+# so a lone stray open tag in prose (a truncated quote, a typo'd example) does
+# not read as a full leaked invocation.
+_LEAKED_INVOKE_BODY_RE = re.compile(r"<(?:[A-Za-z][\w.-]*:)?(?:parameter\b|/invoke\s*>)")
+
+
+def has_leaked_tool_call(text: str) -> bool:
+    """True when *text* contains a tool invocation emitted as PROSE — an
+    unquoted invoke-block open tag with a parameter or close tag (issue #6112:
+    the model writes the call into the text channel instead of executing it,
+    the turn ends with zero tool calls, and the session silently stalls).
+
+    Quoted syntax is excluded structurally: fenced code blocks and inline code
+    spans are stripped before the scan, so a pasted bug report or an explained
+    example never matches. The caller must additionally require
+    ``turn_tool_calls == 0`` — a turn that executed tools and ALSO printed a
+    block is not the leak shape.
+    """
+    if not text:
+        return False
+    stripped = _strip_quoted_code(text)
+    opener = _LEAKED_INVOKE_OPEN_RE.search(stripped)
+    if not opener:
+        return False
+    # Corroboration must FOLLOW the opener: a parameter/close tag sitting
+    # before a lone opener is unrelated markup, not this invocation's body.
+    return bool(_LEAKED_INVOKE_BODY_RE.search(stripped, opener.end()))
+
+
+def should_notice_leaked_tool_call(
+    *,
+    stop_reason: str,
+    end_turn_reason: str,
+    final_segment_text: str,
+    prompt_depth: int,
+    is_cancelled: bool,
+    refusal_reasons: list,
+    turn_tool_calls: int = 0,
+    in_stage_execution: bool = False,
+) -> bool:
+    """Decide whether to surface the leaked-tool-call NOTICE (issue #6112).
+
+    The defect: the model emits an invoke block into its TEXT channel instead
+    of executing it (observed when the target is a deferred MCP tool whose
+    schema is not yet bound, and with large nested arguments), the turn then
+    ends with zero tool calls, and the session idles — in a monitor/autonudge
+    loop this is a silent stall the user only discovers by noticing nothing
+    happened.
+
+    NOTICE-ONLY, deliberately. An injected "re-issue that call" continuation
+    would carry runtime authority into a session where the call can execute
+    with no human gate — slot trust, global yolo, OR a static agent tool
+    allowlist all auto-approve it, and the last of these is invisible at this
+    layer, so no downgrade condition can be written here that fails closed.
+    The leaked block is also not proof of the model's own intent: untrusted
+    external content (a pasted issue, a fetched page quoting a leak) can carry
+    an unfenced block the model merely reproduces. So the turn is marked
+    un-landed and the user gets a visible card naming what happened; nothing
+    is queued and nothing can execute. An unattended loop loses one cycle and
+    retries on its own schedule — visibly, which is the half of #6112 this
+    layer can fix honestly.
+
+    Gates: the turn ended NORMALLY (cancel/refusal/error paths own their own
+    reporting), made ZERO tool calls (a turn that executed tools and also
+    printed a block is not the leak shape), is top-level, is NOT a
+    stage-execution turn (the orchestrator's stage loop reads the turn result
+    for stage accounting, and un-landing a stage turn from here would let the
+    loop record an unfinished stage as complete — same exclusion as the
+    promise-only guard), and its final segment carries the machine-shaped
+    leak (:func:`has_leaked_tool_call`). No one-shot budget: nothing is
+    re-queued, so there is no loop to bound, and every leaked turn deserves
+    its own visible mark.
+    """
+    if is_cancelled or refusal_reasons:
+        return False
+    if turn_tool_calls != 0:
+        return False
+    if in_stage_execution:
+        return False
+    if stop_reason != end_turn_reason:
+        return False
+    if prompt_depth != 0:
+        return False
+    return has_leaked_tool_call(final_segment_text)
+
+
+def should_recover_promise_only(
+    *,
+    stop_reason: str,
+    end_turn_reason: str,
+    produced_visible_output: bool,
+    final_segment_text: str,
+    prompt_depth: int,
+    promise_only_retries: int,
+    is_cancelled: bool,
+    refusal_reasons: list,
+    turn_tool_calls: int = 0,
+    in_stage_execution: bool = False,
+    stop_in_progress: bool = False,
+    stop_generation_unchanged: bool = True,
+    queue_empty: bool = True,
+    no_pending_steers: bool = True,
+) -> bool:
+    """Decide whether to inject ONE promise-only continuation.
+
+    All must hold (each guards a failure mode the #2686 fix direction names):
+      * NO Stop is in progress (``stop_in_progress`` is the runner's
+        ``_should_suppress_requeue``). A soft Stop pressed while the promise
+        streamed can lose the cancel race and arrive here as a normal
+        ``end_turn``; re-queueing then would dispatch the very action the user
+        tried to stop. Every sibling recovery path gates on this, so this one
+        must too (#2696 GPT review, blocking);
+      * NO Stop was pressed at ANY point during this turn
+        (``stop_generation_unchanged``: the monotonic ``slot._stop_generation``
+        snapshotted at turn start still matches). A Stop that pressed AND
+        resolved back to idle during the turn is invisible to ``stop_in_progress``
+        but the user still cancelled; do not re-dispatch the announced action
+        (#2696 GPT review round 2, blocking);
+      * NO user follow-up is queued (``queue_empty``). ``queue_insert(0, ...)``
+        would jump the continuation ahead of a user-typed "don't do that" or
+        clarifying message; the user's queued input must process FIRST — respect
+        it by falling through to a normal landing instead of overriding it
+        (#2696 GPT review round 2, blocking);
+      * NO mid-turn steer is pending (``no_pending_steers``). A steer lands in
+        ``slot._pending_steers``, a SEPARATE channel from ``_queue``; it is only
+        degraded into a queue card in ``_run_chat``'s ``finally``, which runs
+        AFTER this guard. So a "don't delete" steer is invisible to
+        ``queue_empty`` here, and firing recovery would schedule the announced
+        action despite the just-arrived revocation. Abort when any user input
+        exists, in either channel (#2696 GPT review round 3, blocking);
+      * the turn ended NORMALLY (``end_turn``), not cancelled/refused/errored —
+        those have their own paths and must stay unchanged;
+      * it produced visible output (a promise IS visible output) and is not the
+        empty-response case (that path owns ``not produced_visible_output``);
+      * the turn made NO tool calls (``turn_tool_calls == 0``). The segment-buffer
+        reset at each tool boundary was the ORIGINAL "never replay an executed
+        action" proxy, but it is not airtight: a turn that completed a side-
+        effecting tool (e.g. ``send_message``) and then emitted trailing
+        promise-shaped text ("I'll send that now") would still match the detector,
+        and the continuation would REISSUE the completed action (duplicate external
+        message). The promise-only bug is by definition a turn that announced an
+        action and made NO tool call, so requiring a zero tool-call count closes the
+        replay hole directly. A turn that ran a read then promised a further action
+        is excluded too — a false negative, which is the safe direction (#2696 GPT
+        review, blocking);
+      * the final segment is a terminal promise-to-act
+        (:func:`is_promise_only_terminal`). Because the runner resets its segment
+        buffer at every tool boundary, ``final_segment_text`` is exactly the text
+        AFTER the last tool call — so a turn that executed a tool and then
+        summarised has a summary here, not a promise; the ``turn_tool_calls`` gate
+        above is the airtight backstop for the same guarantee;
+      * this is NOT a stage-execution turn (``in_stage_execution``). A turn run by
+        the orchestrator's stage loop must not spawn async recovery: the loop
+        records the stage complete and advances before the continuation finishes,
+        corrupting stage attribution (#2696 GPT review, blocking);
+      * this is a top-level turn (``prompt_depth == 0``) and the one-shot budget
+        is unspent (``promise_only_retries < 1``) — bounded to a single attempt,
+        never a loop.
+    Model-agnostic: nothing here keys on a model id.
+
+    Language scope: the terminal-promise detector (``is_promise_only_terminal``)
+    matches English commitment/immediacy tokens only; a non-English promise-only
+    turn falls through and lands normally (pre-fix behaviour). Failure bias is
+    safe (false negative, not false positive)."""
+    if stop_in_progress or not stop_generation_unchanged or not queue_empty:
+        return False
+    if not no_pending_steers:
+        return False
+    if is_cancelled or refusal_reasons:
+        return False
+    if turn_tool_calls != 0:
+        return False
+    if in_stage_execution:
+        return False
+    if stop_reason != end_turn_reason:
+        return False
+    if not produced_visible_output:
+        return False
+    if prompt_depth != 0 or promise_only_retries >= 1:
+        return False
+    return is_promise_only_terminal(final_segment_text)
+
+
+def should_continue_after_compaction(
+    *,
+    compaction_started: bool,
+    compaction_settled: bool,
+    user_requested_compaction: bool,
+    final_segment_text: str,
+    stop_reason: str,
+    end_turn_reason: str,
+    prompt_depth: int,
+    compaction_continue_retries: int,
+    is_cancelled: bool,
+    refusal_reasons: list,
+    in_stage_execution: bool = False,
+    stop_in_progress: bool = False,
+    stop_generation_unchanged: bool = True,
+    queue_empty: bool = True,
+    no_pending_steers: bool = True,
+) -> bool:
+    """Decide whether to inject ONE post-compaction continuation.
+
+    The scenario: the backend hit its context ceiling PART WAY THROUGH a turn,
+    summarized the conversation in place, and then ended the turn without
+    finishing the work it was doing. The compaction succeeded, so nothing
+    reports an error and the turn lands as a clean ``end_turn`` with a settled
+    footer — the request is simply abandoned, and the chat appears to stop dead.
+    kiro-cli re-sends the pending request itself after compacting; the Claude
+    backend does not, so the recovery has to live here.
+
+    Unlike :func:`should_recover_promise_only` this needs no text detector and
+    is deliberately NOT gated on ``turn_tool_calls == 0``: a mid-turn compaction
+    is a hard fact reported by the backend, not a guess about what prose meant,
+    and the turns that overflow the window are precisely the long tool-heavy
+    ones. Re-dispatch safety comes from the continuation's own wording, which
+    tells the model the summary records completed work and not to re-run it.
+
+    All must hold:
+      * a compaction STARTED and COMPLETED inside this turn
+        (``compaction_started``/``compaction_settled``) — the turn really was
+        interrupted by one, rather than merely following one. ``compaction_settled``
+        means the COMPLETED terminal specifically, not any terminal: a compaction
+        that FAILED also ends, and continuing after one would assert a summary
+        exists when the context was never summarized;
+      * the user did NOT ask for it (``user_requested_compaction`` is False for
+        anything but an explicit ``/compact``). A deliberate ``/compact`` has
+        done exactly what was asked and must land quietly; auto-continuing it
+        would turn a housekeeping command into an unrequested turn;
+      * the turn produced NO answer of its own after the compaction
+        (``final_segment_text`` is blank). A backend that DID resume and finish
+        leaves text here, so this is also what keeps the fix from double-
+        prompting a backend that self-heals. A compaction NOTICE does not count
+        as such an answer: the Claude adapter ships it as ordinary assistant text
+        and nothing deletes the chunk, so the ACP layer flags it
+        (``AcpEvent.control_notice``) and the caller SUBTRACTS the flagged chunks
+        from the segment text it passes here. Subtracting at this one call rather
+        than suppressing the chunk upstream is deliberate: the notice must still
+        stream and persist, so the text path stays untouched and only this gate —
+        the one reader that asks "did the turn answer?" — discounts it;
+      * the turn ended NORMALLY (``end_turn``), was not cancelled, and carried
+        no tool refusals — those have their own paths;
+      * no Stop is in progress, no Stop was pressed at any point in the turn,
+        no user follow-up is queued, and no mid-turn steer is pending. Same four
+        user-intent gates every sibling recovery path uses, for the same reason:
+        a queued continuation must never jump ahead of, or act against, input
+        the user has already given;
+      * this is NOT a stage-execution turn, it IS top-level
+        (``prompt_depth == 0``), and the one-shot budget is unspent
+        (``compaction_continue_retries < 1``) — one attempt, never a loop. The
+        bound matters more here than elsewhere: if the continuation itself
+        overflows the window again, an unbounded version would compact and
+        continue forever.
+    Model-agnostic and backend-agnostic: nothing here keys on a model id or a
+    backend name — it reads the normalized compaction status every backend's
+    adapter now produces.
+    """
+    if not compaction_started or not compaction_settled:
+        return False
+    if user_requested_compaction:
+        return False
+    if stop_in_progress or not stop_generation_unchanged or not queue_empty:
+        return False
+    if not no_pending_steers:
+        return False
+    if is_cancelled or refusal_reasons:
+        return False
+    if in_stage_execution:
+        return False
+    if stop_reason != end_turn_reason:
+        return False
+    if final_segment_text.strip():
+        return False
+    return prompt_depth == 0 and compaction_continue_retries < 1
+
+
 # Injected when the USER presses Continue on an interrupted turn. Worded to be
 # TRUE in both interruption shapes, which is why the endpoint needs no branch:
 # a turn that streamed partway and one that produced nothing at all read this
@@ -1332,6 +2212,13 @@ def is_system_injection(content: str) -> bool:
     """True when a queued message is a system injection (sub-agent completion
     or cron notification) rather than a plain user message.
 
+    .. deprecated::
+        Content-only classification is spoofable — a user typing the prefix
+        text would be misclassified. Prefer :func:`is_system_injection_item`
+        which checks the structural ``kind`` tag first. This function is kept
+        only as a backwards-compatibility fallback for queue items enqueued
+        before the kind tag was introduced.
+
     Single source of truth for the predicate that decides which queued
     messages keep draining during a sub-agent run (`_dequeue_next_system_message`),
     which break a user-message merge (`_dequeue_next_message`), and which must
@@ -1347,6 +2234,21 @@ def is_system_injection(content: str) -> bool:
 
 #: Structural queue-entry kind for runner-injected recovery instructions.
 SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
+
+#: Row-level kind for the `error` notice appended when a recovery has ALREADY
+#: been queued, so the frontend can tell a pending retry from a terminal failure.
+TRANSIENT_RETRY_KIND = "transient_retry"
+
+#: Structural queue-entry kinds for system injections.  Classification by kind
+#: tag — set at enqueue time — is unforgeable: a user typing the same prefix
+#: text will not have the kind tag and will correctly classify as plain input.
+SUBAGENT_COMPLETION_KIND = "subagent_completion"
+CRON_NOTIFICATION_KIND = "cron_notification"
+
+#: All system-injection kinds (for set-membership checks).
+_SYSTEM_INJECTION_KINDS = frozenset(
+    (SUBAGENT_COMPLETION_KIND, CRON_NOTIFICATION_KIND, SYNTHETIC_RECOVERY_KIND)
+)
 
 
 def is_synthetic_recovery_item(item: dict) -> bool:
@@ -1406,13 +2308,20 @@ def is_synthetic_payload_item(item: dict) -> bool:
 def is_system_injection_item(item: dict) -> bool:
     """Item-aware system-injection predicate for queue-entry consumers.
 
+    Prefers the **structural** ``kind`` tag (set at enqueue time, unforgeable)
+    over content-prefix inspection. Content fallback is removed to fully close
+    the spoofing gap — classification is exclusively by kind tag.
+
     Synthetic recovery instructions are orchestration, not user speech: they
     must BREAK a user-message merge (folding one into a "[N queued messages
     merged]" turn would flip it back into user-authored, persisted,
     channel-mirrored history), keep draining during sub-agent runs, and never
     consume the session-reset notice — same treatment as sub-agent completion
     and cron injections."""
-    return is_synthetic_recovery_item(item) or is_system_injection(item["content"])
+    kind = item.get("kind", "")
+    if kind in _SYSTEM_INJECTION_KINDS:
+        return True
+    return False
 
 
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
@@ -1431,7 +2340,7 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     return item["content"], [item]
 
 
-def _dequeue_next_system_message(slot) -> tuple:
+def _dequeue_next_system_message(slot, *, exclude_cron: bool = False) -> tuple:
     """Pop the first queued sub-agent-completion or cron injection, leaving
     plain user messages queued.
 
@@ -1441,63 +2350,189 @@ def _dequeue_next_system_message(slot) -> tuple:
     keep flowing (sub-agent completions, cron notifications) are still drained.
     Returns ``(content, [item])`` for the drained item, or ``(None, [])`` when
     only held (user) messages remain queued.
+
+    ``exclude_cron`` additionally holds cron notifications. A multi-stage plan
+    runs each stage as its own ``_run_chat`` whose tail-drain fires while
+    ``_in_stage_execution`` is still set; without this a cron notification
+    queued during the plan is pulled BETWEEN stages and starts a turn that
+    scatters the plan's output. Sub-agent completions and synthetic recovery
+    still flow (a stage may legitimately spawn sub-agents or re-queue a
+    continuation) -- only the external cron injection waits for the plan to end.
     """
     for i, item in enumerate(slot._queue):
         if is_system_injection_item(item):
+            if exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND:
+                continue
             popped = slot.queue_pop(i)
             return popped["content"], [popped]
     return None, []
 
 
+def _collapse_wire_rows(messages: list[dict]) -> list[dict]:
+    """Reduce wire-only rows so that one row means one displayed message.
+
+    ``chunk`` and ``done`` are wire-only roles that are never persisted.
+    ``chunk`` is appended once per streamed delta, so a text segment still in
+    flight occupies hundreds of rows that render as a single message, and
+    ``done`` is a turn terminator that renders as nothing at all. A caller that
+    bounds by row count is therefore counting stream progress and terminators
+    rather than messages, and a bound taken before this reduction is spent on
+    rows the response will not contain.
+
+    Runs of ``chunk`` fold into one ``chunk`` row; ``done`` rows drop. This is
+    the canonical first pass for :func:`_prepare_messages`, so dropping a
+    terminator here rather than letting it split a run defines the render
+    behaviour too. No redaction is applied and no other role is rewritten,
+    which is what lets this run ahead of a slice without changing what the
+    slice renders as.
+
+    Input dicts are never mutated: a merged row is a fresh dict, because these
+    rows are shared with the live window the event loop appends to.
+    """
+
+    def _merged(run: list[dict]) -> dict:
+        if len(run) == 1:
+            return run[0]
+        # One join across the run, not a new string per delta: a long reply is
+        # hundreds of deltas, and pairwise concatenation copies the text
+        # accumulated so far every time, which is quadratic in the reply size.
+        return {**run[0], "content": "".join(m.get("content", "") for m in run)}
+
+    out: list[dict] = []
+    run: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "chunk":
+            run.append(m)
+            continue
+        if role == "done":
+            continue
+        if run:
+            out.append(_merged(run))
+            run = []
+        out.append(m)
+    if run:
+        out.append(_merged(run))
+    return out
+
+
+# One opaque id for THIS gateway process, minted at import and never written to
+# disk. That is the entire mechanism behind the gate below: an `mcp_oauth` banner
+# records the generation that minted it, and a generation that is not this one is
+# provably gone. Every ACP child is a subprocess of the gateway, so the loopback
+# listener and the PKCE verifier that made the banner's URL redeemable died with it.
+#
+# In-memory ON PURPOSE, and random rather than sequential. `connections.warm`
+# documents where a counter leads: its generation restarts at 0 every boot, so a
+# stored `generation=1` compares equal to a different boot's `generation=1` and the
+# row is judged live when it is dead -- that bug already withdrew a URL whose
+# process and session were both alive. A fresh random id cannot collide with a
+# previous boot's, so the comparison stays correct with no bookkeeping and no
+# persisted state to migrate.
+_GATEWAY_GENERATION = uuid.uuid4().hex[:16]
+
+
+def gateway_generation() -> str:
+    """The generation id of the running gateway process."""
+    return _GATEWAY_GENERATION
+
+
+def _expire_stale_generation_oauth_meta(role: str, meta: dict) -> dict:
+    """Present an `mcp_oauth` banner minted by a dead generation as terminal.
+
+    A read-time gate, and it has to be read-time. The case it exists for is a hard
+    gateway restart: no code of ours runs at the moment the flow dies, so nothing
+    can write the terminal state when it becomes true. Revalidating on every read
+    is the same discipline `connections.mint.expire_dead_holder` already applies to
+    the mint feed, instead of trying to catch every way a flow can end.
+
+    Withdraws the link only when ALL of these hold:
+
+    * the row still carries an `oauth_url` -- there is a live-looking button to take
+      away. A row without one has nothing to withdraw and is left untouched, which
+      is what keeps the two rejected-URL banners and an already-retired row alone.
+    * the row is not already terminal. `completed` / `failed` / `superseded` are
+      authoritative outcomes recorded by the process that observed them, and a
+      later read must not reinterpret them.
+    * the row's `gen` is not this process's.
+
+    A row carrying NO `gen` is treated as stale, and that is a deduction rather than
+    a guess: the stamp is written by the same build that reads it, so an unstamped
+    row was persisted by an older build -- and running this build means this process
+    replaced the one that wrote that row. Its child cannot still be alive. The
+    effect is that the fix also retires banners that went stale before it shipped.
+
+    Returns the input dict unchanged when nothing applies, so the caller can use the
+    result unconditionally; only the withdrawing path copies.
+    """
+    if role != "mcp_oauth":
+        return meta
+    if not meta.get("oauth_url"):
+        return meta
+    if meta.get("completed") or meta.get("failed") or meta.get("superseded"):
+        return meta
+    if meta.get("gen") == gateway_generation():
+        return meta
+    out = dict(meta)
+    out.pop("oauth_url", None)
+    out["expired"] = True
+    return out
+
+
 def _prepare_messages(messages: list[dict], running: bool) -> list[dict]:
     """Prepare messages for API response."""
     out: list[dict] = []
-    chunk_text = ""
-    for m in messages:
+    for m in _collapse_wire_rows(messages):
         role = m.get("role", "")
         if role == "chunk":
-            chunk_text += m.get("content", "")
-        elif role == "done":
-            continue
-        else:
-            if chunk_text:
-                redacted_chunk, _ = redact_exfiltration_urls(chunk_text)
-                redacted_chunk, _ = redact_credentials(redacted_chunk)
-                out.append({"role": "streaming", "content": redacted_chunk, "cls": "msg msg-a"})
-                chunk_text = ""
             text = m.get("content", "")
-            # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the
-            # display-time redaction boundary for everything the slot detail
-            # endpoint returns — including the frozen-prefix lines read straight
-            # off disk — so it must cover every non-user role. The load path does
-            # not redact on load, and `system` content is written to disk
-            # unredacted (see _build_message_entry's gate), so excluding it here
-            # would emit raw stored bytes.
-            # User-authored content stays raw: the user typed it and is the only
-            # one who sees it back.
-            if role != "user" and text:
+            if text:
                 text, _ = redact_exfiltration_urls(text)
                 text, _ = redact_credentials(text)
-                m = {**m, "content": text}
-            msg_out = dict(m)
-            if msg_out.get("variants"):
-                msg_out["variants"] = [
-                    {**v, "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0]}
-                    for v in msg_out["variants"] if isinstance(v, dict)
-                ]
-            meta = parse_cls_meta(m.get("cls", ""))
-            if meta is not None:
-                msg_out["meta"] = _redact_meta_for_role(role, meta)
-            elif isinstance(msg_out.get("meta"), dict):
-                # Redact the STORED meta too. Without this branch the stored dict
-                # passes through by reference (dict(m) is shallow), so it would
-                # reach the client exactly as loaded. This is the only guard on
-                # meta for the slot-detail response (the load path does not
-                # redact meta).
-                msg_out["meta"] = _redact_meta_for_role(role, msg_out["meta"])
-            out.append(msg_out)
-    if chunk_text:
-        redacted_chunk, _ = redact_exfiltration_urls(chunk_text)
-        redacted_chunk, _ = redact_credentials(redacted_chunk)
-        out.append({"role": "streaming", "content": redacted_chunk, "cls": "msg msg-a"})
+                out.append({"role": "streaming", "content": text, "cls": "msg msg-a"})
+            continue
+        text = m.get("content", "")
+        # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the
+        # display-time redaction boundary for everything the slot detail
+        # endpoint returns — including the frozen-prefix lines read straight
+        # off disk — so it must cover every non-user role. The load path does
+        # not redact on load, and `system` content is written to disk
+        # unredacted (see _build_message_entry's gate), so excluding it here
+        # would emit raw stored bytes.
+        # User-authored content stays raw: the user typed it and is the only
+        # one who sees it back.
+        if role != "user" and text:
+            text, _ = redact_exfiltration_urls(text)
+            text, _ = redact_credentials(text)
+            m = {**m, "content": text}
+        msg_out = dict(m)
+        if msg_out.get("variants"):
+            # Snapshot for the same reason as _redact_meta — this runs in a
+            # worker thread (slot-detail render offload) while the event
+            # loop may still be appending variants to the live list.
+            msg_out["variants"] = [
+                {
+                    **v,
+                    "content": redact_credentials(
+                        redact_exfiltration_urls(v.get("content", ""))[0]
+                    )[0],
+                }
+                for v in list(msg_out["variants"])
+                if isinstance(v, dict)
+            ]
+        meta = parse_cls_meta(m.get("cls", ""))
+        if meta is not None:
+            msg_out["meta"] = _expire_stale_generation_oauth_meta(
+                role, _redact_meta_for_role(role, meta)
+            )
+        elif isinstance(msg_out.get("meta"), dict):
+            # Redact the STORED meta too. Without this branch the stored dict
+            # passes through by reference (dict(m) is shallow), so it would
+            # reach the client exactly as loaded. This is the only guard on
+            # meta for the slot-detail response (the load path does not
+            # redact meta).
+            msg_out["meta"] = _expire_stale_generation_oauth_meta(
+                role, _redact_meta_for_role(role, msg_out["meta"])
+            )
+        out.append(msg_out)
     return out

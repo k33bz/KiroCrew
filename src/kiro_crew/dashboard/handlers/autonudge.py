@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -19,7 +20,9 @@ from kiro_crew.autonudge_authz import (  # noqa: F401 - re-exported
     resolve_stop_sentinel,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.platform import redact_via_context
 from kiro_crew.sel import sel
+from kiro_crew.session_ledger import ledger_key, render_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +32,51 @@ def render_nudge_message(message: str, stop_sentinel_path: str | None) -> str:
     return message.replace("{{STOP_FILE}}", stop_sentinel_path or "")
 
 
-def _serialize(loop: Any) -> dict:
-    return asdict(loop)
+async def compose_nudge_body(
+    message: str, stop_sentinel_path: str | None, slot_key: str | None
+) -> str:
+    """Compose one nudge cycle's full body text — the shared fire-path composer.
+
+    Applies :func:`render_nudge_message`'s template substitution and, when the
+    loop's session has a non-empty, non-terminal work ledger, prefixes a
+    compact snapshot of it so every cycle starts from the durable state
+    instead of from transcript memory. Derived server-side at fire time;
+    sessions without a ledger render exactly as before.
+
+    The ledger read is filesystem I/O, so it runs in a worker thread — a slow
+    or wedged filesystem costs this loop's snapshot, never the event loop.
+    Best-effort throughout: a snapshot failure must not cost the nudge itself.
+    """
+    body = render_nudge_message(message, stop_sentinel_path)
+    if slot_key:
+        try:
+            snapshot = await asyncio.to_thread(render_snapshot, ledger_key(slot_key))
+        except Exception:
+            logger.debug("nudge: ledger snapshot failed for %s", slot_key, exc_info=True)
+            snapshot = ""
+        if snapshot:
+            return f"{snapshot}\n\n{body}"
+    return body
+
+
+def _redact_monitor_value(value: Any) -> Any:
+    """Redact every string in provider-controlled monitor evidence."""
+    if isinstance(value, str):
+        return redact_via_context(value)
+    if isinstance(value, dict):
+        return {
+            _redact_monitor_value(key): _redact_monitor_value(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_monitor_value(item) for item in value]
+    return value
+
+
+def _serialize(loop: Any) -> dict[str, Any]:
+    payload = asdict(loop)
+    if payload.get("monitor") is not None:
+        payload["monitor"] = _redact_monitor_value(payload["monitor"])
+    return payload
 
 
 async def api_autonudge_list(request: web.Request) -> web.Response:
@@ -54,7 +100,12 @@ async def api_autonudge_get(request: web.Request) -> web.Response:
 async def api_autonudge_start(request: web.Request) -> web.Response:
     """POST /api/autonudge — start or replace a loop on a slot.
 
-    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?, stop_sentinel_path? }
+    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?,
+            stop_sentinel_path?, gate? }
+
+    ``gate`` defaults to FALSE here: this route arms whatever the goal popover was
+    given, and only ``monitor_start`` has the evidence to gate by default. Pass
+    ``gate: true`` to probe-gate a loop armed through this route.
     """
     svc = _autonudge_get()
     if svc is None:
@@ -93,6 +144,24 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
+    # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
+    # ABSENT MEANS UNGATED on this route, unlike the monitor_start tool. This is a
+    # GENERIC arming route: its only caller is the goal popover, where a person
+    # types a recurring instruction whose work is usually NOT a pull request. Such
+    # an instruction routinely mentions one anyway ("keep driving PR #42"), and
+    # gating on that mention throttles the task to the quiet-streak floor and, when
+    # that PR is closed or merged, DEACTIVATES a recurring task that had nothing to
+    # do with it. The evidence for gating by default is about monitor_start, whose
+    # directive sets `gate: true` itself; extending it here was reach, twice.
+    #
+    # A non-boolean is still refused rather than coerced: `"false"` is truthy and
+    # would silently gate a loop that asked not to be.
+    raw_gate = body.get("gate")
+    if raw_gate is not None and not isinstance(raw_gate, bool):
+        return web.json_response(
+            {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
+        )
+    gate = False if raw_gate is None else raw_gate
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -104,9 +173,10 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         max_runtime_secs=max_runtime_secs,
         source="dashboard",
         caller=request.remote or "",
+        gate=gate,
     )
     if error is not None:
-        return web.json_response({"error": error}, status=status)
+        return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)
     return web.json_response({"ok": True, "loop": _serialize(loop)})
 
 

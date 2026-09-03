@@ -1,13 +1,13 @@
 """In-memory agent->Electron browser command bus.
 
-The dashboard's Browser panel is getting a native embedded Chromium view owned by
-the Electron main process. The agent's ``browser_*`` MCP tool calls originate in
-Python (``mcp_playwright_proxy``) and need a route into that native view. This
-module is the gateway-side half of that route: a tiny, framework-free command bus
-plus the three loopback HTTP endpoints wired in ``dashboard/handlers/messaging.py``.
+The dashboard's Browser panel hosts a native embedded Chromium view owned by the
+Electron main process. The agent's ``browser`` MCP tool call originates in Python
+and needs a route into that native view. This module is the gateway-side half of
+that route: a tiny, framework-free command bus plus the three loopback HTTP
+endpoints wired in ``dashboard/handlers/messaging.py``.
 
 Shape (why this design):
-- The MCP proxy calls ``POST /api/browser/command`` to run one op. That maps to
+- The ``browser`` MCP tool calls ``POST /api/browser/command`` to run one op. That maps to
   :meth:`BrowserCommandBus.submit`, which enqueues the command and awaits its
   result (bounded by ``timeout_ms``).
 - The Electron main process long-polls ``POST /api/browser/command-drain``
@@ -40,11 +40,14 @@ the stdlib -- no aiohttp -- so the bus logic can be tested in isolation.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 # Default ceiling on commands queued per session before we reject. Matches the
 # spec's suggested bound; a live native panel drains far faster than this fills.
@@ -86,8 +89,8 @@ class BusError(Exception):
 class NoPanelError(BusError):
     """No live native panel is registered for the target session (maps to 503).
 
-    Raised by :meth:`BrowserCommandBus.submit` WITHOUT waiting, so the MCP proxy
-    can immediately fall back to Playwright.
+    Raised by :meth:`BrowserCommandBus.submit` WITHOUT waiting, so the ``browser``
+    MCP tool can immediately fall back to playwright-cli.
     """
 
 
@@ -172,6 +175,15 @@ class BrowserCommandBus:
         exp = self._now() + ttl_s
         for key in session_keys:
             if isinstance(key, str) and key:
+                # Log only the not-alive -> alive transition (first drain of a
+                # session, or re-registration after a TTL lapse), never the
+                # per-drain refresh, so this proves an Electron host is polling
+                # THIS gateway for THIS session without flooding the log.
+                if not self._panel_alive_locked(key):
+                    logger.debug(
+                        "browser-cmdbus: native panel registered (Electron polling) session=%s",
+                        key,
+                    )
                 self._panels[key] = exp
 
     async def is_registered(self, session_key: str) -> bool:
@@ -266,6 +278,10 @@ class BrowserCommandBus:
                 if self._panel_alive_locked(session_key):
                     return
                 if not self._host_present_locked():
+                    logger.debug(
+                        "browser-cmdbus: submit session=%s but NO Electron host polling -> NoPanel (fast fallback)",
+                        session_key,
+                    )
                     raise NoPanelError(session_key)
                 # Clear under the lock: a drain sets the register signal only
                 # after releasing its lock, so a registration that races this
@@ -273,10 +289,20 @@ class BrowserCommandBus:
                 self._register_signal.clear()
             remaining = deadline - loop.time()
             if remaining <= 0:
+                logger.debug(
+                    "browser-cmdbus: submit session=%s host present but panel not registered within %dms -> NoPanel (cold-start)",
+                    session_key,
+                    self._panel_wait_ms,
+                )
                 raise NoPanelError(session_key)
             try:
                 await asyncio.wait_for(self._register_signal.wait(), remaining)
             except asyncio.TimeoutError:
+                logger.debug(
+                    "browser-cmdbus: submit session=%s host present but panel not registered within %dms -> NoPanel (cold-start)",
+                    session_key,
+                    self._panel_wait_ms,
+                )
                 raise NoPanelError(session_key) from None
 
     # ── drain (endpoint 2) ────────────────────────────────────────────────
@@ -383,8 +409,8 @@ class BrowserCommandBus:
 
 
 # ── process-wide singleton ────────────────────────────────────────────────
-# The aiohttp handlers and the MCP-proxy ingress share one bus per gateway
-# process, mirroring how the frame path shares one DashboardState. Tests
+# The aiohttp handlers and the ``browser`` MCP tool ingress share one bus per
+# gateway process, mirroring how the frame path shares one DashboardState. Tests
 # construct their own BrowserCommandBus(now=...) directly for clock injection.
 _default_bus: Optional[BrowserCommandBus] = None
 

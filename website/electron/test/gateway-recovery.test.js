@@ -1,10 +1,19 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { chooseRecoveryStrategy, waitForServiceRebind, waitForProcessExit } = require("../gateway-recovery");
+const {
+  chooseRecoveryStrategy,
+  classifyAdoptedGateway,
+  GATEWAY_OWNERSHIP_STATES,
+  waitForServiceRebind,
+  waitForProcessExit,
+  snapshotPortPids,
+  incumbentSnapshotBlocksRespawn,
+  unrecoverableGatewayDialog,
+} = require("../gateway-recovery");
 
 describe("chooseRecoveryStrategy", () => {
   it("respawns when we own the spawned gateway", () => {
-    assert.equal(chooseRecoveryStrategy({ weSpawnedGateway: true }), "respawn");
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: "spawned" }), "respawn");
   });
 
   // Regression guard for the lid-close / network-switch crash: on the reuse
@@ -14,15 +23,16 @@ describe("chooseRecoveryStrategy", () => {
   // "respawn" here is exactly the bug that force-killed the tunnel and then quit
   // the app on Retry.
   it("reconnects (never respawns) for a gateway we did not spawn", () => {
-    assert.equal(chooseRecoveryStrategy({ weSpawnedGateway: false }), "reconnect");
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: "none" }), "reconnect");
   });
 
   // Ownership defaults to "not ours" when unknown: the safe strategy is the
   // non-destructive reconnect, never a port-kill.
   it("defaults to reconnect when ownership is falsy/unknown", () => {
     assert.equal(chooseRecoveryStrategy({}), "reconnect");
-    assert.equal(chooseRecoveryStrategy({ weSpawnedGateway: undefined }), "reconnect");
-    assert.equal(chooseRecoveryStrategy({ weSpawnedGateway: null }), "reconnect");
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: undefined }), "reconnect");
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: null }), "reconnect");
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: "garbage" }), "reconnect");
   });
 
   // Regression guard for the adopted-gateway dead window: a relaunch adopted
@@ -31,30 +41,57 @@ describe("chooseRecoveryStrategy", () => {
   // a comeback that a local process can never make on its own. An adopted
   // LOCAL gateway must get the bounded wait-then-respawn strategy instead.
   it("bounded reconnect-then-respawn for an adopted local same-family gateway", () => {
-    assert.equal(
-      chooseRecoveryStrategy({ weSpawnedGateway: false, reusedLocalGateway: true }),
-      "reconnect-bounded",
-    );
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: "reused-local" }), "reconnect-bounded");
   });
 
-  // The never-evict/never-respawn behavior is preserved ONLY for genuinely
-  // external gateways: reuse without the positive local-family identification
-  // stays on the indefinite tunnel-heal wait.
-  it("keeps the indefinite reconnect for external/tunnel gateways", () => {
-    assert.equal(
-      chooseRecoveryStrategy({ weSpawnedGateway: false, reusedLocalGateway: false }),
-      "reconnect",
-    );
-    assert.equal(chooseRecoveryStrategy({ weSpawnedGateway: false }), "reconnect");
+  // A service-classified adoption is still an adopted LOCAL gateway for the
+  // wedged-recovery fork (the rebind grace lives further down the respawn
+  // path); it must never fall into the indefinite external wait.
+  it("bounded reconnect-then-respawn for an adopted service-managed gateway", () => {
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: "reused-service" }), "reconnect-bounded");
   });
 
-  // Owning the spawned child always wins: the kill+respawn path is safe (and
-  // correct) for a process we created, regardless of any stale adoption flag.
-  it("respawn takes precedence over the adopted-local classification", () => {
-    assert.equal(
-      chooseRecoveryStrategy({ weSpawnedGateway: true, reusedLocalGateway: true }),
-      "respawn",
-    );
+  it("covers every declared ownership state (vocabulary is closed)", () => {
+    for (const state of GATEWAY_OWNERSHIP_STATES) {
+      const strategy = chooseRecoveryStrategy({ gatewayOwnership: state });
+      assert.ok(
+        ["respawn", "reconnect-bounded", "reconnect"].includes(strategy),
+        `state ${state} produced unknown strategy ${strategy}`,
+      );
+    }
+  });
+});
+
+describe("classifyAdoptedGateway", () => {
+  // Positive identification requires BOTH same-family health AND a local
+  // LISTEN owner — anything less stays "none" (never-kill/never-respawn).
+  it("classifies a same-family kirocrew-owned holder as reused-local", () => {
+    assert.equal(classifyAdoptedGateway({ reason: "same-family", localOwner: "kirocrew" }), "reused-local");
+  });
+
+  it("classifies a same-family service-owned holder as reused-service", () => {
+    assert.equal(classifyAdoptedGateway({ reason: "same-family", localOwner: "service" }), "reused-service");
+  });
+
+  it("stays none for a tunnel / unidentified holder (no positive owner)", () => {
+    assert.equal(classifyAdoptedGateway({ reason: "same-family", localOwner: "none" }), "none");
+    assert.equal(classifyAdoptedGateway({ reason: "same-family", localOwner: "other" }), "none");
+    assert.equal(classifyAdoptedGateway({ reason: "same-family", localOwner: undefined }), "none");
+  });
+
+  it("stays none without the same-family health identification", () => {
+    assert.equal(classifyAdoptedGateway({ reason: "healthy", localOwner: "kirocrew" }), "none");
+    assert.equal(classifyAdoptedGateway({ reason: undefined, localOwner: "service" }), "none");
+  });
+
+  // The classifier's output must feed chooseRecoveryStrategy losslessly: a
+  // positively-identified local adoption gets the bounded strategy, an
+  // unidentified one keeps the indefinite external reconnect.
+  it("composes with chooseRecoveryStrategy end to end", () => {
+    const local = classifyAdoptedGateway({ reason: "same-family", localOwner: "kirocrew" });
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: local }), "reconnect-bounded");
+    const external = classifyAdoptedGateway({ reason: "same-family", localOwner: "none" });
+    assert.equal(chooseRecoveryStrategy({ gatewayOwnership: external }), "reconnect");
   });
 });
 
@@ -145,8 +182,8 @@ describe("waitForProcessExit", () => {
     }
   });
 
-  // Empty/invalid pid sets (probe failed, Windows without lsof) degrade to a
-  // no-op — same behavior as before this gate existed, never a hang.
+  // Empty/invalid pid sets (for example, a failed listener probe) degrade to a
+  // no-op rather than hanging recovery.
   it("degrades to exited immediately with no watchable pids", async () => {
     let slept = false;
     for (const pids of [[], null, undefined, [0, -3, NaN]]) {
@@ -158,5 +195,101 @@ describe("waitForProcessExit", () => {
       assert.equal(verdict, "exited");
     }
     assert.equal(slept, false);
+  });
+});
+
+describe("snapshotPortPids", () => {
+  it("uses the Windows listener probe so recovery can wait for gateway.lock", async () => {
+    const calls = [];
+    const pids = await snapshotPortPids({
+      port: 5476,
+      isWindows: true,
+      getWindowsPids: async (port) => {
+        calls.push(["windows", port]);
+        return [4242];
+      },
+      getPosixPids: async (port) => {
+        calls.push(["posix", port]);
+        return [9999];
+      },
+    });
+    assert.deepEqual(pids, [4242]);
+    assert.deepEqual(calls, [["windows", 5476]]);
+  });
+
+  it("returns unknown when the selected probe fails or misses the listener", async () => {
+    const failed = await snapshotPortPids({
+      port: 5476,
+      isWindows: true,
+      getWindowsPids: async () => { throw new Error("netstat unavailable"); },
+      getPosixPids: async () => [9999],
+    });
+    const missed = await snapshotPortPids({
+      port: 5476,
+      isWindows: true,
+      getWindowsPids: async () => [],
+      getPosixPids: async () => [9999],
+    });
+    assert.equal(failed, null);
+    assert.equal(missed, null);
+  });
+});
+
+describe("unrecoverableGatewayDialog", () => {
+  it("offers a real quit action for an unkillable primary gateway", () => {
+    const model = unrecoverableGatewayDialog({
+      port: 5476,
+      isPrimaryWindow: true,
+    });
+    assert.equal(model.title, "Kiro Crew: backend stuck on port 5476");
+    assert.equal(model.primaryAction, "quit");
+    assert.equal(model.primaryLabel, "Quit Kiro Crew");
+    assert.equal(model.showQuitButton, false);
+    assert.equal(model.portConflict, false);
+    assert.match(model.message, /Restart your computer/);
+  });
+
+  it("tells a probe-failure user to reopen before restarting", () => {
+    const model = unrecoverableGatewayDialog({
+      port: 5476,
+      probeFailed: true,
+      isPrimaryWindow: false,
+    });
+    assert.equal(model.title, "Kiro Crew: can't verify what's using port 5476");
+    assert.equal(model.primaryAction, "quit");
+    assert.equal(model.primaryLabel, "Close");
+    assert.equal(model.showQuitButton, false);
+    assert.match(model.message, /Quit and reopen Kiro Crew to try again/);
+    assert.match(model.message, /If the port is still blocked, restart your computer/);
+  });
+
+  it("tells a user to quit an unowned process that still holds the port", () => {
+    const model = unrecoverableGatewayDialog({
+      port: 5476,
+      variant: "held",
+      isPrimaryWindow: true,
+    });
+    assert.equal(model.title, "Kiro Crew: port 5476 is in use");
+    assert.equal(model.primaryAction, "quit");
+    assert.equal(model.primaryLabel, "Quit Kiro Crew");
+    assert.equal(model.showQuitButton, false);
+    assert.match(model.message, /Quit the process using port 5476/);
+    assert.doesNotMatch(model.message, /Restart your computer/);
+  });
+});
+
+describe("incumbentSnapshotBlocksRespawn", () => {
+  it("refuses an automatic respawn when the Windows probe named nothing", () => {
+    assert.equal(incumbentSnapshotBlocksRespawn({ pids: null, isWindows: true }), true);
+  });
+
+  it("still boots a POSIX host whose lsof is missing or blocked", () => {
+    assert.equal(incumbentSnapshotBlocksRespawn({ pids: null, isWindows: false }), false);
+  });
+
+  it("never blocks when the incumbent was actually captured", () => {
+    for (const isWindows of [true, false]) {
+      assert.equal(incumbentSnapshotBlocksRespawn({ pids: [4242], isWindows }), false);
+    }
   });
 });

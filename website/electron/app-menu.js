@@ -19,7 +19,7 @@ function buildMenuTemplate(deps) {
     isMac,
     appName,
     openSettings, // navigate dashboard to /settings
-    openAbout, // navigate dashboard to /settings?tab=about (version + updates)
+    openAbout, // navigate dashboard to /settings/about (version + updates)
     reload,
     forceReload,
     toggleDevTools,
@@ -28,6 +28,7 @@ function buildMenuTemplate(deps) {
     zoomOut,
     alwaysOnTop, // initial checked state for Keep on Top (restored preference)
     toggleAlwaysOnTop,
+    openNewSessionWindow,
     openNewConnectionWindow,
     renameCurrentWindow,
     promptRemoteHost,
@@ -44,6 +45,7 @@ function buildMenuTemplate(deps) {
     ...(isMac
       ? [
           {
+            id: "app-menu",
             label: appName,
             submenu: [
               aboutItem,
@@ -62,14 +64,16 @@ function buildMenuTemplate(deps) {
         ]
       : [
           {
+            id: "file-menu",
             // Windows/Linux home for Settings; the quit role renders as
             // "Exit" on Windows and "Quit" on Linux.
             label: "File",
             submenu: [settingsItem, { type: "separator" }, { role: "quit" }],
           },
         ]),
-    { role: "editMenu" },
+    { id: "edit-menu", role: "editMenu" },
     {
+      id: "view-menu",
       label: "View",
       submenu: [
         // Explicit handlers, not { role: ... }: the roles target the focused
@@ -104,8 +108,15 @@ function buildMenuTemplate(deps) {
       ],
     },
     {
+      id: "connection-menu",
       label: "Connection",
       submenu: [
+        ...(isMac
+          ? [
+              { label: "New Window", accelerator: "Cmd+Shift+N", click: openNewSessionWindow },
+              { type: "separator" },
+            ]
+          : []),
         { label: "New Connection Window…", accelerator: "CmdOrCtrl+N", click: openNewConnectionWindow },
         // No accelerator: Cmd+Shift+R is Force Reload (platform standard).
         { label: "Rename Window…", click: renameCurrentWindow },
@@ -115,9 +126,9 @@ function buildMenuTemplate(deps) {
         { label: "Open Config File", click: openConfigFile },
       ],
     },
-    { role: "windowMenu" },
+    { id: "window-menu", role: "windowMenu" },
     // Windows/Linux home for About (Help > About <app>).
-    ...(isMac ? [] : [{ label: "Help", submenu: [aboutItem] }]),
+    ...(isMac ? [] : [{ id: "help-menu", label: "Help", submenu: [aboutItem] }]),
   ];
 }
 

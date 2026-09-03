@@ -8,6 +8,7 @@ import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 try:
@@ -15,7 +16,152 @@ try:
 except ImportError:
     import sqlite3
 
+from kiro_crew.on_loop_db import STORE_STRICT_ENV, OnLoopDBGuard
+
+from .._sqlite_compat import fts5_cjk_match_groups, fts5_segment_for_index
+
 logger = logging.getLogger(__name__)
+
+# Every query in this module funnels through the ``db`` property, so one check
+# there covers every caller at any stack depth -- including the ones a lexical
+# ``async def`` scan cannot see, which is why this guard exists (#7078, the
+# interprocedural half of #3057).
+#
+# Both narrowings below are temporary and exist for the same reason: this store
+# still has 85 recorded on-loop callers -- the whole of
+# ``.github/sync-io-in-async-baseline.txt``, all of it knowledge paths, owned by
+# the cleanup at #7019.
+#
+# * ``strict_env=STORE_STRICT_ENV`` keeps this store off the SHARED
+#   ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch, which ``setup.py``'s ``test_e2e``
+#   and ``ci.yml`` already export into the e2e gateway for history's clean
+#   surface. On the shared flag, the on-loop ``/api/knowledge/stats`` and
+#   ``/api/knowledge/namespaces`` handlers would raise and 500 the e2e run.
+# * ``dev_mode_arms_strict=False`` keeps a developer gateway from raising on that
+#   same backlog, which would report tracked work as a regression and push the
+#   developer to unset ``KIROCREW_DEV_MODE`` -- silencing history.py's guard too.
+#
+# When #7019 empties that baseline, delete both arguments and this store joins
+# the shared switch.
+_ON_LOOP_DB_GUARD = OnLoopDBGuard(
+    label="knowledge store",
+    remedy=(
+        "Offload the call (await asyncio.to_thread(...), or a named lane from "
+        "kiro_crew.executors) so the busy wait runs off the loop."
+    ),
+    strict_env=STORE_STRICT_ENV,
+    dev_mode_arms_strict=False,
+)
+
+# Bumped when the *term representation* stored in ``items_fts`` changes, which a
+# schema probe cannot detect: the CREATE statement is identical either way, only
+# the text handed to the index differs. Version 1 segments CJK characters
+# (fts5_segment_for_index) so a word inside a spaceless run is addressable.
+FTS_INDEX_VERSION = 1
+
+
+class KnowledgeBundleError(ValueError):
+    """A bundle value would commit a corrupt JSON column.
+
+    Raised by :meth:`KnowledgeStore.import_bundle` before any INSERT binds a
+    ``sources.properties`` / ``entities.aliases`` value that is not the JSON
+    text every reader ``json.loads()`` back.  The dashboard import handler is
+    the store's only production caller today; the invariant lives here, with
+    the writer, so any future caller (an MCP tool, a CLI import, an app
+    backend) is safe by construction instead of depending on one HTTP path's
+    pre-validation.
+    """
+
+
+def _validated_json_column(value: object, *, field: str, default: str,
+                           shape: type, shape_name: str) -> tuple[str, Any]:
+    """Return ``(text, parsed)`` to bind for a store JSON column, or raise.
+
+    ``None`` (and an absent key, which callers pass as ``None``) falls back
+    to ``default`` -- the same value the column's schema DEFAULT would
+    supply.  Anything present must be JSON text whose parsed value is a
+    ``shape`` instance: several readers parse the raw column with
+    ``json.loads()`` and no shape guard (source detail handlers index the
+    parsed dict; ``find_entity()`` calls ``.lower()`` on each parsed alias),
+    so a non-string, an empty string, or the wrong parsed shape commits a
+    row that crashes a later, unrelated read.  ``json.loads`` raises
+    ``RecursionError`` (not ``ValueError``) on deeply nested input, so it
+    is caught alongside.  A lone-surrogate escape (``"\\ud800"``) in the
+    outer request JSON decodes to text that ``json.loads`` accepts but the
+    SQLite driver cannot UTF-8-encode at bind time, so encodability is
+    checked here too -- otherwise the bind raises ``UnicodeEncodeError``
+    past the typed-error contract.
+    """
+    if value is None:
+        return default, shape()
+    if not isinstance(value, str):
+        raise KnowledgeBundleError(f"'{field}' must be a JSON {shape_name} string or null")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise KnowledgeBundleError(f"'{field}' must be valid UTF-8 text") from None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        raise KnowledgeBundleError(f"'{field}' must be valid JSON") from None
+    if not isinstance(parsed, shape):
+        raise KnowledgeBundleError(f"'{field}' must be a JSON {shape_name}")
+    return value, parsed
+
+
+def _validated_properties(value: object) -> str:
+    """``sources.properties``: JSON text parsing to an object, or NULL."""
+    text, _ = _validated_json_column(
+        value, field="sources.properties", default="{}", shape=dict, shape_name="object")
+    return text
+
+
+def _validated_aliases(value: object) -> str:
+    """``entities.aliases``: JSON text parsing to an array of strings, or NULL."""
+    text, parsed = _validated_json_column(
+        value, field="entities.aliases", default="[]", shape=list, shape_name="array")
+    if not all(isinstance(alias, str) for alias in parsed):
+        raise KnowledgeBundleError("'entities.aliases' must be a JSON array of strings")
+    return text
+
+
+def _without_sync_status(properties):
+    """*properties* with any ``sync_status`` key removed.
+
+    The ``sources.sync_status`` COLUMN is the single source of truth for a
+    source's sync state: the dashboard list, the watcher's pre-scan skip and
+    ``SyncScheduler.sync_all`` all read it. A ``sync_status`` key inside the
+    properties JSON is a SECOND store that only the writer touching it observes
+    -- the divergence that let a paused folder go on being walked every sweep
+    and a vanished file go on rendering 'synced'.
+
+    Callers may still STATE a status in properties at INSERT time (that is the
+    channel ``_initial_sync_status`` reads, under an allowlist); it is dropped
+    from what gets persisted, so no row carries two answers. After insert the
+    column is written explicitly or not at all: a status found in a properties
+    write is discarded rather than applied, because a blob read off a legacy row
+    carries a value that is stale by definition, and honouring it would let the
+    watcher stamp 'missing' back onto a file it had just re-ingested.
+
+    The input is never mutated. A value that is not a JSON object (legacy
+    imports hold arrays), an unparsable blob, and a blob without the key all
+    pass through unchanged.
+    """
+    if isinstance(properties, str):
+        try:
+            parsed = json.loads(properties)
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError is a RuntimeError, so it needs naming: json.loads
+            # recurses per nesting level, and this helper sits on every insert
+            # and update path. A pathologically nested blob is left exactly as
+            # it was rather than failing the write.
+            return properties
+        if not isinstance(parsed, dict) or "sync_status" not in parsed:
+            return properties
+        return json.dumps(_without_sync_status(parsed))
+    if not isinstance(properties, dict) or "sync_status" not in properties:
+        return properties
+    return {k: v for k, v in properties.items() if k != "sync_status"}
 
 
 class _NodeView:
@@ -146,6 +292,18 @@ _DOC_STATE_TABLES: tuple[tuple[str, str], ...] = (
     ("agent_item_state", "active"),
 )
 
+# Which column identifies ONE document within a doc-state table. Ownership has to
+# be derived per document, and the hash cannot do it: two documents in one source
+# may legitimately hold identical text, so a hash-scoped read names one physical
+# item into two groups and the first delete of either destroys it. An allowlist
+# rather than a caller-supplied column name, because these identifiers are
+# interpolated into SQL.
+_DOC_STATE_KEY_COL: dict[str, str] = {
+    "folder_file_state": "file_path",
+    "artifact_item_state": "slug",
+    "agent_item_state": "slug",
+}
+
 # Which column on each state table holds a hash in the SAME DOMAIN as
 # ``items.content_hash``, for lookups that have to relate a state row to items.
 #
@@ -191,6 +349,25 @@ class KnowledgeStore:
         # concurrent readers alongside a single writer, and busy_timeout
         # serializes rare cross-thread writes.
         self._thread_local = threading.local()
+        # The FTS index rebuild is deliberately NOT done here. This constructor
+        # runs on the event-loop thread (see the note above), and a rebuild is
+        # data-scaled, so doing it here would stall the gateway at boot for the
+        # length of a full reindex. It is triggered instead by the first reader
+        # -- `ensure_fts_index_current` -- which by the same note always runs on
+        # a worker thread.
+        #
+        # Guards the rebuild ONLY, so two reader threads in this process do not
+        # each start one. Deliberately not taken on the FTS write path: the
+        # rebuild acquires this and then SQLite's writer lock, so a writer that
+        # held SQLite's and waited on this one would invert the order and
+        # deadlock until busy_timeout. Writes are serialized by SQLite alone --
+        # see `_fts_terms_segmented`.
+        self._fts_lock = threading.Lock()
+        self._fts_index_current = False
+        # Which term representation `items_fts` currently holds: True once it is
+        # known to be CJK-segmented, None while unknown. Never cached as False --
+        # see `_fts_terms_segmented`.
+        self._fts_segmented: bool | None = None
         self.graph = SimpleDiGraph()
         self._init_schema()
         self._migrate()
@@ -207,6 +384,7 @@ class KnowledgeStore:
     @property
     def db(self) -> sqlite3.Connection:
         """The calling thread's connection, created lazily on first use."""
+        _ON_LOOP_DB_GUARD.check()
         conn = getattr(self._thread_local, "conn", None)
         if conn is None:
             conn = self._connect()
@@ -435,119 +613,148 @@ class KnowledgeStore:
         src_cols = {r[1] for r in self.db.execute("PRAGMA table_info(sources)").fetchall()}
         if "sync_status" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN sync_status TEXT DEFAULT 'pending'")
+        # ONE pass over the rows that still carry a blob copy of the status:
+        # repair the column where it was never written, then retire the copy.
+        # After this pass no row has a copy at all, so on a store that has
+        # already opened once the scan matches nothing.
+        #
+        # An INITIAL state is repaired onto a column still at its un-written
+        # 'pending' default (rows inserted before the column was written on
+        # INSERT). The dashboard picks the row's control from the column, so a
+        # divergent row renders Pause instead of Confirm and the source cannot be
+        # started. Only 'pending' rows are candidates: any row a handler has
+        # transitioned already had its column written, so a repair never
+        # overwrites a live state.
+        #
+        # A LIFECYCLE value in the blob is deliberately NOT promoted, not even
+        # 'error'. It cannot be ordered against the column: a pre-column
+        # ``_record_failure`` wrote 'error' to the blob alone, and a later
+        # successful re-ingest wrote 'synced' to the column alone, so the two
+        # copies carry no evidence of which happened last. Promoting would mark a
+        # recovered source errored and, since the copy is retired in the same
+        # pass, nothing would correct it. Not promoting costs at most ONE sync
+        # attempt: ``_record_failure`` reads ``consecutive_failures`` from the
+        # blob, which such a row already has at or above its threshold, so the
+        # first attempt that fails writes the column and quiesces the source for
+        # good -- while an attempt that SUCCEEDS is the right outcome for a source
+        # that had recovered. The column is authoritative; a value that cannot be
+        # ordered against it does not get to overrule it.
+        #
+        # The copy is then RETIRED. This runs on EVERY open, so leaving the key in
+        # place would make the repair above a standing reader of a value that goes
+        # stale the moment a column-only writer moves the row. Retiring makes it a
+        # one-time repair instead.
+        #
+        # The repair is compare-and-set on the row as READ -- the blob AND the
+        # column -- so a concurrent writer wins and the row is converged by the
+        # next open instead. The retirement predicates on the blob ALONE, which
+        # is the only field it writes: a column-only transition is what every
+        # live writer does, and requiring the column to be unmoved would abandon
+        # the copy for exactly the transitions that are expected to happen.
+        # No SQL prefilter on the blob text. A raw substring match cannot decide
+        # membership here: JSON escapes are legal inside a KEY, so a blob stored
+        # as {"sync_\u0073tatus": "paused"} parses to the very key this pass
+        # converges while `properties LIKE '%sync_status%'` never matches it. The
+        # key only exists once decoded, so the decision has to be made on the
+        # PARSED value. `sources` holds one row per knowledge source, so parsing
+        # each one is bounded and cheap -- and after this pass no row carries a
+        # copy at all, so later opens parse and skip.
+        #
+        # Nothing in-tree can write that escaped form any more (`json.dumps`
+        # never escapes ASCII, and `_without_sync_status` re-serializes on every
+        # insert and update), but `import_bundle` used to store a bundle's
+        # properties text verbatim, so a row imported before this change can
+        # still hold one.
+        blob_copies = self.db.execute(
+            "SELECT id, properties, sync_status FROM sources").fetchall()
+        for row in blob_copies:
+            try:
+                props = json.loads(row["properties"] or "{}")
+            except (ValueError, TypeError, RecursionError):
+                # RecursionError (a RuntimeError, so not covered by ValueError):
+                # json.loads recurses per nesting level, and this runs on EVERY
+                # open, so one pathologically nested legacy blob would otherwise
+                # abort every store construction -- a gateway that cannot start.
+                continue
+            if not isinstance(props, dict) or "sync_status" not in props:
+                continue
+            copied = props["sync_status"]
+            if (row["sync_status"] == "pending" and isinstance(copied, str)
+                    and copied != "pending" and copied in self._INITIAL_SYNC_STATUSES):
+                self.db.execute(
+                    "UPDATE sources SET sync_status = ? "
+                    "WHERE id = ? AND sync_status = 'pending' AND properties = ?",
+                    (copied, row["id"], row["properties"]))
+            self.db.execute(
+                "UPDATE sources SET properties = ? WHERE id = ? AND properties = ?",
+                (_without_sync_status(row["properties"]), row["id"], row["properties"]))
         if "summary_topic" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN summary_topic TEXT")
         if "summary_themes" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN summary_themes TEXT")
-        # Migrate: folder_file_state table
-        tables = {r[0] for r in self.db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "folder_file_state" not in tables:
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS folder_file_state (
-                    source_id TEXT NOT NULL REFERENCES sources(id),
-                    file_path TEXT NOT NULL,
-                    content_hash TEXT,
-                    text_hash TEXT,
-                    mtime REAL,
-                    item_ids TEXT DEFAULT '[]',
-                    last_seen TEXT NOT NULL,
-                    status TEXT DEFAULT 'pending',
-                    error_message TEXT,
-                    merged_into_source_id TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (source_id, file_path)
-                )
-            """)
-        else:
-            ffs_cols = {r[1] for r in self.db.execute("PRAGMA table_info(folder_file_state)").fetchall()}
-            if "status" not in ffs_cols:
-                self.db.execute("ALTER TABLE folder_file_state ADD COLUMN status TEXT DEFAULT 'pending'")
-            if "error_message" not in ffs_cols:
-                self.db.execute("ALTER TABLE folder_file_state ADD COLUMN error_message TEXT")
-            if "merged_into_source_id" not in ffs_cols:
-                self.db.execute(
-                    "ALTER TABLE folder_file_state ADD COLUMN merged_into_source_id TEXT")
-            # The extracted-text hash, in the same domain as items.content_hash --
-            # see _OWNERSHIP_HASH_COL. Deliberately NOT backfilled: it can only be
-            # derived from a row's own items, and a legacy row that owns nothing has
-            # nothing to derive it from. Left NULL, such a row behaves exactly as it
-            # does today (its ownership lookups match nothing) and is populated the
-            # next time the file is scanned. A backfill that guessed instead would be
-            # the data-loss shape this feature already had to remove once.
-            if "text_hash" not in ffs_cols:
-                self.db.execute("ALTER TABLE folder_file_state ADD COLUMN text_hash TEXT")
-            # Consecutive non-terminal attempt count, the bound on crash recovery --
-            # see the CREATE TABLE comment. Existing rows start at 0, including any
-            # already stuck in 'scanning': that is deliberate, so a database carrying
-            # a file that cannot be ingested spends the same small retry budget as a
-            # fresh one and then retires the row, instead of re-ingesting it (and
-            # paying for its extraction calls) on every sweep for as long as the
-            # source exists.
-            if "attempts" not in ffs_cols:
-                self.db.execute(
-                    "ALTER TABLE folder_file_state "
-                    "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
-        # Migrate: artifact_item_state table -- per-artifact item-group tracking
-        # for the aggregate "Artifacts" KB source, keyed by artifact slug.
-        if "artifact_item_state" not in tables:
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS artifact_item_state (
-                    source_id TEXT NOT NULL REFERENCES sources(id),
-                    slug TEXT NOT NULL,
-                    content_hash TEXT,
-                    item_ids TEXT DEFAULT '[]',
-                    updated_at TEXT NOT NULL,
-                    name TEXT,
-                    merged_into_source_id TEXT,
-                    kind TEXT,
-                    PRIMARY KEY (source_id, slug)
-                )
-            """)
-        else:
-            ais_cols = {r[1] for r in self.db.execute(
-                "PRAGMA table_info(artifact_item_state)").fetchall()}
-            if "name" not in ais_cols:
-                self.db.execute("ALTER TABLE artifact_item_state ADD COLUMN name TEXT")
-            if "status" not in ais_cols:
-                self.db.execute(
-                    "ALTER TABLE artifact_item_state ADD COLUMN status TEXT DEFAULT 'active'")
-            if "merged_into_source_id" not in ais_cols:
-                self.db.execute(
-                    "ALTER TABLE artifact_item_state ADD COLUMN merged_into_source_id TEXT")
-            # The artifact kind AS INGESTED. Reconcile needs it to tell an
-            # artifact whose kind changed while sync was off (stale chunks, must
-            # be reaped) from one the user merely excluded by narrowing
-            # `auto_ingest_artifact_kinds` (still live, must NOT be reaped).
-            # Legacy rows carry NULL, which reconcile treats as "cannot tell"
-            # and leaves alone; the next ingest of that artifact backfills it.
-            if "kind" not in ais_cols:
-                self.db.execute("ALTER TABLE artifact_item_state ADD COLUMN kind TEXT")
-        # Migrate: agent_item_state table -- per-document item-group tracking for
-        # the aggregate "Auto-added" KB source the agent writes to.
-        if "agent_item_state" not in tables:
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS agent_item_state (
-                    source_id TEXT NOT NULL REFERENCES sources(id),
-                    slug TEXT NOT NULL,
-                    content_hash TEXT,
-                    item_ids TEXT DEFAULT '[]',
-                    updated_at TEXT NOT NULL,
-                    name TEXT,
-                    status TEXT DEFAULT 'active',
-                    merged_into_source_id TEXT,
-                    PRIMARY KEY (source_id, slug)
-                )
-            """)
-        else:
-            agent_cols = {r[1] for r in self.db.execute(
-                "PRAGMA table_info(agent_item_state)").fetchall()}
-            if "status" not in agent_cols:
-                self.db.execute(
-                    "ALTER TABLE agent_item_state ADD COLUMN status TEXT DEFAULT 'active'")
-            if "merged_into_source_id" not in agent_cols:
-                self.db.execute(
-                    "ALTER TABLE agent_item_state ADD COLUMN merged_into_source_id TEXT")
+        # Backfill columns on the document-state tables. Each table itself is
+        # created by ``_init_schema``, which runs first on every construction, so
+        # only the per-column ALTERs belong here.
+        ffs_cols = {r[1] for r in self.db.execute(
+            "PRAGMA table_info(folder_file_state)").fetchall()}
+        if "status" not in ffs_cols:
+            self.db.execute(
+                "ALTER TABLE folder_file_state ADD COLUMN status TEXT DEFAULT 'pending'")
+        if "error_message" not in ffs_cols:
+            self.db.execute("ALTER TABLE folder_file_state ADD COLUMN error_message TEXT")
+        if "merged_into_source_id" not in ffs_cols:
+            self.db.execute(
+                "ALTER TABLE folder_file_state ADD COLUMN merged_into_source_id TEXT")
+        # The extracted-text hash, in the same domain as items.content_hash --
+        # see _OWNERSHIP_HASH_COL. Deliberately NOT backfilled: it can only be
+        # derived from a row's own items, and a legacy row that owns nothing has
+        # nothing to derive it from. Left NULL, such a row behaves exactly as it
+        # does today (its ownership lookups match nothing) and is populated the
+        # next time the file is scanned. A backfill that guessed instead would be
+        # the data-loss shape this feature already had to remove once.
+        if "text_hash" not in ffs_cols:
+            self.db.execute("ALTER TABLE folder_file_state ADD COLUMN text_hash TEXT")
+        # Consecutive non-terminal attempt count, the bound on crash recovery --
+        # see the CREATE TABLE comment. Existing rows start at 0, including any
+        # already stuck in 'scanning': that is deliberate, so a database carrying
+        # a file that cannot be ingested spends the same small retry budget as a
+        # fresh one and then retires the row, instead of re-ingesting it (and
+        # paying for its extraction calls) on every sweep for as long as the
+        # source exists.
+        if "attempts" not in ffs_cols:
+            self.db.execute(
+                "ALTER TABLE folder_file_state "
+                "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        # artifact_item_state -- per-artifact item-group tracking for the
+        # aggregate "Artifacts" KB source, keyed by artifact slug.
+        ais_cols = {r[1] for r in self.db.execute(
+            "PRAGMA table_info(artifact_item_state)").fetchall()}
+        if "name" not in ais_cols:
+            self.db.execute("ALTER TABLE artifact_item_state ADD COLUMN name TEXT")
+        if "status" not in ais_cols:
+            self.db.execute(
+                "ALTER TABLE artifact_item_state ADD COLUMN status TEXT DEFAULT 'active'")
+        if "merged_into_source_id" not in ais_cols:
+            self.db.execute(
+                "ALTER TABLE artifact_item_state ADD COLUMN merged_into_source_id TEXT")
+        # The artifact kind AS INGESTED. Reconcile needs it to tell an
+        # artifact whose kind changed while sync was off (stale chunks, must
+        # be reaped) from one the user merely excluded by narrowing
+        # `auto_ingest_artifact_kinds` (still live, must NOT be reaped).
+        # Legacy rows carry NULL, which reconcile treats as "cannot tell"
+        # and leaves alone; the next ingest of that artifact backfills it.
+        if "kind" not in ais_cols:
+            self.db.execute("ALTER TABLE artifact_item_state ADD COLUMN kind TEXT")
+        # agent_item_state -- per-document item-group tracking for the aggregate
+        # "Auto-added" KB source the agent writes to.
+        agent_cols = {r[1] for r in self.db.execute(
+            "PRAGMA table_info(agent_item_state)").fetchall()}
+        if "status" not in agent_cols:
+            self.db.execute(
+                "ALTER TABLE agent_item_state ADD COLUMN status TEXT DEFAULT 'active'")
+        if "merged_into_source_id" not in agent_cols:
+            self.db.execute(
+                "ALTER TABLE agent_item_state ADD COLUMN merged_into_source_id TEXT")
         # Clean orphan sources (no items), entities (no mentions/relations), and stale relations
         #
         # Folder sources are EXCLUDED: a watched folder with zero discovered
@@ -556,7 +763,7 @@ class KnowledgeStore:
         # restart and then re-created as active by auto-discovery, silently
         # un-pausing it. The row is user-registered configuration, not derived
         # data, so only its items are reclaimable.
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
             orphan_sources_q = (
                 "SELECT id FROM sources WHERE id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
@@ -575,15 +782,27 @@ class KnowledgeStore:
             self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({orphan_sources_q})")
             self.db.execute(f"DELETE FROM sources WHERE id IN ({orphan_sources_q})")
             self.db.execute("DELETE FROM entity_relations WHERE source_id NOT IN (SELECT id FROM entities) OR target_id NOT IN (SELECT id FROM entities)")
-            self.db.execute("""
-                DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
-                AND id NOT IN (SELECT source_id FROM entity_relations)
-                AND id NOT IN (SELECT target_id FROM entity_relations)
-            """)
+            self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _prune_orphan_entities(self) -> None:
+        """Delete entities nothing references any more -- no mention, no relation.
+
+        Every path that removes items or a source has to run this, because an
+        entity is only reachable through the rows those paths delete. It takes no
+        transaction of its own -- each call site is already inside an open write
+        transaction -- and it does not reload the in-memory graph, which the sweep
+        can leave holding dropped entities; that stays with whoever owns the
+        transaction.
+        """
+        self.db.execute("""
+            DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
+            AND id NOT IN (SELECT source_id FROM entity_relations)
+            AND id NOT IN (SELECT target_id FROM entity_relations)
+        """)
 
     def find_doc_by_content_hash(
         self, content_hash: str, exclude_source_id: str | None = None
@@ -624,7 +843,7 @@ class KnowledgeStore:
         item_id = str(uuid4())
         now = datetime.now().isoformat()
         tags_json = json.dumps(tags or [])
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute(
                 "INSERT INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, content_hash, created_at, updated_at) "
@@ -632,9 +851,7 @@ class KnowledgeStore:
                 (item_id, title, content, item_type, source_id, chunk_index, namespace, summary, tags_json, embedding, content_hash, now, now))
             # Sync FTS: get the rowid of the inserted item
             rowid = self.db.execute("SELECT rowid FROM items WHERE id = ?", (item_id,)).fetchone()[0]
-            self.db.execute(
-                "INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, ?)",
-                (rowid, title, content, tags_json))
+            self._fts_index(rowid, title, content, tags_json)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
@@ -671,18 +888,18 @@ class KnowledgeStore:
             ).fetchone()
         cols = ", ".join(f"{k} = ?" for k in safe)
         vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in safe.values()]
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute(f"UPDATE items SET {cols} WHERE id = ?", (*vals, item_id))  # noqa: S608
             # Sync FTS: delete with OLD values, insert with NEW values
             if old_row:
-                self.db.execute("INSERT INTO items_fts (items_fts, rowid, title, content, tags) VALUES ('delete', ?, ?, ?, ?)",
-                                (old_row["rowid"], old_row["title"], old_row["content"], old_row["tags"]))
+                self._fts_unindex(old_row["rowid"], old_row["title"],
+                                  old_row["content"], old_row["tags"])
                 new_row = self.db.execute(
                     "SELECT title, content, tags FROM items WHERE id = ?", (item_id,)
                 ).fetchone()
-                self.db.execute("INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, ?)",
-                                (old_row["rowid"], new_row["title"], new_row["content"], new_row["tags"]))
+                self._fts_index(old_row["rowid"], new_row["title"],
+                                new_row["content"], new_row["tags"])
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
@@ -692,23 +909,17 @@ class KnowledgeStore:
         """Delete item and its dependents without commit/graph reload (for batch use)."""
         row = self.db.execute("SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)).fetchone()
         if row:
-            self.db.execute("INSERT INTO items_fts (items_fts, rowid, title, content, tags) VALUES ('delete', ?, ?, ?, ?)",
-                            (row["rowid"], row["title"], row["content"], row["tags"]))
+            self._fts_unindex(row["rowid"], row["title"], row["content"], row["tags"])
         self.db.execute("DELETE FROM source_locations WHERE item_id = ?", (item_id,))
         self.db.execute("DELETE FROM mentions WHERE item_id = ?", (item_id,))
         self.db.execute("DELETE FROM entity_relations WHERE source_item_id = ?", (item_id,))
         self.db.execute("DELETE FROM items WHERE id = ?", (item_id,))
 
     def delete_item(self, item_id):
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
             self._delete_item_cascade(item_id)
-            # Remove orphan entities (no mentions and no relations)
-            self.db.execute("""
-                DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
-                AND id NOT IN (SELECT source_id FROM entity_relations)
-                AND id NOT IN (SELECT target_id FROM entity_relations)
-            """)
+            self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
@@ -858,30 +1069,47 @@ class KnowledgeStore:
         """
         if not item_ids:
             return
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
-            for item_id in item_ids:
-                if owner_source_id:
-                    others = self.sources_holding_item(
-                        item_id, exclude_source_id=owner_source_id)
-                    if others:
-                        self.reassign_item_source(item_id, others[0])
-                        self._adopt_reassigned_item(item_id, others[0])
-                        self.db.execute(
-                            "DELETE FROM source_locations "
-                            "WHERE item_id = ? AND source_id = ?",
-                            (item_id, owner_source_id))
-                        continue
-                self._delete_item_cascade(item_id)
-            self.db.execute("""
-                DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
-                AND id NOT IN (SELECT source_id FROM entity_relations)
-                AND id NOT IN (SELECT target_id FROM entity_relations)
-            """)
+            self.delete_items_batch_in_txn(item_ids, owner_source_id)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        self._load_graph()
+
+    def delete_items_batch_in_txn(self, item_ids: list[str],
+                                  owner_source_id: str | None = None):
+        """The body of :meth:`delete_items_batch`, for a caller already in a write txn.
+
+        Same semantics, minus the transaction and the graph reload, so a caller
+        that must delete and then record something ATOMICALLY can put both inside
+        one ``BEGIN IMMEDIATE`` -- otherwise the delete commits on its own and a
+        concurrent writer can act on the gap. Such a caller owns two duties:
+        commit the transaction, and call :meth:`reload_graph` afterwards, because
+        the orphan sweep below drops entities the in-memory graph still holds.
+        """
+        for item_id in item_ids:
+            if owner_source_id:
+                others = self.sources_holding_item(
+                    item_id, exclude_source_id=owner_source_id)
+                if others:
+                    self.reassign_item_source(item_id, others[0])
+                    self._adopt_reassigned_item(item_id, others[0])
+                    self.db.execute(
+                        "DELETE FROM source_locations "
+                        "WHERE item_id = ? AND source_id = ?",
+                        (item_id, owner_source_id))
+                    continue
+            self._delete_item_cascade(item_id)
+        self._prune_orphan_entities()
+
+    def reload_graph(self) -> None:
+        """Rebuild the in-memory entity graph from the tables.
+
+        For a caller that ran :meth:`delete_items_batch_in_txn` and therefore owes
+        the reload that :meth:`delete_items_batch` would have done for it.
+        """
         self._load_graph()
 
     def dismiss_auto_source(self, uri: str) -> None:
@@ -955,16 +1183,75 @@ class KnowledgeStore:
                     return None, False
             sid = str(uuid4())
             now = datetime.now().isoformat()
+            stored = _without_sync_status(properties)
             self.db.execute(
-                "INSERT INTO sources (id, name, source_type, uri, properties, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (sid, name, source_type, uri, json.dumps(properties), now, now),
+                "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid, name, source_type, uri, json.dumps(stored),
+                 self._initial_sync_status(properties), now, now),
             )
             self.db.execute("COMMIT")
             return sid, True
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def surviving_group_in_txn(self, table: str, source_id: str, key: str) -> list[str]:
+        """Items a doc-state row already names and this source still owns.
+
+        The caller must already hold a write transaction, and must not be on the
+        event loop: this issues sync sqlite reads whose result is only meaningful
+        under that lock.
+
+        Exists because the terminal write for a document the pre-ingest gate
+        REFUSED cannot predict its own group. The gate commits before returning,
+        so a concurrent ``delete_source_cascade`` on the holder can land in
+        between: it reassigns the surviving item to this source and
+        :meth:`_adopt_reassigned_item` names it in this very row. Writing an empty
+        group afterwards -- which "the gate refused, so this document owns
+        nothing" predicts -- erases that, leaving the last copy owned by the
+        source but named by no row: unreachable by the delete path, and
+        undeletable.
+
+        Row-scoped, never by content hash. Two documents in one source may
+        legitimately hold identical text, so a hash-scoped read hands this row the
+        OTHER document's items; both rows then name one physical item and deleting
+        either destroys it. ``_adopt_reassigned_item`` refuses an ambiguous hash
+        for that reason and this must not reintroduce it.
+
+        Filtered to ids that still exist under this source, because the row is
+        still carrying the group the gate just deleted. What survives is an
+        adoption that landed here.
+
+        An unreadable ``item_ids`` RAISES rather than reporting an empty group: the
+        caller writes whatever comes back as the row's terminal state, so mapping
+        corruption to "owns nothing" would overwrite a recoverable value and
+        orphan every item it named.
+        """
+        key_col = _DOC_STATE_KEY_COL[table]
+        row = self.db.execute(
+            f"SELECT item_ids FROM {table} "  # noqa: S608
+            f"WHERE source_id = ? AND {key_col} = ?",
+            (source_id, key)).fetchone()
+        if not row:
+            return []
+        raw = row["item_ids"]
+        if raw in (None, ""):
+            return []
+        try:
+            ids = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{table} item_ids unreadable for {key!r} in source {source_id} "
+                f"({exc})") from exc
+        if not isinstance(ids, list) or not ids:
+            return []
+        # Bounded by chunker.MAX_CHUNKS_PER_FILE, so the bind count cannot reach
+        # SQLITE_MAX_VARIABLE_NUMBER.
+        placeholders = ",".join("?" for _ in ids)
+        return [r["id"] for r in self.db.execute(
+            f"SELECT id FROM items WHERE id IN ({placeholders}) AND source_id = ?",  # noqa: S608,E501
+            (*ids, source_id)).fetchall()]
 
     def delete_source_cascade(self, source_id, dismiss_uri: str | None = None):
         """Delete a source and all its items in a single transaction (batch SQL).
@@ -1015,10 +1302,8 @@ class KnowledgeStore:
                 for row in self.db.execute(
                         f"SELECT rowid, title, content, tags FROM items WHERE id IN ({q})",  # noqa: S608
                         doomed).fetchall():
-                    self.db.execute(
-                        "INSERT INTO items_fts (items_fts, rowid, title, content, tags) "
-                        "VALUES ('delete', ?, ?, ?, ?)",
-                        (row["rowid"], row["title"], row["content"], row["tags"]))
+                    self._fts_unindex(row["rowid"], row["title"],
+                                      row["content"], row["tags"])
                 self.db.execute(
                     f"DELETE FROM source_locations WHERE item_id IN ({q})", doomed)  # noqa: S608
                 self.db.execute(f"DELETE FROM mentions WHERE item_id IN ({q})", doomed)  # noqa: S608
@@ -1071,19 +1356,196 @@ class KnowledgeStore:
             self.db.execute("DELETE FROM artifact_item_state WHERE source_id = ?", (source_id,))
             self.db.execute("DELETE FROM agent_item_state WHERE source_id = ?", (source_id,))
             self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
-            # Remove orphan entities
-            self.db.execute("""
-                DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
-                AND id NOT IN (SELECT source_id FROM entity_relations)
-                AND id NOT IN (SELECT target_id FROM entity_relations)
-            """)
+            self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
         self._load_graph()
 
+    _FTS_REBUILD_BATCH = 500
+
+    def ensure_fts_index_current(self) -> None:
+        """Rebuild ``items_fts`` if it holds a stale term representation.
+
+        Called by each of the three FTS readers before it matches --
+        :meth:`search_items_fts`, ``HybridRetriever._keyword_search``, and the
+        dashboard's entity-items lookup. Deliberately NOT called
+        from ``__init__``: the constructor runs on the event-loop thread, and a
+        rebuild is proportional to corpus size, so migrating there would stall
+        the gateway at boot for a large legacy library. All three readers run on
+        a worker thread
+        (``run_in_embed_pool`` / ``asyncio.to_thread``), so the one-time cost
+        lands on the first search instead of on startup.
+
+        Steady state is a single boolean check. The first caller takes the lock
+        and does the work; concurrent readers wait rather than each starting
+        their own rebuild.
+
+        **A migration that cannot get the writer lock is not a search failure.**
+        The rebuild opens ``BEGIN IMMEDIATE``, so a concurrent long import can
+        hold the lock past ``busy_timeout`` and raise ``OperationalError``.
+        Every caller is a reader whose own query already degrades to "no keyword
+        hits" on that error, and letting it escape from here instead turns a
+        transient lock into an HTTP 500 -- one that the dashboard's entity lookup
+        does not even guard. So a lock failure leaves the index at its old
+        representation and returns: the read that follows finds legacy terms,
+        which costs the CJK recall this PR restores for that one request and
+        nothing else, and ``_fts_index_current`` stays False so the next reader
+        retries. Only lock/contention errors are absorbed -- a corrupt database
+        raises ``DatabaseError``, which is not caught here.
+        """
+        if self._fts_index_current:
+            return
+        with self._fts_lock:
+            if self._fts_index_current:
+                return
+            try:
+                self._migrate_fts_index()
+            except sqlite3.OperationalError:
+                logger.warning(
+                    "knowledge: FTS index migration could not take the writer lock; "
+                    "serving the legacy index for now and retrying on the next read",
+                    exc_info=True)
+                return
+            self._fts_index_current = True
+
+    def _migrate_fts_index(self) -> None:
+        """Re-index ``items_fts`` when its stored term representation is stale.
+
+        Gated on ``PRAGMA user_version`` rather than a schema probe, because the
+        ``CREATE VIRTUAL TABLE`` text is identical before and after: what changed
+        is the text handed to the index, which SQLite does not record anywhere.
+        ``user_version`` is otherwise unused by this database.
+
+        Ordering matters. The version is bumped only after the whole rebuild
+        commits, so a crash or a kill part-way through leaves the marker at its
+        old value and the next open starts over. A partially rebuilt index is
+        therefore always transient, never a resting state.
+        """
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= FTS_INDEX_VERSION:
+            self._fts_segmented = True
+            return
+        rows = self.db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        if rows:
+            logger.info(
+                "knowledge: re-indexing %d item(s) for FTS index format v%d "
+                "(CJK-segmented terms)", rows, FTS_INDEX_VERSION)
+        # IMMEDIATE so the writer lock is held for the whole rebuild: that is what
+        # stops a concurrent writer from reading the old representation and then
+        # writing terms the migrated index cannot match.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # 'delete-all' is the documented reset for an external-content table:
+            # it drops the index without touching `items`, which holds the data.
+            self.db.execute("INSERT INTO items_fts (items_fts) VALUES ('delete-all')")
+            # Declared before the re-insert, not after: the rows below are written
+            # through _fts_index, which asks _fts_terms_segmented what to write,
+            # and PRAGMA user_version is still the old value until this
+            # transaction commits.
+            self._fts_segmented = True
+            last = 0
+            while True:
+                batch = self.db.execute(
+                    "SELECT rowid, title, content, tags FROM items "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last, self._FTS_REBUILD_BATCH)).fetchall()
+                if not batch:
+                    break
+                for row in batch:
+                    self._fts_index(row["rowid"], row["title"], row["content"], row["tags"])
+                    last = row["rowid"]
+            self.db.execute(f"PRAGMA user_version = {FTS_INDEX_VERSION:d}")
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            # The index is back to whatever it held before, so the declaration
+            # has to go back to unknown rather than to False -- another process
+            # may have migrated the same database meanwhile.
+            self._fts_segmented = None
+            raise
+
+    def _fts_terms_segmented(self) -> bool:
+        """Whether ``items_fts`` currently holds CJK-segmented terms.
+
+        A writer must use the representation the index already holds, because
+        FTS5's ``'delete'`` subtracts the exact terms it is handed: handing
+        segmented terms to a not-yet-migrated index raises
+        ``DatabaseError: database disk image is malformed``. A legacy database
+        has legitimate writers before any reader can migrate it -- the orphan
+        reclaim in ``_migrate`` runs inside the constructor, and the startup
+        watcher sweep can update or delete an item before the first search --
+        so "segment unconditionally" is not available.
+
+        **Serialized by SQLite's writer lock, not by a Python lock.** Every
+        caller reads this from inside a ``BEGIN IMMEDIATE`` transaction, and the
+        rebuild flips it from inside one too. SQLite admits one writer at a time,
+        so a reader of this value already excludes the only thing that can change
+        it -- across processes as well as threads, which a Python lock could not
+        do. Taking a Python lock here instead would invert against SQLite's:
+        a writer holding SQLite's lock would wait on Python's while the
+        rebuilding reader holds Python's and waits on SQLite's.
+
+        A True answer is latched, since ``user_version`` only ever increases, so
+        the steady state costs nothing. A False answer is deliberately NOT
+        cached: another process (an MCP tool server on the same database) may
+        migrate it at any time, and a cached False would have this process keep
+        writing raw terms into a migrated index.
+        """
+        if self._fts_segmented:
+            return True
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= FTS_INDEX_VERSION:
+            self._fts_segmented = True
+        return bool(self._fts_segmented)
+
+    def _fts_terms(self, title, content, tags) -> tuple[str, str, str]:
+        """The three column values as this database's index represents them."""
+        values = (title or "", content or "", tags or "")
+        if not self._fts_terms_segmented():
+            return values
+        return (
+            fts5_segment_for_index(values[0]),
+            fts5_segment_for_index(values[1]),
+            fts5_segment_for_index(values[2]),
+        )
+
+    def _fts_index(self, rowid, title, content, tags) -> None:
+        """Index one item's row in the representation the index holds.
+
+        The single write path into ``items_fts``. Centralised because the
+        representation is not a per-call-site choice: an index built from
+        segmented text and probed with un-segmented text does not match, and the
+        reverse raises.
+
+        Holds no Python lock, by design -- see ``_fts_terms_segmented``. Callers
+        must already own SQLite's writer lock (``BEGIN IMMEDIATE``).
+        """
+        self.db.execute(
+            "INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, ?)",
+            (rowid, *self._fts_terms(title, content, tags)))
+
+    def _fts_unindex(self, rowid, title, content, tags) -> None:
+        """Remove one item's row from ``items_fts``.
+
+        FTS5's ``'delete'`` command subtracts the terms it is given, so it has to
+        be given the same text that was indexed. Passing the wrong
+        representation either leaves the original terms in the index -- which
+        keeps serving deleted or superseded content as live hits, and which
+        ``'integrity-check'`` does not flag -- or raises
+        ``database disk image is malformed`` outright.
+
+        Holds no Python lock, by design -- see ``_fts_terms_segmented``. Callers
+        must already own SQLite's writer lock (``BEGIN IMMEDIATE``).
+        """
+        self.db.execute(
+            "INSERT INTO items_fts (items_fts, rowid, title, content, tags) "
+            "VALUES ('delete', ?, ?, ?, ?)",
+            (rowid, *self._fts_terms(title, content, tags)))
+
     def search_items_fts(self, query, limit=10, offset=0) -> list:
+        self.ensure_fts_index_current()
         safe = self._sanitize_fts5(query)
         if not safe:
             return []
@@ -1097,22 +1559,18 @@ class KnowledgeStore:
             return []
         return [self._serialize_item(r) for r in rows]
 
-    def search_items_fts_count(self, query) -> int:
-        safe = self._sanitize_fts5(query)
-        if not safe:
-            return 0
-        try:
-            row = self.db.execute(
-                "SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH ?",
-                (safe,)).fetchone()
-            return row[0] if row else 0
-        except sqlite3.OperationalError:
-            return 0
-
     @staticmethod
     def _sanitize_fts5(query: str) -> str:
-        tokens = query.split()
-        return " ".join('"' + t.replace('"', '""') + '"' for t in tokens if t)
+        """Escape user input for FTS5 MATCH, ANDing the query's tokens.
+
+        Tokens stay individually quoted so the user's input can never contribute
+        FTS5 operators. CJK runs expand to their adjacent-character phrases
+        (``fts5_cjk_match_groups``) because a spaceless run is one whitespace
+        token but several words; non-CJK input is unchanged. The join is AND:
+        this is the store's direct-search surface, where every typed word is
+        taken as deliberate.
+        """
+        return " AND ".join(fts5_cjk_match_groups(query))
 
     def add_entity(self, name, entity_type, description=None, aliases=None) -> str:
         eid = str(uuid4())
@@ -1173,13 +1631,52 @@ class KnowledgeStore:
             (item_id, entity_id, context, now))
         self.db.commit()
 
+    # States a sources row may legitimately START in: the DURABLE ones, which a
+    # caller (or a restored bundle) can assert about a source before any work has
+    # run. The transient and outcome states -- syncing/synced/error/missing --
+    # are claims about work, so only the operation that did the work may write
+    # them: persisting a caller-supplied 'syncing' would make the sync endpoint
+    # report a conflict forever for a source whose sync never started.
+    _INITIAL_SYNC_STATUSES = frozenset({"pending", "pending_confirmation", "active", "paused"})
+
+    @staticmethod
+    def _initial_sync_status(properties) -> str:
+        """The sync_status column value a new sources row starts with.
+
+        The dashboard reads the sync_status COLUMN (list_sources serves
+        SELECT s.*), while callers express the intended initial state inside
+        the properties JSON. Both insert paths persist the column from the
+        same value so a freshly-added source renders the control matching its
+        state: a column left at its 'pending' default while properties says
+        'pending_confirmation' hides the Confirm button that starts the scan.
+        Values outside the initial-state allowlist fall back to 'pending'.
+        """
+        if isinstance(properties, dict):
+            return KnowledgeStore._initial_status_or_default(properties.get("sync_status"))
+        return "pending"
+
+    @staticmethod
+    def _initial_status_or_default(status) -> str:
+        """*status* if a row may legitimately start there, else 'pending'.
+
+        The allowlist itself, shared by every insert path so a status arriving
+        through the properties blob and one restored from a bundle's column are
+        held to the same rule.
+        """
+        if isinstance(status, str) and status in KnowledgeStore._INITIAL_SYNC_STATUSES:
+            return status
+        return "pending"
+
     def add_source(self, name, source_type, uri, **kwargs) -> str:
         sid = str(uuid4())
         now = datetime.now().isoformat()
+        properties = kwargs.get("properties", {})
+        stored = _without_sync_status(properties)
         self.db.execute(
-            "INSERT INTO sources (id, name, source_type, uri, properties, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sid, name, source_type, uri, json.dumps(kwargs.get("properties", {})), now, now))
+            "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, name, source_type, uri, json.dumps(stored),
+             self._initial_sync_status(properties), now, now))
         self.db.commit()
         return sid
 
@@ -1190,15 +1687,42 @@ class KnowledgeStore:
     _SOURCE_COLUMNS = {"name", "source_type", "uri", "properties", "last_synced", "sync_status", "updated_at"}
 
     def update_source(self, source_id, **fields):
+        """Write *fields* to a sources row.
+
+        ``if_sync_status`` makes the write a compare-and-set on the status
+        column: the row is written only while it still reads that value. A caller
+        deriving a status from a SNAPSHOT it took earlier must pass it, because
+        the row can move in between -- a sweep that observed 'missing' and then
+        writes 'synced' would otherwise overwrite the 'error' a manual sync
+        recorded in the meantime. A caller writing the outcome of something that
+        just happened has current information and does not need it.
+        """
+        expected = fields.pop("if_sync_status", None)
         if not fields:
             return
+        if "properties" in fields:
+            # The blob is not a place a status can live. Dropping it here means a
+            # legacy row's second copy disappears the first time anything writes
+            # its properties, and no caller can mint a new one. It is DROPPED,
+            # not applied to the column: a blob read off a legacy row carries a
+            # stale value, so honouring it would let the watcher stamp 'missing'
+            # back onto a file it had just re-ingested. A transition passes
+            # sync_status= explicitly.
+            fields["properties"] = _without_sync_status(fields["properties"])
         fields["updated_at"] = datetime.now().isoformat()
         safe = {k: v for k, v in fields.items() if k in self._SOURCE_COLUMNS}
         if not safe:
             return
         cols = ", ".join(f"{k} = ?" for k in safe)
         vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in safe.values()]
-        self.db.execute(f"UPDATE sources SET {cols} WHERE id = ?", (*vals, source_id))  # noqa: S608
+        sql = f"UPDATE sources SET {cols} WHERE id = ?"  # noqa: S608
+        params: list = [*vals, source_id]
+        if expected is not None:
+            # IS, not =, so a NULL column compares as a value rather than
+            # silently matching nothing.
+            sql += " AND sync_status IS ?"
+            params.append(expected)
+        self.db.execute(sql, params)
         self.db.commit()
 
     def add_source_location(self, item_id, source_id, chunk_range=None, section_title=None, anchor=None):
@@ -1209,6 +1733,19 @@ class KnowledgeStore:
         exists is a no-op. Attaching a second source is what keeps the item alive when
         the first is deleted -- see ``sources_holding_item``.
         """
+        self.add_source_location_in_txn(
+            item_id, source_id, chunk_range=chunk_range,
+            section_title=section_title, anchor=anchor)
+        self.db.commit()
+
+    def add_source_location_in_txn(self, item_id, source_id, chunk_range=None,
+                                   section_title=None, anchor=None):
+        """:meth:`add_source_location` without the commit, for a caller in a write txn.
+
+        The connection runs in autocommit mode, so ``db.commit()`` inside an
+        explicit ``BEGIN IMMEDIATE`` would END that transaction early and hand a
+        concurrent writer the very gap the caller took the lock to close.
+        """
         lid = str(uuid4())
         now = datetime.now().isoformat()
         self.db.execute(
@@ -1216,7 +1753,6 @@ class KnowledgeStore:
             "(id, item_id, source_id, chunk_range, section_title, anchor, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (lid, item_id, source_id, chunk_range, section_title, anchor, now))
-        self.db.commit()
 
     def sources_holding_item(self, item_id: str, exclude_source_id: str | None = None) -> list[str]:
         """Ids of EXISTING sources that hold *item_id*, optionally excluding one.
@@ -1303,6 +1839,7 @@ class KnowledgeStore:
             return {}
         mentions = self.db.execute("SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)).fetchall()
         entity_ids = [m["entity_id"] for m in mentions]
+        entity_id_set = set(entity_ids)
         entities = []
         for eid in entity_ids:
             row = self.db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
@@ -1314,12 +1851,38 @@ class KnowledgeStore:
             for row in self.db.execute(
                     "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)):
                 r = dict(row)
-                if r["id"] not in seen_ids:
-                    seen_ids.add(r["id"])
-                    relations.append(r)
+                if r["id"] in seen_ids:
+                    continue
+                # A relation whose OTHER endpoint isn't among this item's
+                # mentioned entities, or that was recorded under a different
+                # item's observation (source_item_id), would re-import
+                # referencing an entity/item this single-item bundle never
+                # carries -- an FK violation on the receiving end. Only keep
+                # relations fully contained in what this bundle exports.
+                if r["source_id"] not in entity_id_set or r["target_id"] not in entity_id_set:
+                    continue
+                if r["source_item_id"] not in (None, item_id):
+                    continue
+                seen_ids.add(r["id"])
+                relations.append(r)
         locations = [dict(r) for r in self.db.execute(
             "SELECT * FROM source_locations WHERE item_id = ?", (item_id,))]
-        return {"item": item, "entities": entities, "relations": relations, "source_locations": locations}
+        mentions = [dict(r) for r in self.db.execute(
+            "SELECT * FROM mentions WHERE item_id = ?", (item_id,))]
+        source_ids = {sid for sid in (item.get("source_id"), *(loc["source_id"] for loc in locations)) if sid}
+        sources = []
+        for sid in source_ids:
+            row = self.db.execute("SELECT * FROM sources WHERE id = ?", (sid,)).fetchone()
+            if row:
+                sources.append(dict(row))
+        return {
+            "items": [item],
+            "sources": sources,
+            "entities": entities,
+            "relations": relations,
+            "source_locations": locations,
+            "mentions": mentions,
+        }
 
     def export_all(self, namespace: str | None = None) -> dict:
         if namespace:
@@ -1358,14 +1921,37 @@ class KnowledgeStore:
         entities_created = 0
         relations_rebuilt = 0
         now = datetime.now().isoformat()
-        self.db.execute("BEGIN")
+        self.db.execute("BEGIN IMMEDIATE")
         try:
             for src in bundle.get("sources", []):
+                # Restore the status from the COLUMN, which ``export_all`` ships
+                # (it serializes SELECT * FROM sources). Reading the blob copy
+                # instead would land every bundle exported from a fixed store at
+                # the 'pending' default -- there is no copy there any more -- and
+                # silently resume a folder the user had paused. A bundle written
+                # before this change has the blob copy and no column, so fall
+                # back to it. Both go through the same allowlist as the other
+                # insert paths: a bundle is untrusted input, and a restored
+                # 'syncing' would report a conflict forever for a sync that
+                # never started.
+                #
+                # The blob is then stripped like every other insert path: after
+                # an insert the column is the only place a status lives, and a
+                # value the allowlist just refused has no business surviving
+                # inside the row it was refused from. The migration would retire
+                # such a key on the next open without ever promoting it, so this
+                # is the boundary holding, not a second line of defence.
+                props_text = _validated_properties(src.get("properties"))
+                restored = src.get("sync_status")
+                if not isinstance(restored, str) or not restored:
+                    restored = json.loads(props_text or "{}").get("sync_status")
                 self.db.execute(
-                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
+                    "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (src["id"], src["name"], src["source_type"], src["uri"],
-                     src.get("properties", "{}"), src.get("created_at", now), now))
+                     _without_sync_status(props_text),
+                     self._initial_status_or_default(restored),
+                     src.get("created_at", now), now))
             for item in bundle.get("items", []):
                 raw_emb = item.get("embedding")
                 if isinstance(raw_emb, str) and raw_emb:
@@ -1384,15 +1970,15 @@ class KnowledgeStore:
                     items_imported += 1
                     row = self.db.execute("SELECT rowid FROM items WHERE id = ?", (item["id"],)).fetchone()
                     if row:
-                        self.db.execute(
-                            "INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, ?)",
-                            (row[0], item["title"], item["content"], item.get("tags", "[]")))
+                        self._fts_index(row[0], item["title"], item["content"],
+                                        item.get("tags", "[]"))
             for ent in bundle.get("entities", []):
                 cursor = self.db.execute(
                     "INSERT OR IGNORE INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (ent["id"], ent["name"], ent["entity_type"], ent.get("description"),
-                     ent.get("aliases", "[]"), ent.get("created_at", now), now))
+                     _validated_aliases(ent.get("aliases")),
+                     ent.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     entities_created += 1
             for rel in bundle.get("relations", []):

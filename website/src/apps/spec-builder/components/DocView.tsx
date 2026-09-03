@@ -4,14 +4,17 @@
 // comment (with file attribution) into the parent's tray — nothing is sent to
 // the agent until "Send all to agent".
 import { useEffect, useRef, useState } from 'react'
-import { MessageSquare, Plus, X, FileText } from 'lucide-react'
+import { MessageSquare, Plus, X, FileText, ListChecks } from 'lucide-react'
 import MarkdownRenderer from '../../../components/MarkdownRenderer'
 import { Input } from '../../../components/ui'
-import type { SpecDetail } from '../api'
+import type { SpecDetail, SpecTask } from '../api'
 import { ACCENT, SEL_BG, Btn } from './shared'
 import { DocSkeleton } from './Shimmer'
+import TaskList from './TaskList'
 
 import { i18nT } from '../../../i18n/t'
+import { useImeGuard } from '../../../hooks/useImeGuard'
+import { containedSelectionRange } from '../../../utils/selectionContainment'
 interface Selection {
   text: string
   x: number
@@ -39,22 +42,40 @@ export interface DocViewProps {
    *  empty state, so an in-flight document reads as pending, not absent. */
   running?: boolean
   addComment: (c: { file: string; quote: string; note: string }) => void
+  /** Dispatch a single task. Absent = the run controls are not offered. */
+  runTask?: (task: SpecTask) => void
+  pendingTaskIndex?: number | null
 }
 
-export default function DocView({ detail, tab, addComment, running = false }: DocViewProps) {
-  const content = detail?.files?.[tab + '.md']
+export default function DocView({
+  detail,
+  tab,
+  addComment,
+  running = false,
+  runTask,
+  pendingTaskIndex = null,
+}: DocViewProps) {
+  const ime = useImeGuard()
+  const fname = tab + '.md'
+  const content = detail?.files?.[fname]
   const boxRef = useRef<HTMLDivElement>(null)
   const [sel, setSel] = useState<Selection | null>(null)
   const [note, setNote] = useState<Selection | null>(null)
   const [draft, setDraft] = useState('')
+  const [taskDocument, setTaskDocument] = useState(false)
 
   const onSelectionSettled = () => {
     const s = window.getSelection()
     const text = s ? s.toString().replace(/\s+/g, ' ').trim() : ''
     if (!text || text.length < 3 || !boxRef.current || !s || !s.rangeCount) { setSel(null); return }
     const range = s.getRangeAt(0)
-    if (!boxRef.current.contains(range.commonAncestorContainer)) { setSel(null); return }
-    const r = range.getBoundingClientRect()
+    // A triple-click of the document's LAST paragraph normalizes to a boundary
+    // point past the pane, so ancestor containment alone would dismiss it and
+    // the Comment pill would never appear (#7891). The pill is positioned from
+    // the clamped range, keeping an accepted overhang's line box out of the rect.
+    const contained = containedSelectionRange(range, boxRef.current)
+    if (!contained) { setSel(null); return }
+    const r = contained.getBoundingClientRect()
     const host = boxRef.current.getBoundingClientRect()
     setSel({ text: text.slice(0, 500), x: r.left - host.left + r.width / 2, y: r.top - host.top + boxRef.current.scrollTop, tab })
   }
@@ -80,10 +101,35 @@ export default function DocView({ detail, tab, addComment, running = false }: Do
     }
   })
 
+  const hasTaskControls = tab === 'tasks' && !!runTask && !!detail?.tasks?.length
+  const showTasks = hasTaskControls && !taskDocument
+
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      {hasTaskControls && (
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-border">
+          <Btn
+            primary={!taskDocument}
+            onClick={() => setTaskDocument(false)}
+            label={<><ListChecks className="lucide-inline" /> {i18nT('apps.specBuilder.components.taskList.task_progress')}</>}
+          />
+          <Btn
+            primary={taskDocument}
+            onClick={() => setTaskDocument(true)}
+            label={<><FileText className="lucide-inline" /> {i18nT('apps.specBuilder.components.docView.document_file_name', { name: 'tasks' })}</>}
+          />
+        </div>
+      )}
       <div ref={boxRef} className="flex-1 min-h-0 overflow-y-auto text-[13px] relative">
-        {content ? (
+        {showTasks ? (
+          <TaskList
+            tasks={detail?.tasks ?? []}
+            progress={detail?.task_progress}
+            pendingIndex={pendingTaskIndex}
+            busy={running || detail?.status === 'executing'}
+            onRun={(t) => runTask?.(t)}
+          />
+        ) : content ? (
           <div className="px-5 py-[18px]">
             <MarkdownRenderer content={content} />
           </div>
@@ -138,7 +184,7 @@ export default function DocView({ detail, tab, addComment, running = false }: Do
               autoFocus
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { setNote(null); setDraft('') } }}
+              {...ime.bindEnter({ onEnter: submit, onEscape: () => { setNote(null); setDraft('') } })}
               placeholder={i18nT('apps.specBuilder.components.docView.your_feedback_on_this_passage_enter_adds_it_to_t')}
               aria-label={i18nT('apps.specBuilder.components.docView.your_feedback_on_the_passage_in', { document: note.tab }) + '.md'}
               className="flex-1"

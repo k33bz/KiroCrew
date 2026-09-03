@@ -1,8 +1,12 @@
 """systemd ``--user`` template unit for pods — generated, not shipped.
 
-The unit's ``ExecStart`` re-enters the installed ``kirocrew`` binary as
-``kirocrew pod _run %i``, so the boot logic lives in Python (see
-:func:`kiro_crew.pod.runtime.boot`) and nothing is shipped outside the package.
+The unit's ``ExecStart`` re-enters a ``kirocrew`` binary as ``kirocrew pod _run
+%i``, so the boot logic lives in Python (see :func:`kiro_crew.pod.runtime.boot`)
+and nothing is shipped outside the package. The template can only name ONE
+binary for every instance, so each pod additionally gets a per-instance drop-in
+(:func:`install_dropin`) pinning ``ExecStart`` to its OWN checkout's ``kirocrew``
+— without it a pod runs whichever build ``pod install`` resolved rather than the
+worktree it exists to test.
 
 The unit deliberately has **no ``ExecStopPost`` teardown hook**. systemd runs
 ``ExecStopPost`` before the final kill of the unit's cgroup, so a hook that
@@ -17,12 +21,19 @@ by a pod that went away without a ``down``.
 
 from __future__ import annotations
 
+import errno
 import os
+import shlex
 import shutil
+import stat
 import sys
 from pathlib import Path
 
+from kiro_crew import pinned_fs
+from kiro_crew.atomic_write import atomic_write_at
+from kiro_crew.pod import provision as prov
 from kiro_crew.pod.config import PodConfig, environment_vars
+from kiro_crew.service.common import systemd_quote
 
 _UNIT_TEMPLATE = """\
 [Unit]
@@ -62,9 +73,8 @@ WantedBy=default.target
 """
 
 
-def _kirocrew_bin() -> str:
-    """Absolute path (or module invocation) to the kirocrew entry-point the unit
-    should boot.
+def _kirocrew_argv() -> tuple[str, ...]:
+    """Argv prefix that re-enters the kirocrew entry point the unit should boot.
 
     Resolution order:
       1. ``KIROCREW_POD_BIN`` — explicit override (used when installing a unit that
@@ -74,11 +84,11 @@ def _kirocrew_bin() -> str:
     """
     override = os.environ.get("KIROCREW_POD_BIN")
     if override:
-        return override
+        return (override,)
     found = shutil.which("kirocrew")
     if found:
-        return found
-    return f"{sys.executable} -m kiro_crew"
+        return (found,)
+    return (sys.executable, "-m", "kiro_crew")
 
 
 def _environment_block(cfg: PodConfig) -> str:
@@ -88,12 +98,15 @@ def _environment_block(cfg: PodConfig) -> str:
     launchd backend pins the identical plane; this function only serialises it in
     systemd's syntax. Returns "" when everything is at defaults.
     """
-    return "".join(f"Environment={key}={val}\n" for key, val in environment_vars(cfg).items())
+    return "".join(
+        f"Environment={systemd_quote(f'{key}={val}')}\n"
+        for key, val in environment_vars(cfg).items()
+    )
 
 
 def render_unit(cfg: PodConfig) -> str:
     return _UNIT_TEMPLATE.format(
-        kirocrew_bin=_kirocrew_bin(),
+        kirocrew_bin=" ".join(systemd_quote(arg) for arg in _kirocrew_argv()),
         unit_prefix=cfg.unit_prefix,
         environment=_environment_block(cfg),
     )
@@ -104,11 +117,159 @@ def unit_path(cfg: PodConfig) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / f"{cfg.unit_prefix}@.service"
 
 
+# --------------------------------------------------------------------------- #
+# Per-instance drop-in — what makes a pod run ITS OWN worktree's code.
+#
+# The unit above is a TEMPLATE shared by every pod, so its ``ExecStart`` can only
+# bake ONE kirocrew binary: whichever one ``pod install`` happened to resolve,
+# normally the globally installed ``~/.local/bin/kirocrew``. Every pod therefore
+# booted through that build regardless of which checkout it was pinned to, and a
+# pod exists precisely to run a worktree's own code. The visible cost was silent:
+# a global build predating a feature simply ignored the env-file key carrying it
+# (``SEED=`` being the sharp one), so the pod came up healthy and unseeded while
+# the worktree's own ``boot`` — which does honour it — never ran.
+#
+# systemd resolves ``<unit>.d/*.conf`` per INSTANCE, so one drop-in per pod pins
+# that pod to its checkout without touching the shared template. The empty
+# ``ExecStart=`` is required: for a ``Type=simple`` unit the directive is a list,
+# and a second value would append a command rather than replace the template's.
+# --------------------------------------------------------------------------- #
+
+_DROPIN_FILENAME = "50-kirocrew-pod.conf"
+
+_DROPIN_TEMPLATE = """\
+# Written by `kirocrew pod up` — removed by `kirocrew pod down`. Do not edit.
+[Service]
+# Reset the template's ExecStart (a list directive, so an unreset second value
+# would APPEND) and boot this pod through its own checkout's kirocrew. The pod
+# then runs the worktree's code, which is the whole point of a pod: the template
+# alone bakes one global binary for every instance.
+ExecStart=
+ExecStart={kirocrew_bin} pod _run %i
+"""
+
+
+def dropin_dir(cfg: PodConfig, name: str) -> Path:
+    """Drop-in directory systemd reads for pod *name* alone."""
+    return unit_path(cfg).with_name(f"{cfg.unit_prefix}@{name}.service.d")
+
+
+def dropin_path(cfg: PodConfig, name: str) -> Path:
+    """The uniquely owned drop-in file ``pod up`` writes for pod *name*.
+
+    ``override.conf`` belongs to ``systemctl edit`` and therefore to the
+    operator. Claiming that conventional name would overwrite their settings on
+    every up and delete them on down.
+    """
+    return dropin_dir(cfg, name) / _DROPIN_FILENAME
+
+
+def render_dropin(checkout: Path) -> str:
+    """The drop-in pinning a pod's boot to *checkout*'s own ``kirocrew``."""
+    return _DROPIN_TEMPLATE.format(kirocrew_bin=systemd_quote(str(prov.venv_bin(checkout))))
+
+
+def _write_unit_file_atomic_nofollow(dst: Path, content: str, *, what: str) -> None:
+    """Publish one managed systemd file without following planted links."""
+    dir_fd = pinned_fs.create_and_open_dir_pinned(
+        dst.parent,
+        what=f"{what} directory",
+        refusal=OSError,
+    )
+    try:
+        try:
+            existing = os.stat(dst.name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(existing.st_mode):
+                raise OSError(f"refusing to write {what} {dst}: it is a symbolic link")
+            if not stat.S_ISREG(existing.st_mode):
+                raise OSError(f"refusing to write {what} {dst}: it is not a regular file")
+        atomic_write_at(dir_fd, dst.name, content, fsync=True, mode=0o600)
+    finally:
+        os.close(dir_fd)
+
+
+def install_dropin(cfg: PodConfig, name: str, checkout: Path) -> Path:
+    """Write pod *name*'s drop-in and return its path. Caller runs daemon-reload.
+
+    Rewritten on every start rather than created once, so a pod re-``up``ped from
+    a different checkout — or one whose venv was rebuilt elsewhere — cannot keep
+    booting a path that no longer exists (the failure mode ``unit_exec_ok``
+    exists to self-heal for the template).
+    """
+    dst = dropin_path(cfg, name)
+    _write_unit_file_atomic_nofollow(
+        dst,
+        render_dropin(checkout),
+        what="pod boot override",
+    )
+    return dst
+
+
+def remove_dropin(cfg: PodConfig, name: str) -> bool:
+    """Delete only Kiro Crew's drop-in. True when its file and empty dir are gone.
+
+    A foreign drop-in keeps the directory alive. The POSIX path addresses the
+    managed filename relative to a pinned directory descriptor, so a planted
+    directory link cannot redirect cleanup into an operator-controlled target.
+    """
+    path = dropin_path(cfg, name)
+    directory = dropin_dir(cfg, name)
+    try:
+        dir_fd = pinned_fs.open_dir_pinned(
+            directory,
+            what="pod boot override directory",
+            refusal=OSError,
+        )
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        try:
+            os.unlink(path.name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+    except OSError:
+        return False
+    finally:
+        os.close(dir_fd)
+
+    try:
+        parent_fd = pinned_fs.pin_parent(
+            os.path.realpath(directory.parent),
+            what="pod boot override directory",
+            refusal=OSError,
+        )
+    except OSError:
+        return False
+    try:
+        try:
+            os.rmdir(directory.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # A foreign drop-in makes the directory non-empty and therefore not
+            # ours to remove. Every other failure means our empty per-pod
+            # directory may remain, so teardown must not claim zero residue.
+            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                return False
+    finally:
+        os.close(parent_fd)
+    return True
+
+
 def install_unit(cfg: PodConfig) -> Path:
     """Write the template unit and return its path. Caller runs daemon-reload."""
     dst = unit_path(cfg)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(render_unit(cfg))
+    _write_unit_file_atomic_nofollow(
+        dst,
+        render_unit(cfg),
+        what="pod template unit",
+    )
     return dst
 
 
@@ -129,16 +290,25 @@ def unit_exec_ok(cfg: PodConfig) -> bool:
         return False
     for line in text.splitlines():
         if line.startswith("ExecStart="):
-            exe = line[len("ExecStart="):].split()[0]
+            try:
+                argv = shlex.split(line[len("ExecStart="):], posix=True)
+            except ValueError:
+                return False
+            if not argv:
+                return False
+            # ``systemd_quote`` doubles percent signs to suppress specifier
+            # expansion; recover the literal executable path before probing it.
+            exe = argv[0].replace("%%", "%")
             return os.access(exe, os.X_OK) if os.path.isabs(exe) else True
     return False
 
 
 # Directives an older installed unit may still carry that this build has removed.
-# ``ExecStopPost`` ran teardown before systemd's final kill of the pod's cgroup,
-# so it raced the pod's own subprocesses and also wiped the HOME on the stop half
-# of a ``Restart=``; reclamation now belongs to the ``down`` path.
-_REMOVED_DIRECTIVES = ("ExecStopPost=",)
+# ``ExecStopPost`` runs teardown before systemd's final kill of the pod's cgroup,
+# so it races the pod's own subprocesses and also wipes the HOME on the stop half
+# of a ``Restart=``; reclamation belongs to the ``down`` path instead. Must stay a
+# tuple: ``unit_is_current`` hands it straight to ``str.startswith``.
+_REMOVED_DIRECTIVES: tuple[str, ...] = ("ExecStopPost=",)
 
 
 def unit_is_current(cfg: PodConfig) -> bool:
@@ -157,8 +327,6 @@ def unit_is_current(cfg: PodConfig) -> bool:
         text = unit_path(cfg).read_text()
     except OSError:
         return False
-    return not any(
-        line.startswith(directive)
-        for line in text.splitlines()
-        for directive in _REMOVED_DIRECTIVES
-    )
+    # str.startswith takes the whole tuple, so one pass answers for every removed
+    # directive.
+    return not any(line.startswith(_REMOVED_DIRECTIVES) for line in text.splitlines())

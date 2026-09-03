@@ -8,6 +8,7 @@ import pytest
 
 from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.acp.runtime import AcpRuntimeDead
+from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import AcpEvent, AcpPromptStats
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
@@ -37,12 +38,17 @@ def _make_handle(
     return handle
 
 
-def _make_runtime(alive: bool = True) -> MagicMock:
-    """Create a mock AcpRuntime."""
+def _make_runtime(alive: bool = True, acp_backend: str = "") -> MagicMock:
+    """Create a mock AcpRuntime.
+
+    ``acp_backend`` mirrors the real constructor's default (kiro), because the
+    provider's ``backend`` delegates to it rather than returning a constant.
+    """
     runtime = MagicMock()
     runtime.is_alive.return_value = alive
     runtime._process = MagicMock(returncode=None if alive else 1)
     runtime._last_activity = 0.0
+    runtime.acp_backend = acp_backend
     return runtime
 
 
@@ -232,23 +238,56 @@ class TestAcpSessionProviderStream:
         assert collected[2].kind == EVENT_COMPLETE
 
     @pytest.mark.asyncio
-    async def test_stream_command_delegates_to_stream(self):
+    async def test_stream_command_routes_through_handle_stream_command(self):
+        """Slash commands go through the handle's NATIVE commands/execute path,
+        never through prompt() — a prompt round-trip would hand the command to
+        the model, which summarizes kiro-cli's output instead of returning it
+        (issue #4972)."""
         handle = _make_handle()
-        events = [AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")]
+        events = [
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="13 tools"),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason=""),
+        ]
+        seen_commands: list[str] = []
 
-        async def mock_prompt(msg):
+        async def mock_stream_command(command):
+            seen_commands.append(command)
             for e in events:
                 yield e
 
+        async def mock_prompt(msg):  # pragma: no cover — must never run
+            raise AssertionError("stream_command must not route through prompt()")
+            yield  # make it a generator
+
+        handle.stream_command = mock_stream_command
         handle.prompt = mock_prompt
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
 
-        collected = []
-        async for event in provider.stream_command("/help"):
-            collected.append(event)
+        collected = [e async for e in provider.stream_command("/tools")]
 
-        assert len(collected) == 1
+        assert seen_commands == ["/tools"]
+        assert [e.kind for e in collected] == [EVENT_TEXT_CHUNK, EVENT_COMPLETE]
+        assert collected[0].text == "13 tools"
+
+    @pytest.mark.asyncio
+    async def test_stream_command_translates_runtime_dead(self):
+        """Runtime death mid-command stays inside the AcpError hierarchy
+        (AcpProcessDied), mirroring stream()'s translation."""
+
+        async def dead_stream_command(command):
+            raise AcpRuntimeDead("runtime died")
+            yield  # make it a generator
+
+        handle = _make_handle()
+        handle.stream_command = dead_stream_command
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+
+        with pytest.raises(AcpProcessDied):
+            async for _ in provider.stream_command("/tools"):
+                pass
 
 
 class TestAcpSessionProviderToolApproval:
@@ -413,11 +452,24 @@ class TestAcpSessionProviderClientCompat:
     """Tests for the AcpClient-compatible API surface."""
 
     def test_backend_is_empty_for_kiro(self):
-        """backend property returns empty string (kiro, not claude)."""
+        """backend reports empty string for a kiro runtime (not claude)."""
         handle = _make_handle()
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
         assert provider.backend == ""
+
+    def test_backend_reports_the_runtimes_backend(self):
+        """Delegated, not constant.
+
+        This provider replaces the placeholder AcpClient on
+        ``AcpProvider._client`` once startup finishes, so it is the only place
+        a started provider's backend can still be read. Returning kiro
+        unconditionally would persist every KAS session under the kiro label.
+        """
+        handle = _make_handle()
+        runtime = _make_runtime(acp_backend="kas")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.backend == "kas"
 
     def test_has_active_turn(self):
         """has_active_turn is a METHOD (parity with AcpClient) delegating to
@@ -651,6 +703,25 @@ class TestAcpSessionProviderRound4Parity:
         assert provider._session_key == "dashboard:slot9"
         assert provider._channel_id == "chan-7"
         assert runtime._last_activity > 0.0
+
+    def test_rekey_rebinds_watchdog_to_claiming_crew(self):
+        """The claiming session's canonical crew identity travels with the
+        claim: rekey rebinds the live handle's watchdog snapshot AND updates
+        the runtime default so later sessions (new_conversation) inherit the
+        claimed crew, not the pool's spawn state."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        wd = WatchdogSettings(tool_stall_suspect_secs=123.0)
+        provider.rekey("dashboard:slot9", "chan-7", crew_agent="pr-reviewer", watchdog=wd)
+        handle.rebind_watchdog.assert_called_once_with("pr-reviewer", settings=wd)
+        assert runtime._crew_agent == "pr-reviewer"
+        # An identity-less claim still rebinds (to the globals): a recycled
+        # runtime must not carry a previous crew's windows. Without a
+        # pre-resolved snapshot the rebind loads synchronously (settings=None).
+        provider.rekey("dashboard:slot3", None)
+        handle.rebind_watchdog.assert_called_with("", settings=None)
+        assert runtime._crew_agent == ""
 
     def test_rekey_resets_context_state(self):
         """#2932 -- the handoff must drop the previous session's context state
@@ -1059,6 +1130,10 @@ class TestLivePathModelEntitlement:
         handle = _make_handle()
         handle.available_models = [{"modelId": m, "name": m} for m in advertised]
         handle.set_model = AsyncMock()
+        # Default: the revalidation probe cannot confirm anything (returns []),
+        # so a stale-snapshot refusal stands. Tests exercising the heal path
+        # override this with a side_effect that also updates available_models.
+        handle.refresh_available_models = AsyncMock(return_value=[])
         return AcpSessionProvider(handle, MagicMock()), handle
 
     @pytest.mark.asyncio
@@ -1102,6 +1177,73 @@ class TestLivePathModelEntitlement:
 
         await provider.set_model("claude-opus-4.8")
 
+        handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_stale_refusal_revalidates_and_allows(self):
+        """A would-be refusal on the session-init snapshot is revalidated
+        against a fresh probe; when the fresh answer advertises the model, the
+        switch proceeds instead of freezing a false 'not entitled' verdict."""
+        provider, handle = self._provider(["claude-sonnet-4", "claude-sonnet-4.5"])
+        fresh = [
+            {"modelId": "auto", "name": "auto", "description": ""},
+            {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
+        ]
+
+        async def _refresh():
+            handle.available_models = fresh
+            return fresh
+
+        handle.refresh_available_models = AsyncMock(side_effect=_refresh)
+
+        await provider.set_model("claude-opus-5")
+
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_awaited_once_with("claude-opus-5")
+
+    @pytest.mark.asyncio
+    async def test_refusal_stands_when_fresh_probe_still_lacks_model(self):
+        """A real downgrade survives revalidation — and the error names the
+        FRESH advertised set, not the stale one."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+        handle.refresh_available_models = AsyncMock(
+            return_value=[
+                {"modelId": "claude-sonnet-4", "name": "s4", "description": ""},
+                {"modelId": "claude-sonnet-4.5", "name": "s45", "description": ""},
+            ]
+        )
+
+        with pytest.raises(AcpModelUnavailable) as excinfo:
+            await provider.set_model("claude-opus-4.8")
+
+        handle.set_model.assert_not_awaited()
+        assert "claude-sonnet-4.5" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_stale_set_when_probe_fails(self):
+        """An empty probe result is not evidence: the stale verdict stands and
+        the error names the only set we actually have."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+
+        with pytest.raises(AcpModelUnavailable) as excinfo:
+            await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_awaited_once()
+        assert "claude-sonnet-4.6" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_advertised_pick_never_probes(self):
+        """The probe runs only on a would-be refusal — an allowed switch costs
+        no extra round-trip."""
+        provider, handle = self._provider(["claude-opus-4.8"])
+
+        await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_not_awaited()
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
 
 

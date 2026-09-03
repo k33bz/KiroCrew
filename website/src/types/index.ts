@@ -3,21 +3,52 @@ export interface StatusData {
   start_time?: number
   sessions: number
   messages: number
-  cron_jobs: number
-  subagents: number
-  lessons: number
-  update_available?: boolean
   /**
-   * Can this install replace its own code? Only a git checkout can — a wheel
-   * install (the `cli.sh` managed venv) upgrades by re-running the installer, so
-   * `POST /api/update` would 409. Shipped with the availability flag so the UI
-   * can pick the right affordance without first running a check.
+   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
+   * yet (e.g. the lesson store is failing). StatCard renders null as a
+   * loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). HTTP/SSE paths always send numbers.
    */
-  update_self_updatable?: boolean
-  /** Did a check ever reach a verdict? Distinguishes "current" from "never checked". */
-  update_checked?: boolean
-  /** Upgrade command for an install that cannot replace itself ("" when it can). */
+  cron_jobs: number | null
+  subagents: number
+  /** See cron_jobs — null = unknown, rendered as a skeleton, never a fake 0. */
+  lessons: number | null
+  /**
+   * Is a newer build available? `null`/absent means NO VERDICT — a check that
+   * never ran, or one that failed. Only `true` may light an update affordance,
+   * and only `false` alongside `update_check_status === 'succeeded'` may render
+   * "up to date". Treating a missing verdict as `false` is the bug this pair
+   * exists to prevent.
+   */
+  update_available?: boolean | null
+  /**
+   * Can the gateway apply an update in-process? Only a git checkout can — a wheel
+   * install (the `cli.sh` managed venv) upgrades by re-running the installer, and
+   * a desktop bundle is updated by its own updater, so `POST /api/update` would
+   * 400/409 on both. Shipped with the availability flag so the UI can pick the
+   * right affordance without first running a check.
+   */
+  update_can_apply?: boolean
+  /**
+   * How far the check itself got: `unchecked`, `checking`, `succeeded`, `failed`
+   * or `deferred` (another surface owns this install's updates).
+   */
+  update_check_status?: 'unchecked' | 'checking' | 'succeeded' | 'failed' | 'deferred'
+  /** Copyable upgrade command for an install that cannot apply in-process ("" when none). */
   update_command?: string
+  /**
+   * The candidate release's version string ("" until a check has found a newer
+   * build). Carried on the hot-path subset so the proactive update popup can
+   * key its per-version snooze/skip without calling the check endpoint; the
+   * changelog text deliberately is not.
+   */
+  update_latest_version?: string
+  /**
+   * DISPLAY-ONLY fold of `update_latest_version` (clean base on the stable
+   * channel). The popup's snooze/skip keys and every arm path keep reading
+   * the raw field. Optional: an older gateway does not send it.
+   */
+  update_latest_version_display?: string
   /**
    * The release channel this INSTALL follows (the `channel` file `cli.sh` wrote).
    * "" when the layout has no channel at all — a git checkout tracks a remote, a
@@ -27,8 +58,53 @@ export interface StatusData {
    * diverge between a channel switch and the new lane's build landing.
    */
   update_channel?: string
+  /**
+   * Is the running build ahead of everything `update_channel` publishes? True
+   * means that lane has never shipped these bytes, so the install is not on it
+   * and only re-running the installer moves it — the state a channel switch
+   * leaves on an install whose bytes the gateway cannot replace.
+   *
+   * Backend-derived from the feed comparison, deliberately NOT from comparing
+   * `update_channel` against `release_channel`: promotion re-points the soaked
+   * candidate's bytes without re-stamping them, so a promoted stable build
+   * reports `release_channel: 'insider'` while being a stable install with
+   * nothing pending. False on every layout with no feed answer (git checkout,
+   * desktop bundle, container) and on older gateways (absent reads as false).
+   */
+  update_channel_move_pending?: boolean
+  update_managed_by?: string
+  update_can_arm?: boolean
+  /**
+   * Commit distance from a git checkout's upstream, both directions. Diverged
+   * (both > 0) reports `update_available: false` exactly like a current
+   * checkout — the destructive apply paths must never be offered local
+   * commits — so this pair is what lets the About badge tell the two apart
+   * without waiting for a manual check. 0/0 on non-git layouts, before any
+   * check, and on older gateways (absent reads as 0).
+   */
+  update_commits_ahead?: number
+  update_commits_behind?: number
+  update_last_checked_at?: number | null
+  update_check_interval_secs?: number
+  /**
+   * Mandatory-update verdict: true when this install sits below either the
+   * enterprise governance pin or the release feed's breaking-change floor.
+   * The proactive update modal drops its snooze/skip affordances while true.
+   */
+  update_required?: boolean
+  /** The floor that made the update mandatory (bare release, '' when none). */
+  update_min_version?: string
   update_progress?: { step: string; detail: string } | null
   version?: string
+  /**
+   * The RUNNING build's version folded for display — the clean base on the
+   * stable channel (`0.4.0` for bytes stamped `0.4.0rc14`), the raw version
+   * on every other channel. DISPLAY-ONLY sibling of `version` above, which
+   * stays raw because the SPA compares it across pushes to force a reload
+   * over a gateway upgrade. Optional: an older gateway does not send it —
+   * fall back to `version`.
+   */
+  version_display?: string
   /**
    * Which release lane these bytes came from. The gateway resolves it (see
    * `src/kiro_crew/release_channel.py`) rather than leaving the dashboard to
@@ -43,6 +119,14 @@ export interface StatusData {
   release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
+  /**
+   * Short content hash of the SERVED frontend bundle's entry point. The SPA
+   * compares it across status pushes and reloads when it moves — the reload
+   * signal `version` cannot give for a same-version rebuild (a git checkout's
+   * in-app update), and one that reaches every open tab. `""`/absent means no
+   * built bundle / older gateway: unknown, never a change.
+   */
+  bundle_id?: string
   platform?: string
   yolo?: boolean
   /** ISO timestamp when the current timed auto-approve grant expires ("" when none). */
@@ -58,19 +142,108 @@ export interface StatusData {
   no_crons?: boolean
   /** True when the gateway has a live Slack (Socket Mode) connection. */
   slack_connected?: boolean
+  /**
+   * Live health of every messaging channel, keyed by channel type (`slack`,
+   * `wecom`, `telegram`, `discord`, `webex`, `teams`, `weixin`, `imessage`). The
+   * gateway derives it by looping its own channel roster, so a channel added
+   * there arrives here without a payload change — which is why this is a map and
+   * not eight named fields.
+   *
+   * Optional because an older gateway sends no `channels` at all. Treat that as
+   * "no answer" and fall back to `slack_connected`; reading an absent map as a
+   * set of disconnected channels would invent an outage.
+   *
+   * `error` is the last connect failure, already capped at 120 chars by the
+   * gateway, and `''` when there is none. So `{ connected: false, error: '' }` is
+   * AMBIGUOUS by construction: it is what an unconfigured channel and a
+   * configured one that never started both look like. Nothing in this payload
+   * separates them — each channel's own config endpoint reports `configured`,
+   * which is what Settings > Channels reads.
+   */
+  channels?: Record<string, { connected: boolean; error: string }>
   /** Governance enforcement health. */
   governance?: 'active' | 'degraded' | 'disabled' | 'unknown'
 }
 
+/**
+ * GET /api/update/check — the update capability contract for this install
+ * (`_update_info` in `dashboard/handlers/updates.py` plus the request-scoped
+ * extras). Every field is optional so an older gateway that predates one still
+ * type-checks; consumers treat absence as "unknown", never as a verdict.
+ */
+export interface UpdateCheckResult {
+  supported?: boolean
+  managed_by?: string
+  mode?: string
+  can_download?: boolean
+  can_apply?: boolean
+  requires_restart?: boolean
+  channel?: string
+  latest_version?: string
+  /**
+   * DISPLAY-ONLY sibling of `latest_version`, folded to the clean release
+   * version on the stable channel (a promoted candidate keeps its insider/rc
+   * stamp in the bytes, e.g. "0.4.0rc14" for the "0.4.0" release). Never pass
+   * this to `InAppUpdateFlow`'s `version` prop, `/api/update/arm`, or a
+   * snooze/skip key — those must use the raw `latest_version`, which is
+   * compared byte-for-byte against the installed build's own never-folded
+   * `__version__` during apply.
+   */
+  latest_version_display?: string
+  /**
+   * Copyable upgrade command ("" when none). Carried by the channel-switch
+   * response (POST /api/update/channel, which answers with this same contract
+   * re-run against the new lane); the check endpoint itself carries the
+   * command inside `remediation` instead.
+   */
+  update_command?: string
+  changes?: string
+  check_status?: 'unchecked' | 'checking' | 'succeeded' | 'failed' | 'deferred'
+  update_available?: boolean | null
+  version_newer?: boolean
+  /**
+   * Commit distance from the tracked git upstream, both directions. A diverged
+   * checkout (both counts > 0) reports `update_available: false` exactly like a
+   * current one — the destructive apply path must never be offered its local
+   * commits — so this pair is the only wire signal that "no update" means
+   * "rebase or merge" rather than "up to date". The diverged condition is
+   * derived at the render site (`commits_ahead > 0 && commits_behind > 0`), not
+   * shipped as a redundant server boolean. Both 0 outside a successful
+   * git-checkout check.
+   */
+  commits_ahead?: number
+  commits_behind?: number
+  error_code?: string | null
+  unavailable_reason?: string | null
+  remediation?: { kind?: string; message?: string; command?: string } | null
+  current_version?: string
+  auto_update?: boolean
+  minimum_version_enforced?: string
+  update_required?: boolean
+  /** Legacy alias some older payloads carried; `latest_version` is authoritative. */
+  version?: string
+}
+
 export interface SystemData {
   hostname: string; os: string; arch: string; cpu_count: number
-  load_1m: number; load_5m: number; load_15m: number; cpu_pct: number
-  mem_total_gb: number; mem_used_gb: number; mem_free_gb: number
+  load_1m: number; load_5m: number; load_15m: number
+  /**
+   * Probe-derived metrics are OPTIONAL by construction. The server assembles
+   * `/api/system` key-by-key under a per-probe `try/except: pass`, seeded from
+   * cached static info — so a frame carrying `mem_total_gb` (static cache) with
+   * no `mem_used_gb` (live probe failed or returned nothing) is an ordinary
+   * outcome, not an error. Narrow through `utils/metrics.ts` before any
+   * arithmetic or formatting; a bare `.toFixed()` on one of these is a crash.
+   */
+  cpu_pct?: number
+  mem_total_gb?: number; mem_used_gb?: number; mem_free_gb?: number
   ip: string; net_rx_mb: number; net_tx_mb: number
   net_rx_kbs: number; net_tx_kbs: number
-  disk_total_gb: number; disk_free_gb: number
+  disk_total_gb?: number; disk_free_gb?: number
   python: string; pid: number; cwd: string
-  proc_mem_mb: number; proc_cpu_pct: number
+  /** Live resident set size. `proc_mem_peak_mb` is the high-water mark since
+   *  the gateway started, so it never falls; do not render it as live memory. */
+  proc_mem_mb: number; proc_mem_peak_mb?: number; proc_cpu_pct: number
   child_processes: number; thread_count: number
   mcp_processes?: { sandbox: number; kiro_cli: number; builder_mcp: number }
   mcp_total?: number
@@ -117,6 +290,31 @@ export interface SessionStorageCleanup {
   /** Empty on a dry run — nothing was staged, so there is no batch to undo. */
   batch_id?: string
   dry_run?: boolean
+}
+
+/**
+ * One empty of the trash, running or recently finished.
+ *
+ * POST /api/system/session-storage/empty answers 202 with this; GET on the same
+ * path returns the current one, and stops returning a finished one once it has gone
+ * stale — so an outcome is never presented as current days later. The gateway keeps
+ * a single slot, so a second empty is refused with 409 and this same shape rather
+ * than queued.
+ *
+ * `total_bytes` comes from the staged manifests — the same figure the trash row
+ * showed — so it is the denominator for `freed_bytes` and never a remeasurement.
+ */
+export interface SessionStorageEmptyJob {
+  job_id: string
+  running: boolean
+  total_bytes: number
+  freed_bytes: number
+  /** Empty unless the delete was refused or stopped on an error. */
+  error: string
+  /** Reason codes for batches deliberately KEPT. A kept batch is a refusal: the
+   *  user asked for it to be destroyed and it is still there, so an empty `error`
+   *  with a non-empty `skipped` is not a success. */
+  skipped: string[]
 }
 
 /* ── Session inventory (contract §1–§3) ── */
@@ -191,6 +389,9 @@ export interface CronJob {
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
   at?: number | null; created_ts?: number | null
   agent?: string; model?: string; channel?: string; approval_mode?: string; silent?: boolean
+  /** Crews a sequence job runs, in order. Takes PRECEDENCE over `agent` at run
+   *  time, so any consumer attributing a job to a crew must read this first. */
+  agent_sequence?: string[]
   strict_schedule?: boolean
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
@@ -203,6 +404,11 @@ export interface CronJob {
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
   folder_id?: string
+  /** Chat session that owns this job — ownership decides chat-side reachability
+   * (cron_list only lists a session its own jobs). Null for an ownerless job,
+   * which is invisible to every chat session and manageable only from the
+   * Schedule page or the CLI. */
+  session_key?: string | null
 }
 
 export interface Lesson {
@@ -279,8 +485,34 @@ export interface SteeringFile {
   /** Display path with the home prefix collapsed to ``~``. */
   path: string
   size: number
-  /** First markdown heading, used as a one-line summary. */
+  /** First markdown heading of the document BODY, used as a one-line summary.
+   *  Front matter is excluded, so a document opening with `inclusion:` is
+   *  summarised by its title rather than by its first declaration. */
   description: string
+  /** Declared `inclusion` mode, canonicalised: always one of `always`,
+   *  `fileMatch`, `manual`, `auto`. An absent or unrecognised declaration
+   *  reports `always`, which is both Kiro's documented default and what
+   *  kiro-cli does with a value it does not recognise. */
+  inclusion: string
+  /** The `inclusion` value exactly as written, `''` when the field is absent.
+   *  Differs from `inclusion` only when the author's spelling is not a mode —
+   *  which is the one case worth telling them about. */
+  inclusion_declared: string
+  /** `fileMatchPattern` verbatim, `''` when absent. Only meaningful alongside
+   *  `inclusion: fileMatch`. */
+  file_match_pattern: string
+  /** True for a leaf symlink admitted read-only: its resolved target passes the
+   *  session loader's gate against the source's trust base, so the document
+   *  loads into sessions but the write path refuses it. Optional because the
+   *  UI reads it defensively — a cached listing from an older backend simply
+   *  renders no chip. */
+  linked?: boolean
+  /** False exactly for linked entries — the tab disables Edit/Delete on them.
+   *  Optional: an absent field fails OPEN (editable), see `selectedReadOnly`. */
+  editable?: boolean
+  /** Resolved symlink target (display path, home collapsed to `~`); `''` when
+   *  the entry is not linked. */
+  target?: string
 }
 
 /** Response shape of ``GET /api/steering``. */
@@ -289,6 +521,18 @@ export interface SteeringList {
   roots: Array<{ source: string; path: string; exists: boolean }>
   /** Active project directory (display path), empty when none is set. */
   project: string
+  /** Why `project` is empty when it is: `none` (no chat names a project) or
+   *  `ambiguous` (open chats name different ones, so the server refuses to
+   *  pick). `set` when `project` is populated.
+   *
+   *  Required, not optional: the backend that serves this bundle is the one that
+   *  answers this call, so the only skew that can occur is an OLD tab against a
+   *  NEW backend — never a new tab against a backend too old to send it. */
+  project_state: 'set' | 'none' | 'ambiguous'
+  /** Opaque fingerprint of the project this listing resolved to, empty when
+   *  there is none. A workspace write echoes it back so the server can refuse
+   *  (409) once the chat slot has been re-pointed at a different project. */
+  project_key: string
 }
 
 /** A skill result from the multi-provider discover endpoint. */
@@ -401,9 +645,11 @@ export interface McpCustomSpec {
   args?: string[]
   env?: Record<string, string>
   url?: string
+  /** Authorable on remote (url) specs; read responses redact every stored value. */
+  headers?: Record<string, string>
 }
 
-/** GET /api/mcp/custom/{name} — full editable spec (env included). */
+/** GET /api/mcp/custom/{name} — editable spec; header values are redacted. */
 export interface McpCustomSpecResponse {
   name: string
   spec: McpCustomSpec
@@ -422,15 +668,38 @@ export interface McpScopePresence {
 export interface McpServer {
   name: string; command: string; args?: string[]
   url?: string
+  /** Header names are preserved, but read responses redact every value. */
+  headers?: Record<string, string>
   status: string; error?: string; tools?: string[]
   source: string; enabled: boolean; disabledTools?: string[]
+  /** How status/tools were established: "handshake" (real spawn + tools/list)
+   *  or "declared" (managed server's static declaration — nothing verified it
+   *  can start). Absent on older runtimes. */
+  probeMode?: string
+  /** Wall-clock seconds of the probe that produced `status`; 0/absent = never probed. */
+  probedAt?: number
   presence?: McpScopePresence
+  /** True when the last probe met a recognisable OAuth challenge. Absent means
+   *  the probe learned nothing about authorization — NOT that none is needed,
+   *  so it must not be rendered as "no sign-in required". */
+  authChallenge?: boolean
+  /** Whether the kiro-cli runtime already holds a grant for this url. Only sent
+   *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
+   *  wording is gated on an explicit `false`. */
+  authGrantPresent?: boolean
   /** Optional status-enrichment fields supplied by newer runtimes. */
   accountLabel?: string
   connectedSince?: string
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Consecutive failed probes on record. Absent means none — a healthy server
+   *  carries neither this nor `quarantined`. */
+  probeFailures?: number
+  /** True when those failures crossed the threshold and the server is no longer
+   *  mounted into new sessions. Distinct from `enabled`, which is the user's own
+   *  choice and is never overwritten by this. */
+  probeFailing?: boolean
 }
 
 export interface McpApplyChange {
@@ -478,18 +747,64 @@ export interface TodoList {
   current: string
 }
 
+/**
+ * What ONE agent session's MCP servers reported while starting.
+ *
+ * Distinct from every other MCP payload in the dashboard: `/api/mcp/active`
+ * reads an agent spec off disk and `/api/mcp/probe` records whether the gateway
+ * itself can start a server. Both answer a question about the host. This is the
+ * only one that answers "what did THIS session actually mount".
+ *
+ * Two properties callers must respect:
+ * - A name absent from every bucket means *no report yet*, never *not mounted*:
+ *   the backend's init drain is time bounded and a late frame still arrives.
+ * - The buckets are a SUPERSET of `configured`, because the backend also starts
+ *   the agent spec's own servers, not just the ones Kiro Crew injects.
+ */
+export interface McpSessionReport {
+  /** Server names Kiro Crew put on the wire for this session. */
+  configured: string[]
+  /** Reported initialized. */
+  ready: string[]
+  /** Reported a startup failure. */
+  failed: string[]
+  /** Asked for authorization and has not reported since. */
+  awaiting_auth: string[]
+  /** Server name -> its redacted failure reason, when one was reported. */
+  failures: Record<string, string>
+}
+
 export interface SessionLink {
   channel: string
   label: string
   target: string
   /**
-   * `origin` — the conversation started on that channel (read-only).
+   * `origin` — the conversation the session started on.
    * `out`    — dashboard replies are mirrored there (one-way, from `!link`).
    * `both`   — a session-RESUME binding from an in-channel `!sessions` pick:
    *            replies go there AND messages from there land in this session.
+   *
+   * Provenance only. It does NOT decide whether a row is operable — an `origin`
+   * row carries a disconnect control like any other (see `paused`). One channel
+   * can also carry TWO rows at once (born there AND mirrored there), so
+   * `channel` alone does not identify a row; pair it with origin-ness.
    */
   direction: 'origin' | 'out' | 'both'
   live: boolean
+  /**
+   * The user disconnected this channel: turn output stops flowing there, but the
+   * binding is retained so a reply in that conversation resumes the same session.
+   * Distinct from `live`, which reports whether the transport *can* send at all —
+   * a disconnected channel on a healthy transport is still `live`.
+   *
+   * Set on every row including `origin`, because the conversation a session was
+   * born in can be disconnected too. `direction` records provenance only; it does
+   * not decide whether a row has a control.
+   *
+   * Optional because a browser holding a `slots` payload cached from before this
+   * field shipped has links without it; absent reads as connected.
+   */
+  paused?: boolean
 }
 
 export interface ConfiguredChannelTarget {
@@ -501,7 +816,28 @@ export interface ConfiguredChannelTarget {
 }
 
 export interface ChatSlot {
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  /** The agent that will actually answer, when it is NOT the requested `agent`;
+   *  "" / absent means nothing to report. The backend stores `agent` verbatim
+   *  (the user's intent) and reports the divergence here instead of rewriting it,
+   *  and it reports "" rather than guessing whenever resolution is unsettled — so
+   *  a consumer must treat absent as "no news", never as a mismatch. */
+  effective_agent?: string
+  /** The backend's verdict on whether the live session can run `model`:
+   *  `true` it cannot (the spawn withheld the pin and the session is on the
+   *  backend default), `false` it can, `null`/absent NOT KNOWN YET — no session
+   *  has advertised a comparable list for this pin.
+   *
+   *  Consumers must fail open on the unknown state (`displayModel` does): it is
+   *  the absence of an answer, never a denial. DISPLAY only — the pin is
+   *  deliberately kept when withheld, so this must not drive a write. */
+  model_withheld?: boolean | null
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
+   * | "system"; absent/"" for untagged background slots). The session-pulse
+   * survey shows only on a "user" slot, so an imported Slack thread, a
+   * task-runner slot, or an app/cron-minted session (which can share the
+   * `chat-<n>-<ts>` key shape) never triggers it. */
+  origin?: string
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -510,6 +846,16 @@ export interface ChatSlot {
   webapp_metadata?: WebAppMetadata
   // Board fields
   has_options?: boolean; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
+  /** An unanswered question card the turn is parked on, so the row would
+   * otherwise read "Thinking…" with nothing able to advance it. Narrower than
+   * `waiting_for_input` (true of every finished turn, and therefore no signal)
+   * and separate from `pending_approval` (a tool gate). */
+  needs_input?: boolean
+  /** The transcript shows the last turn ending without a reply (trailing error
+   * row or unanswered user row) — the state behind the composer's Resume
+   * button. Always false while `running`. Lets the sidebar stop rendering a
+   * goal-loop session as actively working when it is actually stalled. */
+  interrupted?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
   /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
@@ -519,6 +865,16 @@ export interface ChatSlot {
   wait_state?: { wait_id: string; seconds: number; deadline_ts: number } | null
   /** Agent TODO list. Null/absent = the todo tool was never used in this slot. */
   todo?: TodoList | null
+  /**
+   * What this slot's agent session reported about its own MCP servers.
+   *
+   * Null/absent means this slot has no session that reported — render that as
+   * absence of knowledge, NOT as "no servers". It is deliberately separate from
+   * `/api/mcp/active` and `/api/mcp/probe`, which answer questions about the
+   * HOST (what an agent spec declares, what the gateway can start) rather than
+   * about this session.
+   */
+  mcp_report?: McpSessionReport | null
 }
 
 export interface PullRequestCommit {
@@ -586,9 +942,28 @@ export interface IssueComment {
   id: string; author: string; body: string; createdAt: string; url: string
 }
 
+/** Which source system an extracted link, issue, or pull request belongs to.
+ *
+ *  The three built-ins are spelled out so they still autocomplete and so a
+ *  `provider === 'github'` narrowing keeps working, but the type is OPEN: a
+ *  downstream edition registers its own provider through
+ *  `registerSourceProvider` (see `utils/pullRequestLinks`) and its id then flows
+ *  through these payloads unchanged. `(string & {})` is the standard way to widen
+ *  a literal union without collapsing it to `string` in editor completions.
+ *
+ *  Declared here rather than in `utils/pullRequestLinks` so the payload types
+ *  never have to import from a util (which imports `ChatMessage` from this
+ *  module); `PullRequestProvider` there is an alias of this. */
+export type SourceProviderId = 'github' | 'gitlab' | 'jira' | (string & {})
+
 /** A pull request / merge request the provider reports as linked to the issue. */
+/** A linked change: a pull request (GitHub/GitLab) or a linked issue (Jira). */
 export interface IssueLinkedChange {
-  provider: 'github' | 'gitlab'; url: string; number: number; title: string; state: string
+  provider: SourceProviderId; url: string; number: number; title: string; state: string
+  /** Jira link relationship label (e.g. "blocks", "is blocked by"). */
+  relation?: string
+  /** Full Jira issue key (e.g. "PROJ-123"). */
+  issueKey?: string
 }
 
 /** Reaction tallies. Null on providers (or issues) that report none. */
@@ -598,7 +973,7 @@ export interface IssueReactions {
 }
 
 export interface IssueSource {
-  provider: 'github' | 'gitlab'
+  provider: SourceProviderId
   /** Always the validated request url, never the provider's echo of it. */
   url: string
   number: number
@@ -626,8 +1001,18 @@ export interface IssueSource {
   partialSections?: string[]
 }
 
+/** A single contributor to an app's source repository (GitHub only, v1).
+ *  Names and avatar URLs are provider-controlled — render as text / <img>. */
+export interface AppContributor {
+  login: string
+  /** Display name, falling back to the login when the profile has none. */
+  name: string
+  avatarUrl: string
+  profileUrl: string
+}
+
 export interface PullRequestSource {
-  provider: 'github' | 'gitlab'; url: string; number: number; title: string
+  provider: SourceProviderId; url: string; number: number; title: string
   description: string; state: string; draft: boolean; mergedAt: string; updatedAt: string
   headBranch: string; baseBranch: string; headSha: string; author: string
   additions: number; deletions: number; changedFiles: number
@@ -645,6 +1030,9 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
+   *  this folder. Absent = no tags, mirroring the optional `color`. */
+  tags?: string[]
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
@@ -655,8 +1043,19 @@ export interface ChatTag {
 
 export type TagColumnMode = 'any' | 'all' | 'none'
 
+/** Derived board lane a session can be in. Mirrors `_VALID_STATE_KEYS` in
+ *  `dashboard/chat_tags.py`, which refuses a column naming anything else. The
+ *  rules that map a slot onto one of these live in `pages/chat/sessionLane.ts`. */
+export type SessionLaneKey = 'needs_approval' | 'waiting' | 'working' | 'idle'
+
+/** A board column filters either by tags or by the session's live runtime lane.
+ *  `source` is absent on every column persisted before lanes existed, so a
+ *  missing value MUST be read as `'tags'`. A `'state'` column carries a
+ *  `state_key` and ignores `tag_ids`/`mode`/`include_untagged` entirely. */
 export interface TagColumn {
   id: string; name: string; tag_ids: string[]; mode: TagColumnMode; order: number; include_untagged?: boolean
+  source?: 'tags' | 'state'
+  state_key?: SessionLaneKey | ''
 }
 
 export interface ChatMessage {
@@ -677,11 +1076,37 @@ export interface ChatMessage {
 
 export interface SubagentActivity {
   id: string; task: string; agent: string
+  /** Model the live session actually resolved to serve, '' when unknown. Folded
+   *  from the `model` field on the `subagent_spawn`/`subagent_done`/snapshot WS
+   *  frames; shown beside the agent pill in the Subagents panel so a model-pinned
+   *  run's real model is visible (#3582). */
+  model?: string
+  /** The model pin the caller REQUESTED for this subagent (the `requested_model`
+   *  field on spawn/snapshot frames). Present only when the caller supplied a pin;
+   *  compared against `model` via `isModelDowngrade` to render the amber chip on
+   *  the live card (#5326). */
+  requestedModel?: string
+  /** The sub-agent's OWN session key, where it writes its per-turn context
+   *  rows. Carried on the `subagent_spawn`/`subagent_done`/snapshot frames
+   *  (backend `conversation_key or subagent:<id>`). The Session Breakdown tree
+   *  uses it to fetch this node's own context-trace so each node shows the
+   *  composition of ITS window, not the parent's. Absent for native cards. */
+  childSession?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
+  /** Seconds of no stream activity measured when the reaper raised `stalled`
+   *  (the `idle_secs` the backend already sends with `subagent_stalled`).
+   *  Distinct from `elapsed` (total runtime): only the idle span justifies the
+   *  warning, so the card shows this rather than making the user infer it. */
+  idleSecs?: number
+  /** Client clock when that stall frame arrived. The backend emits `idle_secs`
+   *  ONCE, on the not-stalled→stalled transition, so this is what lets the row
+   *  advance the figure instead of freezing it beside a live elapsed counter —
+   *  while `stalled` holds there is by definition no activity to reset it. */
+  stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
   approval_id?: string
   approving?: boolean
@@ -699,6 +1124,7 @@ export interface ToolActivity {
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
   ts: number
+  execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
   approval_id?: string  // pending approval ID
   approval_type?: string // 'chat' or 'spawn'
@@ -743,15 +1169,6 @@ export interface NotificationChannel {
   default_priority: string | null
   protected: boolean
   settings: { muted?: boolean; priority?: string }
-}
-
-export interface SecretaryItem {
-  id: string; channel: string; channel_name: string
-  thread_ts: string | null; message: string
-  sender_id: string; sender_name: string
-  thread_context: { sender: string; text: string }[]
-  classification: string; draft: string; confidence: string
-  status: string; created_at: number; context_summary?: string
 }
 
 export interface PendingApproval {
@@ -1089,6 +1506,35 @@ export interface WebAppTeardown {
   method: string;
   handle: string;
   reversible: boolean;
+}
+
+/** One row of `GET /api/workflows/runs` — the compact run view (no events).
+ *
+ *  This is the AUTHORITATIVE status of a dynamic-workflow run: the live
+ *  `workflow_run_event` WS stream is one-shot, so a client that was closed,
+ *  asleep, or disconnected when a run ended never sees its terminal frame.
+ *  Field names are the backend's (`RunHandle.snapshot`), snake_case on the wire.
+ */
+export interface WorkflowRunSummary {
+  run_id: string;
+  name?: string;
+  /** `running` | `finished` | `failed` | `cancelled`. Typed loosely on purpose —
+   *  an unrecognised value is treated as "no evidence" rather than coerced. */
+  status?: string;
+  error?: string | null;
+  /** Originating chat session, `""` for a UI-launched run that belongs to no chat. */
+  session_key?: string;
+  source_format?: 'python' | 'task-plan';
+  driver?: 'workflow' | 'taskrunner' | string;
+  task_id?: string;
+  capabilities?: string[];
+  workflow_id?: string;
+  workflow_slug?: string;
+  workflow_revision?: number;
+  /** Title of the most recent `phase_started` event. */
+  phase?: string;
+  /** Most recent narrator `log` message. */
+  last_log?: string;
 }
 
 export interface WebAppMetadata {
