@@ -4662,6 +4662,8 @@
         "drive_upload": "업로드",
         "drive_uploading": "업로드 중…",
         "drive_bad_name": "이 파일 이름에는 드라이브가 저장할 수 없는 문자가 있습니다. 이름을 바꾼 뒤 다시 시도하세요.",
+        "drive_bad_name_named": "‘{{name}}’을(를) 업로드할 수 없습니다. 이름에 드라이브가 저장할 수 없는 문자가 있습니다. 이름을 바꾼 뒤 다시 시도하세요.",
+        "drive_upload_failed": "‘{{name}}’ 업로드에 실패했습니다. 다시 시도하세요.",
         "section_files": "파일",
         "section_library": "라이브러리",
         "section_backup": "백업",
@@ -4749,7 +4751,10 @@
         "library_actions": "라이브러리 항목 작업",
         "library_remove_action": "사본 제거",
         "library_removing": "제거 중…",
-        "library_remove_failed": "제거하지 못했습니다. 클라우드 사본은 그대로입니다. 다시 시도하세요."
+        "library_remove_failed": "제거하지 못했습니다. 클라우드 사본은 그대로입니다. 다시 시도하세요.",
+        "move_conflict": "대상 폴더에 같은 이름의 파일이 이미 있습니다.",
+        "move_shared": "이 파일에는 유효한 공유 링크가 있습니다. 이동하면 링크가 끓어집니다. 공유를 제거하거나 만료될 때까지 기다린 뒤 다시 시도하세요.",
+        "move_failed": "파일을 이동하지 못했습니다. 다시 시도하세요."
       },
       "page": {
         "totals_summary": "계정 {{accounts}}개 · 키 {{keys}}개 · 정상 {{healthy}}개",
@@ -5350,7 +5355,9 @@
       "auto_compact_threshold": "자동 압축 임계값",
       "auto_compact_load_failed": "자동 압축 설정을 불러오지 못했습니다",
       "reset_to_global": "전역 설정으로 재설정 ({{pct}}%)",
-      "following_global": "전역 설정 따름 ({{pct}}%)"
+      "following_global": "전역 설정 따름 ({{pct}}%)",
+      "sketch": "스케치",
+      "sketch_desc": "스케치를 그리기. 이미지와 편집 가능한 원본을 첨부합니다"
     },
     "chatPane": {
       "agent_list": "에이전트 목록",
@@ -5378,7 +5385,9 @@
       "redaction_failed_retry": "마스킹 실패 — 다시 시도",
       "send_selection_to_chat": "선택 항목을 채팅으로 전송",
       "send_to_chat": "채팅으로 전송",
-      "sending": "전송 중…"
+      "sending": "전송 중…",
+      "touch_select_anchor": "첫 지점 설정됨 — 반대쪽 끝을 탭하세요",
+      "touch_select_done": "범위 선택됨 — 복사를 탭하세요"
     },
     "codeBlock": {
       "copied": "복사했습니다!",
@@ -5679,8 +5688,10 @@
       "no_matches_enter_sends": "일치하는 파일이 없습니다 — Enter 키를 누르면 메시지가 전송됩니다",
       "open_in_viewer": "뷰어에서 열기",
       "remove_folder": "폴더 제거",
-      "searching": "검색 중…",
-      "type_2_chars_to_search_files": "파일 및 폴더를 검색하려면 2자 이상 입력하세요…"
+      "searching_ctrl_enter_held": "검색 중… — Ctrl+Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
+      "searching_enter_held": "검색 중… — Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Enter 키를 누르면 메시지가 전송됩니다",
+      "type_2_chars_to_search_files_ctrl_enter_held": "파일 및 폴더를 검색하려면 2자 이상 입력하세요… — Ctrl+Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
+      "type_2_chars_to_search_files_enter_held": "파일 및 폴더를 검색하려면 2자 이상 입력하세요… — Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Enter 키를 누르면 메시지가 전송됩니다"
     },
     "fileRenderers": {
       "download": "다운로드",
@@ -6935,8 +6946,8 @@
       "title": "신뢰하는 프로젝트 폴더"
     },
     "skillPickerMenu": {
-      "loading_skills_ctrl_enter_held": "스킬을 불러오는 중… — Ctrl+Enter 키로는 아직 전송되지 않습니다. 전송 버튼을 사용하세요",
-      "loading_skills_enter_held": "스킬을 불러오는 중… — Enter 키로는 아직 전송되지 않습니다. 전송 버튼을 사용하세요",
+      "loading_skills_ctrl_enter_held": "스킬을 불러오는 중… — Ctrl+Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
+      "loading_skills_enter_held": "스킬을 불러오는 중… — Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Enter 키를 누르면 메시지가 전송됩니다",
       "no_matching_skills": "일치하는 스킬 없음",
       "no_matching_skills_ctrl_enter_sends": "일치하는 스킬 없음 — Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
       "no_matching_skills_enter_sends": "일치하는 스킬 없음 — Enter 키를 누르면 메시지가 전송됩니다",
@@ -6982,7 +6993,8 @@
       "desc_tools": "사용할 수 있는 도구를 표시합니다",
       "desc_usage": "청구 및 사용량 정보를 표시합니다",
       "desc_workflow": "저장된 워크플로를 이름으로 나열하거나 실행합니다",
-      "loading_commands": "명령을 불러오는 중…",
+      "loading_commands_ctrl_enter_held": "명령을 불러오는 중… — Ctrl+Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
+      "loading_commands_enter_held": "명령을 불러오는 중… — Enter 키로는 아직 전송되지 않습니다. Esc 키를 누른 뒤 Enter 키를 누르면 메시지가 전송됩니다",
       "no_matching_commands_ctrl_enter_sends": "일치하는 명령 없음 — Ctrl+Enter 키를 누르면 메시지가 전송됩니다",
       "no_matching_commands_enter_sends": "일치하는 명령 없음 — Enter 키를 누르면 메시지가 전송됩니다"
     },
@@ -7030,7 +7042,7 @@
       "copy": "복사",
       "copy_failed": "복사 실패",
       "copy_needs_https": "복사하려면 보안(HTTPS) 연결이 필요합니다",
-      "copy_no_selection": "선택을 누른 다음 복사하세요",
+      "copy_no_selection": "줄을 길게 누르거나 선택을 탭한 다음 복사하세요",
       "copy_done": "복사됨",
       "copy_permission_needed": "클립보드 액세스를 허용하세요",
       "paste": "붙여넣기",
@@ -7560,6 +7572,18 @@
       "path_copied": "경로 복사됨",
       "reveal_blocked": "이 경로는 보호되어 있어 열 수 없습니다.",
       "reveal_failed": "{{productName}}이(가) 실행 중인 컴퓨터에서 이 경로를 열 수 없습니다."
+    },
+    "sketchDialog": {
+      "title": "스케치 패드",
+      "draw_something_first": "먼저 무언가를 그려 보세요",
+      "loading": "스케치 패드 불러오는 중…",
+      "export_failed": "스케치를 내보내지 못했습니다. 다시 시도해 주세요",
+      "insert_hint": "이미지와 함께 크루가 데이터로 읽을 수 있는 편집 가능한 원본 파일을 첨부합니다",
+      "attach_to_message": "메시지에 첨부",
+      "new_sketch": "새 스케치",
+      "confirm_discard": "그림 삭제",
+      "already_attached": "첨부됨 — 캔버스를 편집하면 다시 스케치할 수 있습니다",
+      "load_failed": "스케치 패드를 불러오지 못했습니다. 연결을 확인하고 다시 열어 주세요"
     }
   },
   "hooks": {
@@ -8337,6 +8361,10 @@
       "pop_out_into_its_own_window": "별도 창으로 분리",
       "pop_out_to_window": "창으로 분리",
       "preview": "미리 보기: {{slug}}",
+      "promote_slug_taken_title": "다른 주소로 저장됨",
+      "promote_slug_taken_body": "해당 이름이 이미 사용 중이어서 문서가 ‘{{slug}}’(으)로 저장되었습니다. ‘{{taken}}’에는 이전 아티팩트가 그대로 남아 있습니다.",
+      "promote_slug_taken_open": "‘{{slug}}’ 열기",
+      "promote_slug_taken_open_older": "이전 ‘{{taken}}’ 열기",
       "published": "게시됨 ({{visibility}})",
       "published_sync_issue": "게시됨 (동기화 문제)",
       "remove_artifact_confirm": "라이브러리에서 아티팩트 ‘{{slug}}’을(를) 제거하시겠습니까?\n\n아티팩트 항목과 버전 기록이 삭제됩니다. 이 아티팩트가 디스크의 파일이나 채팅 위젯에서 온 것이라면 원본은 건드리지 않습니다 — 나중에 다시 추가할 수 있습니다.",
@@ -8559,7 +8587,8 @@
         "needs_earlier_history": "선택하면 이전 기록을 다음 페이지만큼 불러옵니다",
         "more_actions": "추가 작업",
         "needs_active_chat": "이 채팅이 완전히 열리면 사용할 수 있습니다",
-        "needs_earlier_history_count_other": "선택하면 이전 기록을 불러옵니다 — 이전 메시지 {{count}}개가 남아 있습니다"
+        "needs_earlier_history_count_other": "선택하면 이전 기록을 불러옵니다 — 이전 메시지 {{count}}개가 남아 있습니다",
+        "share_message": "이미지로 공유"
       },
       "chatFooter": {
         "compacting": "압축 중…",
@@ -9005,6 +9034,32 @@
       },
       "deepLink": {
         "message_unavailable": "이 메시지는 이 대화에 더 이상 없습니다."
+      },
+      "share": {
+        "title": "소셜 미디어에 공유",
+        "description": "이 답변을 어디든 게시할 수 있는 공유 카드로 만듭니다.",
+        "preview_label": "카드 미리보기",
+        "edit_hint": "카드 텍스트를 클릭하면 편집할 수 있습니다",
+        "card_footer": "{{productName}}(으)로 제작",
+        "include_question": "내 질문 포함",
+        "caption_label": "게시물 텍스트",
+        "caption_template": "{{productName}}이(가) 또 멋진 일을 해냈어요 {{link}} #AIAgent",
+        "char_count": "{{count}} / {{limit}} (X 제한)",
+        "download_png": "PNG 다운로드",
+        "copy_image_text": "이미지+텍스트 복사",
+        "share_on_x": "X에 공유",
+        "share_on_linkedin": "LinkedIn에 공유",
+        "copied": "복사됨 — 게시창에 이미지를 붙여넣으세요",
+        "copy_unavailable": "클립보드를 사용할 수 없어 이미지를 다운로드했습니다",
+        "intent_hint": "게시창이 텍스트가 입력된 채 열립니다. 복사한 이미지를 붙여넣으면 카드가 첨부됩니다.",
+        "kind_aws_key": "AWS 액세스 키",
+        "kind_token": "API 토큰",
+        "kind_private_key": "개인 키",
+        "kind_local_path": "로컬 파일 경로",
+        "kind_internal_url": "내부 URL",
+        "card_wordmark": "{{productName}}",
+        "sensitive_in_card": "공유 전 확인하세요 — 카드에 다음이 포함되어 있습니다: {{kinds}}",
+        "sensitive_in_caption": "공유 전 확인하세요 — 게시물 텍스트에 다음이 포함되어 있습니다: {{kinds}}"
       }
     },
     "chatPage": {
@@ -9326,6 +9381,7 @@
     "connectionsPage": {
       "action_failed": "작업에 실패했습니다: {{error}}",
       "authorize": "인증하기",
+      "before_you_connect": "연결하기 전에",
       "cancel": "취소",
       "complete_connection": "완료",
       "connect": "연결",
@@ -9363,6 +9419,10 @@
       "not_verified_help": "{{productName}}은(는) {{provider}}의 인증 상태를 확인할 수 없습니다. 토큰은 Kiro CLI가 보관합니다. 에이전트가 이미 호출할 수 있다면 정상 작동 중이며, 그렇지 않다면 아직 인증이 필요합니다.",
       "official_mcp_server": "공식 MCP 서버",
       "open_managed_connection": "{{provider}} 연결 카드 열기",
+      "prerequisite_atlassian": "Jira 또는 Confluence 사이트가 있는 Atlassian 계정이 필요합니다. 없으면 동의 페이지의 Accept 버튼이 비활성화된 상태로 유지됩니다.",
+      "prerequisite_gitlab": "GitLab Duo를 베타 및 실험적 기능과 함께 활성화하고 최상위 그룹에 대해 MCP 서버 액세스를 허용하세요. 이 설정이 없으면 연결은 성공하지만 도구가 제공되지 않습니다.",
+      "prerequisite_gitlab_steps": "GitLab Duo를 베타 및 실험적 기능과 함께 활성화하고 최상위 그룹에 대해 MCP 서버 액세스를 허용하세요.",
+      "prerequisites_for_provider": "{{provider}} 사전 요구 사항",
       "reconnect": "다시 연결",
       "reconnecting": "다시 연결 중…",
       "relaying": "전송 중…",

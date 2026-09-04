@@ -125,6 +125,7 @@ from kiro_crew.dashboard.state import (
     DENY_CAUSE_POLICY,
     HOOK_CONTINUATION_RECOVERY_PREFIX,
     HOOK_HALTED_RECOVERY_PREFIX,
+    MONITOR_WAKE_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
     NATIVE_SUBAGENT_DONE_TRUNC_MARKER,
     NATIVE_SUBAGENT_OUTPUT_HARD,
@@ -4332,6 +4333,19 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         _did = getattr(slot, "_steer_delivery_ids", {}).pop(steer_msg, "")
         if _did:
             _meta["steer_delivery_id"] = _did
+        # Carry the client's `sendId` the same way, for the same reason one step
+        # further on (#6751). The drain unions this meta onto the row it writes, so
+        # this is what gives a REQUEUED steer's row the `meta.sendId` an ACCEPTED
+        # steer's row already gets from `steer_into_running_turn` -- without it the
+        # row is id-less, `mergePreservedThinking` has no id to resolve the
+        # optimistic bubble against, and the pre-steer thinking chip strands at the
+        # tail until a reload. Popped in lockstep with the delivery id above so the
+        # two maps never disagree about what is still in flight. Additive: a steer
+        # whose POST carried no id stores nothing here and its entry meta keeps the
+        # exact prior shape.
+        _sid = getattr(slot, "_steer_send_ids", {}).pop(steer_msg, "")
+        if _sid:
+            _meta["sendId"] = _sid
         # Provenance is derivable, not guessed: `steer_into_running_turn` has
         # exactly one caller (the api_chat composer branch), and app isolation
         # confines app-surface requests to app-scoped slots — so every steer
@@ -5949,6 +5963,7 @@ async def _run_chat(
     # Only plain assignments separate this line from the try.
     slot._active_turn_session_key = session_key
 
+    _is_monitor_wake = message.startswith(MONITOR_WAKE_PREFIX)
     _acquired = False
     _mirror_stream_ts: str = ""
     _mirror_chan: str | None = ""
@@ -6734,7 +6749,6 @@ async def _run_chat(
         ):
             await _probe_fallback_restore_for_slot(slot, client)
 
-        event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         state.broadcast_ws("chat_status", {"slot": slot.key, "status": "Thinking…"})
         state.broadcast_ws(
             "activity_event", {"slot": slot.key, "kind": "status", "text": "Thinking…"}
@@ -6816,6 +6830,9 @@ async def _run_chat(
         # first await) are one atomic span, strictly ordered w.r.t. close_all's
         # _closing set. Abort (lease released by the outer finally) if closing.
         try:
+            if monitor_completion is not None:
+                if not await monitor_completion.authorize():
+                    return
             state.sessions.begin_turn(session_key)
         except SessionClosingError:
             logger.info("Aborting dispatch for %s — gateway is shutting down", session_key)
@@ -6838,6 +6855,9 @@ async def _run_chat(
                 session_key,
             )
             return
+        if monitor_completion is not None:
+            monitor_completion.mark_accepted()
+        event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         async for event in event_stream:
             # Heartbeat every 5s during long operations
             if time.time() - last_heartbeat > 5:
@@ -7453,12 +7473,30 @@ async def _run_chat(
                             "(tool_call_id=%s, mcp_server_name=%r, tool_name=%r, "
                             "expected mcp_server_name=%r). Either a forged marker, "
                             "or this ACP backend emits no _meta.kiro identity AND "
-                            "could not reach the gateway to park the payload.",
+                            "could not reach the gateway to park the payload. "
+                            "CLAIM was attempted for session_key=%r selector=%r; "
+                            "that session's queue currently holds %d parked "
+                            "record(s) — a non-zero depth here means a record WAS "
+                            "parked but did not match this frame's (kind, args) or "
+                            "fell outside this turn, while zero means nothing ever "
+                            "reached /api/session-directive for this key.",
                             event.tool_call_id,
                             _seen_tool_identity.get(event.tool_call_id, ("", ""))[0],
                             _seen_tool_identity.get(event.tool_call_id, ("", ""))[1],
                             session_directive.CORE_MCP_SERVER,
+                            session_key,
+                            (_sel_pair[0] if _sel_pair else None),
+                            directive_queue.depth(session_key),
                         )
+                        if _sel_pair is None:
+                            logger.warning(
+                                "session-directive SELECTOR UNREADABLE for %s: the "
+                                "frame carries the marker sentinel but peek() could "
+                                "not turn it into a (kind, args) selector, so no "
+                                "parked record can be named. Reason: %s",
+                                session_key,
+                                session_directive.peek_failure_reason(event.tool_output),
+                            )
                 if not _dir_tool and event.tool_call_id in _dir_consumed_out:
                     # A LATER frame for a directive we already consumed: replay
                     # the output we produced instead of letting the raw marker
@@ -8970,7 +9008,8 @@ async def _run_chat(
                 _native_subagent_close_all(state, slot, _native_tracker, _native_card_output)
                 _u = event.usage
                 if monitor_completion is not None and is_monitor_completion_evidence(
-                    event.stop_reason
+                    event.stop_reason,
+                    synthetic=event.synthetic_completion,
                 ):
                     try:
                         await monitor_completion.complete(
@@ -10063,6 +10102,7 @@ async def _run_chat(
             and not _recovering_promise
             and not _recovering_compaction
             and not _noticed_leak
+            and not _is_monitor_wake
         ):
             _maybe_consolidate(state, slot)
         state.sessions.check_context_usage(session_key, client)

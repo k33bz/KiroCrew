@@ -50,7 +50,11 @@ from typing import Any
 from kiro_crew.apps.builtins.auto_research.session_keys import (
     is_owned_research_slot,
 )
-from kiro_crew.autonudge import APPROVAL_STALL_REASON, AUTONUDGE_STOP_REASON
+from kiro_crew.autonudge import (
+    APPROVAL_STALL_REASON,
+    AUTONUDGE_STOP_REASON,
+    MONITOR_TERMINAL_REASON,
+)
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.session_surface import has_dashboard_surface
 
@@ -158,8 +162,12 @@ async def apply_session_directive(
     try:
         if kind == "monitor_start":
             result = await _monitor_start(state, session_key, args)
+        elif kind == "monitor_watch":
+            result = await _monitor_watch(state, session_key, args)
         elif kind == "monitor_update":
-            result = await _monitor_update(session_key, args)
+            result = await _monitor_update(state, session_key, args)
+        elif kind == "monitor_stop":
+            result = await _monitor_stop(session_key, args)
         elif kind == "autonudge_stop":
             result = await _autonudge_stop(slot, session_key, args)
         elif kind == "set_project":
@@ -175,6 +183,12 @@ async def apply_session_directive(
             return f"Error: unknown session directive {kind!r}."
     except _DirectiveDenied as exc:
         _audit(session_key, kind, "denied")
+        logger.warning(
+            "session-directive DENIED at apply for session_key=%r kind=%r: %s",
+            session_key,
+            kind,
+            exc,
+        )
         return str(exc)
     except Exception as exc:  # never propagate into the turn loop
         logger.warning("apply_session_directive(%s) failed", kind, exc_info=True)
@@ -196,6 +210,12 @@ def _binding(session_key: str) -> str | None:
     from kiro_crew.autonudge import binding_key_for
 
     return binding_key_for(session_key)
+
+
+def _structured_binding(session_key: str) -> str | None:
+    from kiro_crew.autonudge import structured_monitor_binding_key_for
+
+    return structured_monitor_binding_key_for(session_key)
 
 
 async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> str:
@@ -230,6 +250,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         source="mcp-directive",
         caller="session-directive",
         gate=gate,
+        replace_existing=False,
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
@@ -260,8 +281,56 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
     )
 
 
-async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
+async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> str:
     from kiro_crew.autonudge import get_instance
+    from kiro_crew.autonudge_authz import authorize_and_add_nudge
+    from kiro_crew.monitoring.models import MonitorBudgets, MonitorState
+
+    svc = get_instance()
+    if svc is None:
+        raise _DirectiveDenied("Structured monitor NOT armed: auto-nudge is disabled on this host.")
+    binding = _structured_binding(session_key)
+    if not binding:
+        raise _DirectiveDenied("monitor_watch is not supported from this session type.")
+    budgets = MonitorBudgets(
+        max_runtime_secs=int(args["max_runtime_secs"]),
+        max_agent_turns=int(args["max_agent_turns"]),
+        max_tokens=int(args["max_tokens"]),
+        max_provider_errors=int(args["max_provider_errors"]),
+    )
+    monitor = MonitorState(
+        kind=str(args["kind"]),
+        target=str(args["target"]),
+        objective=str(args["objective"]),
+        created_ts=time.time(),
+        budgets=budgets,
+        cadence_secs=int(args["cadence_secs"]),
+        wake_instructions=str(args.get("wake_instructions") or ""),
+    )
+    loop, error, _status = await authorize_and_add_nudge(
+        svc=svc,
+        state=state,
+        slot_key=binding,
+        message=monitor.wake_instructions or "structured monitor",
+        idle_secs=monitor.cadence_secs,
+        max_cycles=0,
+        max_runtime_secs=monitor.budgets.max_runtime_secs,
+        source="mcp-directive",
+        caller="session-directive",
+        replace_existing=False,
+        monitor=monitor,
+    )
+    if error is not None:
+        raise _DirectiveDenied(f"Failed to start structured monitor: {error}")
+    if loop is None:
+        raise _DirectiveDenied(
+            "Failed to start structured monitor: no monitor record was returned."
+        )
+    return f"Structured monitor {loop.id} started on this session."
+
+
+async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) -> str:
+    from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
     from kiro_crew.autonudge_authz import authorize_and_update_nudge
 
     svc = get_instance()
@@ -275,6 +344,26 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
     if not loop:
         raise _DirectiveDenied("No active monitor loop on this session to update.")
     patch = dict(args.get("patch") or {})
+    if is_structured_monitor_loop(loop):
+        if _structured_binding(session_key) != binding:
+            raise _DirectiveDenied("monitor_update is not supported from this session type.")
+        return await _structured_monitor_update(state, svc, loop, patch)
+    structured_only = sorted(
+        set(patch)
+        & {
+            "target",
+            "objective",
+            "max_agent_turns",
+            "max_tokens",
+            "max_provider_errors",
+            "wake_instructions",
+        }
+    )
+    if structured_only:
+        raise _DirectiveDenied(
+            "monitor_update cannot apply structured fields to a legacy loop: "
+            + ", ".join(structured_only)
+        )
     cycle_count = int(getattr(loop, "cycle_count", 0) or 0)
     current_cap = int(getattr(loop, "max_cycles", 0) or 0)
     new_cap = patch.get("max_cycles", current_cap)
@@ -320,16 +409,55 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
         # A budget-raise passed the spent-budget guard above, so any budget in
         # the patch here is beyond the loop's elapsed age (or 0 = unlimited).
         raising_budget = "max_runtime_secs" in patch
-        if stopped_at_cap and raising_cap:
-            patch["active"] = True
-            revived = True
-        elif stopped_at_budget and raising_budget:
+        # A TERMINAL subject outranks every bound, and an OWED terminal turn counts
+        # as one -- the same precedence the expiry notice states, read from the same
+        # two fields, so the agent-facing and user-facing endings cannot disagree.
+        #
+        # A channel-bound loop does not settle on observation: the probe records the
+        # owed final turn in ``monitor.terminal_pending`` and leaves the loop active
+        # with no ``outcome``. If that turn is refused (a busy thread, the ordinary
+        # case) and the retry finds a bound spent, the loop deactivates tagged with
+        # that bound before the settlement that would promote the debt ever runs.
+        # Reading ``stopped_reason`` alone then contradicts a fact already durably on
+        # disk, and here it does more than mis-word a notice: a patch that also
+        # raises the bound REVIVES the loop, re-arming a watch on a subject that has
+        # already merged -- the wasted fresh loop this branch exists to prevent.
+        #
+        # Expressed ONCE, as a term in the revival decision itself, rather than as a
+        # guard per branch: the notice next door lost this same precedence three
+        # times because each new bound was added ahead of it.
+        monitor = getattr(loop, "monitor", None)
+        owed = str(getattr(monitor, "terminal_pending", "") or "") if monitor else ""
+        terminal = reason == MONITOR_TERMINAL_REASON or bool(owed)
+        # A settled outcome wins; the debt is the fallback that keeps the
+        # merged-vs-closed distinction available before the settlement lands. Both
+        # speak the same vocabulary (``success``/``blocked``, matching
+        # ``MonitorOutcome``), so one reading covers either source.
+        settled = getattr(monitor, "outcome", None) if monitor else None
+        decided = str(getattr(settled, "value", settled) or owed or "")
+        revivable = not terminal and (
+            (stopped_at_cap and raising_cap) or (stopped_at_budget and raising_budget)
+        )
+        if revivable:
             patch["active"] = True
             revived = True
         else:
             # Name the bound that actually stopped the loop, so the remedy in
             # the message is the one that will work.
-            if stopped_at_budget:
+            if terminal:
+                if decided == "success":
+                    bound = (
+                        "its subject already merged, so the watch is over and there is "
+                        "nothing left to observe; raising a bound buys cycles with no "
+                        "work in them, so arm monitor_start again only for a NEW subject"
+                    )
+                else:
+                    bound = (
+                        "its subject was closed without merging, so re-arming would only "
+                        "re-observe that; the open question is whether to reopen the "
+                        "subject or abandon the goal, and neither is a bound you can raise"
+                    )
+            elif stopped_at_budget:
                 bound = (
                     f"its {int(getattr(loop, 'max_runtime_secs', 0) or 0)}s wall-clock "
                     "budget ran out; raise max_runtime_secs above the loop's age "
@@ -415,8 +543,96 @@ def _no_loop_message(svc: Any, binding: str) -> str:
     )
 
 
+async def _structured_monitor_update(state: Any, svc: Any, loop: Any, patch: dict[str, Any]) -> str:
+    from kiro_crew.autonudge_authz import authorize_and_update_monitor
+
+    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active"})
+    if legacy_only:
+        raise _DirectiveDenied(
+            "monitor_update cannot apply legacy fields to a structured monitor: "
+            + ", ".join(legacy_only)
+        )
+    monitor_state = loop.monitor
+    if monitor_state is None:
+        raise _DirectiveDenied("No structured monitor on this session to update.")
+    structured: dict[str, Any] = {}
+    if "target" in patch:
+        structured["target"] = str(patch["target"])
+    if "objective" in patch:
+        structured["objective"] = str(patch["objective"])
+    if "idle_secs" in patch:
+        structured["cadence_secs"] = int(patch["idle_secs"])
+    if "wake_instructions" in patch:
+        structured["wake_instructions"] = str(patch["wake_instructions"])
+    budget_fields = {
+        "max_runtime_secs",
+        "max_agent_turns",
+        "max_tokens",
+        "max_provider_errors",
+    }
+    if budget_fields & set(patch):
+        values = {field: int(patch[field]) for field in budget_fields if field in patch}
+        if any(value <= 0 for value in values.values()):
+            raise _DirectiveDenied("structured monitor budgets must be positive")
+        structured["budget_patch"] = values
+    updated, error, _status = await authorize_and_update_monitor(
+        svc=svc,
+        state=state,
+        loop_id=loop.id,
+        session_key=loop.slot_key,
+        patch=structured,
+        source="mcp-directive",
+        caller="session-directive",
+    )
+    if error is not None:
+        raise _DirectiveDenied(f"Failed to update structured monitor: {error}")
+    if updated is None:
+        raise _DirectiveDenied(
+            "Failed to update structured monitor: no monitor record was returned."
+        )
+    return f"Structured monitor {updated.id} updated on this session."
+
+
+def _structured_stop_reason(args: dict[str, Any]) -> str:
+    from kiro_crew.monitoring.models import MAX_MONITOR_STOP_REASON_CHARS
+    from kiro_crew.security import redact_and_truncate
+
+    return redact_and_truncate(
+        str(args.get("reason") or "").strip(),
+        max_chars=MAX_MONITOR_STOP_REASON_CHARS,
+    )
+
+
+async def _monitor_stop(session_key: str, args: dict[str, Any]) -> str:
+    from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
+    from kiro_crew.autonudge_authz import authorize_and_stop_monitor
+
+    svc = get_instance()
+    if svc is None:
+        raise _DirectiveDenied("Monitor was not stopped: auto-nudge is disabled on this host.")
+    binding = _structured_binding(session_key)
+    if not binding:
+        raise _DirectiveDenied("monitor_stop is not supported from this session type.")
+    loop = svc.get_by_slot(binding)
+    if loop is None or not is_structured_monitor_loop(loop):
+        return "No structured monitor to stop on this session."
+    stopped, error, _status = await authorize_and_stop_monitor(
+        svc=svc,
+        loop_id=loop.id,
+        session_key=loop.slot_key,
+        source="mcp-directive",
+        caller="session-directive",
+        user_reason=_structured_stop_reason(args),
+    )
+    if error is not None:
+        raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
+    if stopped is None:
+        raise _DirectiveDenied("Failed to stop structured monitor: no monitor record was returned.")
+    return f"Structured monitor {stopped.id} stopped and retained for inspection."
+
+
 async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> str:
-    from kiro_crew.autonudge import get_instance
+    from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
 
     svc = get_instance()
     # "Nothing to stop" is an IDEMPOTENT success — the goal (no loop running on
@@ -433,14 +649,27 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
     if not loop:
         return _no_loop_message(svc, binding)
     loop_id = loop.id
-    reason = str(args.get("reason") or "").strip()
+    reason = _structured_stop_reason(args)
     # Research Lab consumes a persisted stop record to distinguish deliberate
     # completion from unreachable-session cleanup. The canonical name is not
     # ownership evidence: users may give an ordinary dashboard slot the same
     # shape, while the slot's persisted app provenance cannot be user-selected.
     # Ordinary dashboard/channel monitors have no tombstone consumer, so retain
     # their historical removal behavior instead of leaving a paused loop.
-    if is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
+    if is_structured_monitor_loop(loop):
+        from kiro_crew.autonudge_authz import authorize_and_stop_monitor
+
+        _loop, error, _status = await authorize_and_stop_monitor(
+            svc=svc,
+            loop_id=loop_id,
+            session_key=loop.slot_key,
+            source="mcp-directive",
+            caller="autonudge-stop-compat",
+            user_reason=_structured_stop_reason(args),
+        )
+        if error is not None:
+            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
+    elif is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
         await svc.remove(loop_id)

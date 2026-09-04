@@ -64,6 +64,7 @@ this area is reached from inside it unless stated otherwise.
 | Session folders | User-defined folders grouping session rows | Sidebar folder header → drag a row | `pages/chat/FolderPanel.tsx` | `chat_folders.py` | `GET,POST /api/chat/folders`, `PATCH /api/chat/slots/{slot}/folder` |
 | Session tags | Colored labels on sessions, filterable | Sidebar row context menu → Tags | `pages/chat/SessionFlyout.tsx` | `chat_tags.py` | `GET,POST /api/chat/tags`, `PUT /api/chat/slots/{slot}/tags` |
 | Pinned messages | Pin a message; pins panel per session | Message hover → pin; header pin count | `pages/chat/PinnedMessagesPanel.tsx` | `chat_pins.py` | `GET,POST /api/chat/pins`, `DELETE /api/chat/pins/{id}` |
+| Share message as card | Turn an assistant reply into a branded PNG card + prefilled caption for X/LinkedIn | Message hover → More actions → Share as image | `pages/chat/share/ShareMessageModal.tsx`, `pages/chat/share/ShareCard.tsx` (helpers: `pages/chat/share/shareSupport.ts`) | — (client-side only) | — |
 | Fork a session | Branch a new slot from an existing transcript | Session row menu → Fork | `pages/ChatSidebar.tsx` | `chat_fork.py` | `POST /api/chat/slots/{slot}/fork` |
 | Rewind | Drop the transcript back to an earlier turn | Message action → Rewind | `pages/chat/AssistantMessage.tsx` | `chat_rewind.py` | `POST /api/chat/slots/{slot}/rewind` |
 | Regenerate / variants | Re-run a turn, keep and switch between answers | Message action → Regenerate | `pages/chat/AssistantMessage.tsx` | `chat_regenerate.py` | `POST /api/chat/slots/{slot}/regenerate`, `.../switch-variant`, `.../edit-resend` |
@@ -124,7 +125,7 @@ Settings → Overview; the graph visualizer is a Developer internals view.
 | Feature | What it is | Reach it | Page | Handler | Endpoints |
 |---|---|---|---|---|---|
 | Schedule | Cron jobs: recurring agent turns, scripts, commands | `/schedule` — rail **Schedule** | `pages/SchedulePage.tsx` | `handlers/cron.py` | `GET,POST /api/crons`, `DELETE /api/crons/{job_id}`, `GET /api/crons/history` |
-| Monitor loops | Same-session nudge loops watching an external thing | Chat header → loop popover; agent-armed | `components/AutoNudgePopover.tsx` | `handlers/autonudge.py` | `GET,POST /api/autonudge`, `PATCH,DELETE /api/autonudge/{loop_id}`, `GET /api/autonudge/slot/{slot_key}` |
+| Monitor loops | Same-session bounded monitors and legacy nudge loops watching an external thing | Agent/API for bounded monitors; Chat header → legacy loop popover | `components/AutoNudgePopover.tsx` | `handlers/autonudge.py` | `GET,POST /api/monitors`, `PATCH /api/monitors/{id}`, `GET /api/monitors/slot/{slot_key}`, `POST /api/monitors/{id}/stop`, `POST /api/monitors/{id}/restart`, `GET,POST /api/autonudge`, `PATCH,DELETE /api/autonudge/{loop_id}` |
 | Session ledger | Durable per-session work state surviving compaction | Agent-written; no dashboard page | — | `handlers/session_ledger.py` | `GET /api/session-ledger`, `POST /api/session-ledger/record` |
 | Session control | Create / stop / send-to a session from outside it | Agent and app callers, not a UI | — | `session_control.py` | `POST /api/session-control/create`, `.../stop`, `.../send`, `GET .../read` |
 

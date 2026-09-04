@@ -1265,6 +1265,10 @@
       "setup_timeout": "Phone access did not reach a ready state. Re-check the setup, then try again."
     },
     "filePickerMenu": {
+      "type_2_chars_to_search_files_enter_held": "Type 2+ chars to search files and folders… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "type_2_chars_to_search_files_ctrl_enter_held": "Type 2+ chars to search files and folders… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "searching_enter_held": "Searching… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "searching_ctrl_enter_held": "Searching… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
       "no_matches_ctrl_enter_sends": "No matching files — Ctrl+Enter sends the message",
       "no_matches_enter_sends": "No matching files — Enter sends the message"
     },
@@ -1482,7 +1486,9 @@
       "redaction_failed_retry": "Redaction failed — retry",
       "send_selection_to_chat": "Send selection to chat",
       "send_to_chat": "Send to chat",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "touch_select_anchor": "First point set — tap the other end",
+      "touch_select_done": "Range selected — tap Copy"
     },
     "codeBlock": {
       "copied": "Copied!",
@@ -2210,8 +2216,8 @@
       "root": "(root)"
     },
     "skillPickerMenu": {
-      "loading_skills_ctrl_enter_held": "Loading skills… — Ctrl+Enter won’t send yet; use the Send button",
-      "loading_skills_enter_held": "Loading skills… — Enter won’t send yet; use the Send button",
+      "loading_skills_ctrl_enter_held": "Loading skills… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "loading_skills_enter_held": "Loading skills… — Enter won’t send yet; press Esc, then Enter sends the message",
       "no_matching_skills_ctrl_enter_sends": "No matching skills — Ctrl+Enter sends the message",
       "no_matching_skills_enter_sends": "No matching skills — Enter sends the message",
       "no_skills_mapped_to_agent": "No skills mapped to {{agent}}",
@@ -2250,7 +2256,7 @@
       "copy": "Copy",
       "copy_failed": "Copy failed",
       "copy_needs_https": "Copy needs a secure (HTTPS) connection",
-      "copy_no_selection": "Tap Select, then Copy",
+      "copy_no_selection": "Long-press a line or tap Select, then Copy",
       "copy_done": "Copied",
       "copy_permission_needed": "Allow clipboard access",
       "paste": "Paste",
@@ -2432,6 +2438,8 @@
       "title_md": "Medium width"
     },
     "slashCommandMenu": {
+      "loading_commands_enter_held": "Loading commands… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "loading_commands_ctrl_enter_held": "Loading commands… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
       "commands_load_failed_ctrl_enter_sends": "Couldn't load commands — Ctrl+Enter sends the message",
       "commands_load_failed_enter_sends": "Couldn't load commands — Enter sends the message",
       "desc_agent": "Switch or manage the active agent",
@@ -2463,7 +2471,6 @@
       "desc_tools": "Show available tools",
       "desc_usage": "Show billing and usage information",
       "desc_workflow": "List or run a saved workflow by name",
-      "loading_commands": "Loading commands…",
       "no_matching_commands_ctrl_enter_sends": "No matching commands — Ctrl+Enter sends the message",
       "no_matching_commands_enter_sends": "No matching commands — Enter sends the message"
     },
@@ -2945,6 +2952,10 @@
       "not_deployed_2": "Not deployed",
       "open_folder": "Open folder {{name}}",
       "preview": "Preview: {{slug}}",
+      "promote_slug_taken_title": "Saved under a different address",
+      "promote_slug_taken_body": "That name was taken, so your document was saved as “{{slug}}”. “{{taken}}” still holds the older artifact.",
+      "promote_slug_taken_open": "Open {{slug}}",
+      "promote_slug_taken_open_older": "Open older {{taken}}",
       "published": "Published ({{visibility}})",
       "published_sync_issue": "Published (sync issue)",
       "remove_artifact_confirm": "Remove artifact “{{slug}}” from your library?\n\nThis deletes the artifact entry and its version history. If this artifact came from a file on disk or a chat widget, the original is NOT touched — you can re-add it later.",
@@ -3071,7 +3082,8 @@
         "more_actions": "More actions",
         "needs_active_chat": "Available once this chat finishes opening",
         "needs_earlier_history_count_one": "Select to load earlier history — {{count}} earlier message remains",
-        "needs_earlier_history_count_other": "Select to load earlier history — {{count}} earlier messages remain"
+        "needs_earlier_history_count_other": "Select to load earlier history — {{count}} earlier messages remain",
+        "share_message": "Share as image"
       },
       "chatNavPanel": {
         "link": "Link"
@@ -3303,6 +3315,32 @@
         "minimize_pinned_prompt": "Minimize pinned turn",
         "pinned_turn": "Pinned turn",
         "restore_pinned_prompt": "Restore pinned turn"
+      },
+      "share": {
+        "title": "Share to social media",
+        "description": "Turn this reply into a share card you can post anywhere.",
+        "preview_label": "Card preview",
+        "edit_hint": "Click the card text to edit it",
+        "card_footer": "Made with {{productName}}",
+        "include_question": "Include my question",
+        "caption_label": "Post text",
+        "caption_template": "{{productName}} just did this for me {{link}} #AIAgent",
+        "char_count": "{{count}} / {{limit}} · X limit",
+        "download_png": "Download PNG",
+        "copy_image_text": "Copy image + text",
+        "share_on_x": "Share on X",
+        "share_on_linkedin": "Share on LinkedIn",
+        "copied": "Copied — paste the image into the post box",
+        "copy_unavailable": "Clipboard unavailable here — the image was downloaded instead",
+        "intent_hint": "The post box opens with your text prefilled; paste the copied image to attach the card.",
+        "kind_aws_key": "an AWS access key",
+        "kind_token": "an API token",
+        "kind_private_key": "a private key",
+        "kind_local_path": "a local file path",
+        "kind_internal_url": "an internal URL",
+        "card_wordmark": "{{productName}}",
+        "sensitive_in_card": "Before you share — the card contains: {{kinds}}",
+        "sensitive_in_caption": "Before you share — the post text contains: {{kinds}}"
       }
     },
     "chatPage": {
@@ -3463,6 +3501,7 @@
     "connectionsPage": {
       "action_failed": "Action failed: {{error}}",
       "authorize": "Authorize",
+      "before_you_connect": "Before you connect",
       "cancel": "Cancel",
       "complete_connection": "Complete",
       "connect": "Connect",
@@ -3500,6 +3539,10 @@
       "not_verified_help": "{{productName}} cannot see the authorization for {{provider}} — the Kiro CLI holds the token. If an agent can already call it, it is working; if not, it still needs authorization.",
       "official_mcp_server": "Official MCP server",
       "open_managed_connection": "Open the {{provider}} connection card",
+      "prerequisite_atlassian": "Requires an Atlassian account with a Jira or Confluence site — without one, the consent page's Accept button stays disabled.",
+      "prerequisite_gitlab": "Enable GitLab Duo with beta and experimental features, and allow MCP server access for your top-level group — without them, connecting succeeds but exposes no tools.",
+      "prerequisite_gitlab_steps": "Enable GitLab Duo with beta and experimental features, and allow MCP server access for your top-level group.",
+      "prerequisites_for_provider": "{{provider}} prerequisites",
       "reconnect": "Reconnect",
       "reconnecting": "Reconnecting…",
       "relaying": "Sending…",

@@ -111,7 +111,9 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
             model_cfg.pop(other_key, None)
     model_defaults[model] = model_cfg
     existing["chat.modelDefaults"] = model_defaults
-    atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
+    atomic_write(
+        cli_json, json.dumps(existing, indent=2)
+    )  # atomic: readers never see a partial file (#426)
 
 
 #: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
@@ -195,7 +197,9 @@ def _write_tool_search_overlay(
         # would take effect if a later build flips the global default on.
         existing.pop("toolSearch.minPct", None)
         existing.pop("toolSearch.minTokens", None)
-    atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
+    atomic_write(
+        cli_json, json.dumps(existing, indent=2)
+    )  # atomic: readers never see a partial file (#426)
 
 
 def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
@@ -640,6 +644,27 @@ class AcpProvider(LLMProvider):
         except Exception:  # never let telemetry break session startup
             logger.debug("kiro startup metric emit failed", exc_info=True)
 
+    def _member_session_key(self) -> str:
+        """This session's key when it is a member DM on a dispatch-capable backend.
+
+        Empty for every other session. One resolution rule for BOTH session
+        establishment paths (session/new and session/load) — the mount must
+        ride whichever one runs, or a gateway restart silently strips a member
+        thread of its dispatch tools mid-conversation.
+        """
+        # circular import: members sits above the provider layer.
+        from kiro_crew.acp_backends import ACP_BACKENDS_MEMBER_DISPATCH
+        from kiro_crew.members import is_member_session_key
+
+        skey = getattr(self._client, "_session_key", None)
+        if (
+            isinstance(skey, str)
+            and self._client.backend in ACP_BACKENDS_MEMBER_DISPATCH
+            and is_member_session_key(skey)
+        ):
+            return skey
+        return ""
+
     async def _load_session_with_retry(
         self,
         runtime: AcpRuntime,
@@ -647,6 +672,7 @@ class AcpProvider(LLMProvider):
         resume_sid: str,
         work_dir: str | Path | None,
         agent: str | None,
+        member_session_key: str = "",
     ) -> AcpSessionHandle | None:
         """Resume via session/load, retrying past a stale native session lock.
 
@@ -671,6 +697,7 @@ class AcpProvider(LLMProvider):
                     resume_sid,
                     cwd=work_dir,
                     agent=agent or None,
+                    member_session_key=member_session_key,
                 )
                 if attempt:
                     logger.info(
@@ -822,6 +849,7 @@ class AcpProvider(LLMProvider):
                             resume_sid,
                             work_dir,
                             agent,
+                            member_session_key=self._member_session_key(),
                         )
                     finally:
                         phases["session_load"] = (time.monotonic() - _t_load) * 1000.0
@@ -872,6 +900,7 @@ class AcpProvider(LLMProvider):
                     handle = await runtime.create_session(
                         cwd=work_dir,
                         agent=agent or None,
+                        member_session_key=self._member_session_key(),
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
@@ -1301,6 +1330,7 @@ class AcpProvider(LLMProvider):
             tool_purpose=e.tool_purpose,
             context_usage_pct=e.context_usage_pct,
             stop_reason=e.stop_reason,
+            synthetic_completion=e.synthetic_completion,
             request_id=e.request_id,
             options=e.options,
             tool_input=e.tool_input,

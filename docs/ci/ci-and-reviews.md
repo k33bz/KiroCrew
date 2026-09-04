@@ -55,6 +55,37 @@ Out-of-band lanes that never gate a PR:
   builds two real app bundles and performs an actual update swap, because the
   Electron unit suite stops at the `autoUpdater` handoff and never proves a real
   bundle is replaced on disk and relaunches.
+- **The ratchet verdict `main` otherwise never gets:** `main-ratchet-audit.yml`
+  re-runs only the cheap ratchet, ceiling and baseline gates on every push to
+  `main`. Two things make a push to `main` unable to answer for them in `ci.yml`:
+  GitHub keeps one *pending* run per concurrency group, so on a busy `main` each
+  run is evicted before its slower lanes report and a commit's checks end up
+  `cancelled` rather than `failure` — which is not a red X, so `main` looks green
+  while drift accumulates; and the lint lanes are surface-gated, so a
+  backend-only merge *skips* the eslint ceiling outright. This lane's group is
+  keyed on the SHA so no push can supersede an earlier push's audit, it runs both
+  surfaces unconditionally, and it reconciles one `ratchet-audit`-labeled tracking
+  issue — opened on drift, commented on each further drifting push, closed on the
+  next all-green one. Because per-SHA groups let audits for different commits
+  finish out of order, only a run whose commit is still `main`'s head writes to
+  that shared issue: a slow green audit would otherwise close the live drift
+  record a newer push just opened. An unreadable head resolves toward keeping
+  drift visible in both directions — still recorded on drift, still not closed on
+  green. Every gate step runs on `!cancelled()` rather than the default
+  `success()`, so one drifting ratchet does not skip the rest and reduce the
+  verdict to whichever gate is listed first; and the set of gate scripts is
+  pinned equal to `ci.yml`'s `backend-lint`, because a gate *added* there and not
+  mirrored here would never be measured on `main` at all. Two further details are
+  load-bearing. It sets
+  `RATCHET_SCOPE_WHOLE_TREE`, because the four diff-scoped gates
+  (`scripts/ratchet_scope.py`) would otherwise resolve an EMPTY diff on a push to
+  the branch they measure against and pass by judging nothing; and it *reads* the
+  eslint ceiling out of `ci.yml` rather than transcribing it, because a second
+  copy would keep granting the old budget after a burn-down and report green on a
+  tree the PR gate reds. It deliberately does not touch `ci.yml`'s concurrency or
+  add a second full run: full serialization or a merge queue is a runner-budget
+  call, and `test-durations.yml` already pays for a full suite on `main`.
+  Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
   `cleanup-temp-screenshots.yml` (prunes the ephemeral `temp-screenshots/` dir,
   see [its README](../../temp-screenshots/README.md); safe because PR bodies
@@ -467,17 +498,19 @@ check on that pairing mis-fires whenever the model quotes prior text.
 
 ### Security posture of the reviewer jobs
 
-- Explicit fork guards (`head.repo.full_name == github.repository`), so the job
-  **skips** on a fork rather than failing an unsatisfiable credential step. GitHub
-  treats a skipped required check as satisfied, which is why fork coverage needs
-  the separate `fork-*` pipeline below.
+- Explicit fork guards (`head.repo.full_name == github.repository`) on **every
+  step**, so on a fork the job starts and then does nothing rather than failing an
+  unsatisfiable credential step. The guard is per-step and not job-level because
+  GitHub never evaluates a **skipped** job's `name:` -- while it was job-level,
+  every fork PR published the raw name expression as its check name. Fork coverage
+  still comes from the separate `fork-*` pipeline below.
 - **The job name is conditional on the head repository**, so a fork PR gets
   `<check> (same-repo lane, not applicable to forks)` instead of the protected
   name. Same-repo PRs keep the exact protected name. Without this, both lanes
   publish one name and GitHub resolves a required status check to the **newest**
   check-run of that name: a `pull_request` event firing after the fork lane
   posted its verdict (a reopen, or an `edited` title/body on `codex-review.yml`)
-  would make the same-repo lane's `skipped` run the newest one and satisfy the
+  would make the same-repo lane's own run the newest one and satisfy the
   gate on a review that never ran. `pr-readiness.yml` was never fooled by this
   -- it collapses every check-run of the name and treats "no completed run" as
   pending -- so the rename closes the branch-protection half of the gate.

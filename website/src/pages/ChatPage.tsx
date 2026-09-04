@@ -206,6 +206,7 @@ import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt, PinnedPromptPill } from './chat'
 import { useStreamIdle } from './chat/ChatFooter'
 import type { TurnStats } from './chat/AssistantMessage'
+import { prevUserTextFor } from './chat/share/shareSupport'
 import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
@@ -4106,15 +4107,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // host route happens to carry.
     if (noUrlSync) return
     // Our own drawer-entry consumption, not a Back/Forward the user asked for.
-    // Cleared and returned BEFORE the arming block below so the flag can never
-    // outlive its pop and swallow a later genuine one — the `!popReadyRef` and
-    // duplicate-key guards there return early, so a check placed after them
-    // would leave the flag set. `lastLocKeyRef` is still advanced, because this
-    // entry HAS been visited and must not be honored again if the effect re-runs
-    // on it while navigationType is still 'POP'.
+    // Correct the POP's stale outgoing `?sid=` HERE, in the effect that owns the
+    // POP, rather than relying on the separate activeSlot -> URL effect below.
+    // In a real mobile browser those two navigation effects can be committed in
+    // either order: a fast New Chat activates the newborn slot, closes the
+    // drawer, then this POP lands on the duplicate's predecessor naming the old
+    // slot. If the generic sync is still gated by a prior POP claim, the old URL
+    // wins and its reader switches Redux straight back, leaving an empty New
+    // Session row behind. MemoryRouter settles synchronously and hid that race.
+    //
+    // `activeSlotRef` is the render-current value even when the close originated
+    // from createSlot.fulfilled in this same commit. Replacing only this popped
+    // entry also preserves the one-entry drawer invariant: the duplicate is gone,
+    // and the surviving history entry names the session actually on screen.
     if (drawerPopRef.current) {
       drawerPopRef.current = false
       lastLocKeyRef.current = location.key
+      popInFlightRef.current = false
+      const target = activeSlotRef.current
+      const urlSlot = searchParams.get('sid') || searchParams.get('slot')
+      if (target && target !== urlSlot) {
+        const next = new URLSearchParams(searchParams)
+        next.set('sid', target)
+        next.delete('slot')
+        navigate(
+          { pathname: location.pathname, search: `?${next}`, hash: location.hash },
+          { replace: true },
+        )
+      }
       return
     }
     // Embed: host app drives the URL — react to any ?sid change.
@@ -4142,7 +4162,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       popInFlightRef.current = true
       dispatch(switchSlot(urlSid))
     }
-  }, [searchParams, filteredSlots, activeSlot, dispatch, embedMode, navigationType, location.key, connected, noUrlSync])
+  }, [searchParams, filteredSlots, activeSlot, dispatch, embedMode, navigationType, location.key, location.pathname, location.hash, connected, noUrlSync, navigate])
   // Timeout: if slot never appears after 5s, show error.
   // Gated on `connected` so the timer only runs while the gateway is reachable
   // — otherwise an offline tab would burn its 5s while the resolve effects
@@ -6871,11 +6891,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     // An injected workflow completion event renders as a compact status card
     // (with the full result folded away) instead of a wall of raw JSON.
-    if (isWorkflowCompletionMessage(m)) return <WorkflowCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} disclosureKey={key} />
+    if (isWorkflowCompletionMessage(m)) return <WorkflowCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} disclosureKey={key} />
     // An injected sub-agent completion event is machine-facing prompt text (the
     // spawn-discipline instructions are addressed to the model). It renders as a
     // compact outcome row with the payload folded away, not as a chat bubble.
-    if (isSubagentCompletionMessage(m)) return <SubagentCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} disclosureKey={key} onOpenPanel={handleSubagentPanelOpen} />
+    if (isSubagentCompletionMessage(m)) return <SubagentCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} disclosureKey={key} onOpenPanel={handleSubagentPanelOpen} />
     // A quiet monitor-loop cycle replies with a bare zero-width space
     // (U+200B): the content is truthy but renders as nothing, so the row
     // would draw as an empty bubble — one per quiet cycle, historical
@@ -6927,7 +6947,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
               return <>
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
-                <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary></div>
+                {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
+                    refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
+                <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6940,7 +6962,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             })()
           ) : (
             <div className="flex flex-col gap-0">
-              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
+              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} prevUserText={prevUserTextFor(messagesRef.current, i)} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
                 // Show footer on the last assistant message of each completed turn
                 if (isStreaming) return false
                 // Find next message after this one that's assistant, user, or streaming
@@ -7996,7 +8018,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-              <div className="ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none">
+              {/* focus-caption-reserve: this group owns the window's top-trailing
+                  corner — where Windows and frameless Linux paint their caption
+                  controls — whenever the side panel is not holding that edge, i.e.
+                  while it is closed (the state that renders the reopen toggle
+                  below) or docked at the bottom. Right-docked and showing, the
+                  panel is at that edge instead and carries the reserve itself, so
+                  reserving here too would indent these controls for nothing. */}
+              <div className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === 'bottom' ? ' focus-caption-reserve' : ''}`}>
               {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.

@@ -4740,6 +4740,8 @@
         "drive_upload": "अपलोड करें",
         "drive_uploading": "अपलोड हो रहा है…",
         "drive_bad_name": "उस फ़ाइल नाम में ऐसे अक्षर हैं जिन्हें ड्राइव संग्रहित नहीं कर सकती। नाम बदलें और फिर कोशिश करें।",
+        "drive_bad_name_named": "“{{name}}” अपलोड नहीं हो सकती — नाम में ऐसे अक्षर हैं जिन्हें ड्राइव संग्रहित नहीं कर सकती। नाम बदलें और फिर कोशिश करें।",
+        "drive_upload_failed": "“{{name}}” अपलोड नहीं हो सकी। फिर कोशिश करें।",
         "section_files": "फ़ाइलें",
         "section_library": "पुस्तकालय",
         "section_backup": "बैकअप",
@@ -4829,7 +4831,10 @@
         "library_actions": "लाइब्रेरी आइटम क्रियाएँ",
         "library_remove_action": "प्रतिलिपि हटाएँ",
         "library_removing": "हटाया जा रहा है…",
-        "library_remove_failed": "हटाना विफल रहा — क्लाउड प्रतिलिपि अपरिवर्तित है। फिर से आज़माएं।"
+        "library_remove_failed": "हटाना विफल रहा — क्लाउड प्रतिलिपि अपरिवर्तित है। फिर से आज़माएं।",
+        "move_conflict": "गंतव्य फ़ोल्डर में इसी नाम की फ़ाइल पहले से मौजूद है।",
+        "move_shared": "इस फ़ाइल का एक सक्रिय शेयर लिंक है — इसे स्थानांतरित करने से लिंक टूट जाएगा। शेयर हटाएं (या उसे समाप्त होने दें) और फिर कोशिश करें।",
+        "move_failed": "फ़ाइल स्थानांतरित नहीं हो सकी। फिर से प्रयास करें।"
       },
       "page": {
         "totals_summary": "{{accounts}} खाते · {{keys}} कुंजियाँ · {{healthy}} स्वस्थ",
@@ -5439,7 +5444,9 @@
       "auto_compact_threshold": "ऑटो-कॉम्पैक्ट थ्रेशोल्ड",
       "auto_compact_load_failed": "ऑटो-कॉम्पैक्ट सेटिंग लोड नहीं हो सकी",
       "reset_to_global": "ग्लोबल पर रीसेट करें ({{pct}}%)",
-      "following_global": "ग्लोबल का पालन कर रहा है ({{pct}}%)"
+      "following_global": "ग्लोबल का पालन कर रहा है ({{pct}}%)",
+      "sketch": "स्केच",
+      "sketch_desc": "स्केच बनाएं; छवि और संपादन योग्य स्रोत संलग्न करता है"
     },
     "chatPane": {
       "agent_list": "एजेंट सूची",
@@ -5467,7 +5474,9 @@
       "redaction_failed_retry": "रिडैक्शन विफल — फिर कोशिश करें",
       "send_selection_to_chat": "चयन चैट में भेजें",
       "send_to_chat": "चैट में भेजें",
-      "sending": "भेजा जा रहा है…"
+      "sending": "भेजा जा रहा है…",
+      "touch_select_anchor": "पहला बिंदु सेट — दूसरा सिरा टैप करें",
+      "touch_select_done": "श्रेणी चयनित — कॉपी टैप करें"
     },
     "codeBlock": {
       "copied": "कॉपी हो गया!",
@@ -5774,8 +5783,10 @@
       "no_matches_enter_sends": "कोई मेल खाती फ़ाइल नहीं — Enter संदेश भेज देगा",
       "open_in_viewer": "व्यूअर में खोलें",
       "remove_folder": "फ़ोल्डर हटाएँ",
-      "searching": "खोज रहे हैं…",
-      "type_2_chars_to_search_files": "फ़ाइलें और फ़ोल्डर खोजने के लिए 2+ अक्षर टाइप करें…"
+      "searching_ctrl_enter_held": "खोज रहे हैं… — Ctrl+Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Ctrl+Enter संदेश भेज देगा",
+      "searching_enter_held": "खोज रहे हैं… — Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Enter संदेश भेज देगा",
+      "type_2_chars_to_search_files_ctrl_enter_held": "फ़ाइलें और फ़ोल्डर खोजने के लिए 2+ अक्षर टाइप करें… — Ctrl+Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Ctrl+Enter संदेश भेज देगा",
+      "type_2_chars_to_search_files_enter_held": "फ़ाइलें और फ़ोल्डर खोजने के लिए 2+ अक्षर टाइप करें… — Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Enter संदेश भेज देगा"
     },
     "fileRenderers": {
       "download": "डाउनलोड करें",
@@ -7040,8 +7051,8 @@
       "title": "भरोसेमंद प्रोजेक्ट फ़ोल्डर"
     },
     "skillPickerMenu": {
-      "loading_skills_ctrl_enter_held": "स्किल लोड हो रही हैं… — Ctrl+Enter अभी संदेश नहीं भेजेगा; भेजें बटन का उपयोग करें",
-      "loading_skills_enter_held": "स्किल लोड हो रही हैं… — Enter अभी संदेश नहीं भेजेगा; भेजें बटन का उपयोग करें",
+      "loading_skills_ctrl_enter_held": "स्किल लोड हो रही हैं… — Ctrl+Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Ctrl+Enter संदेश भेज देगा",
+      "loading_skills_enter_held": "स्किल लोड हो रही हैं… — Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Enter संदेश भेज देगा",
       "no_matching_skills": "कोई मेल खाती स्किल नहीं",
       "no_matching_skills_ctrl_enter_sends": "कोई मेल खाती स्किल नहीं — Ctrl+Enter संदेश भेज देगा",
       "no_matching_skills_enter_sends": "कोई मेल खाती स्किल नहीं — Enter संदेश भेज देगा",
@@ -7087,7 +7098,8 @@
       "desc_tools": "उपलब्ध टूल दिखाएँ",
       "desc_usage": "बिलिंग और उपयोग की जानकारी दिखाएँ",
       "desc_workflow": "सहेजे गए वर्कफ़्लो को नाम से सूचीबद्ध करें या चलाएँ",
-      "loading_commands": "कमांड लोड हो रहे हैं…",
+      "loading_commands_ctrl_enter_held": "कमांड लोड हो रही हैं… — Ctrl+Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Ctrl+Enter संदेश भेज देगा",
+      "loading_commands_enter_held": "कमांड लोड हो रही हैं… — Enter अभी संदेश नहीं भेजेगा; Esc दबाएँ, फिर Enter संदेश भेज देगा",
       "no_matching_commands_ctrl_enter_sends": "कोई मेल खाता कमांड नहीं — Ctrl+Enter संदेश भेज देगा",
       "no_matching_commands_enter_sends": "कोई मेल खाता कमांड नहीं — Enter संदेश भेज देगा"
     },
@@ -7135,7 +7147,7 @@
       "copy": "कॉपी करें",
       "copy_failed": "कॉपी विफल",
       "copy_needs_https": "कॉपी करने के लिए एक सुरक्षित (HTTPS) कनेक्शन आवश्यक है",
-      "copy_no_selection": "चुनें टैप करें, फिर कॉपी करें",
+      "copy_no_selection": "किसी पंक्ति को देर तक दबाएँ या “चुनें” टैप करें, फिर “कॉपी”",
       "copy_done": "कॉपी हो गया",
       "copy_permission_needed": "क्लिपबोर्ड एक्सेस की अनुमति दें",
       "paste": "चिपकाएँ",
@@ -7666,6 +7678,18 @@
       "path_copied": "पथ कॉपी किया गया",
       "reveal_blocked": "यह पथ सुरक्षित है और इसे खोला नहीं जा सकता।",
       "reveal_failed": "{{productName}} चलाने वाली मशीन पर यह पथ नहीं खोला जा सका।"
+    },
+    "sketchDialog": {
+      "title": "स्केच पैड",
+      "draw_something_first": "पहले कुछ बनाएं",
+      "loading": "स्केच पैड लोड हो रहा है…",
+      "export_failed": "स्केच निर्यात नहीं हो सका — फिर से आज़माएं",
+      "insert_hint": "छवि और एक संपादन योग्य स्रोत फ़ाइल संलग्न करता है जिसे crew डेटा के रूप में पढ़ सकती है",
+      "attach_to_message": "संदेश में संलग्न करें",
+      "new_sketch": "नया स्केच",
+      "confirm_discard": "चित्र हटाएं",
+      "already_attached": "संलग्न — फिर से स्केच करने के लिए कैनवास संपादित करें",
+      "load_failed": "स्केच पैड लोड नहीं हो सका — कनेक्शन जांचें और फिर से खोलें"
     }
   },
   "hooks": {
@@ -8456,6 +8480,10 @@
       "pop_out_into_its_own_window": "अपनी अलग विंडो में पॉप आउट करें",
       "pop_out_to_window": "विंडो में पॉप आउट करें",
       "preview": "प्रीव्यू: {{slug}}",
+      "promote_slug_taken_title": "दूसरे पते पर सहेजा गया",
+      "promote_slug_taken_body": "वह नाम पहले से मौजूद था, इसलिए दस्तावेज़ “{{slug}}” के रूप में सहेजा गया। “{{taken}}” में अब भी पुराना आर्टिफ़ैक्ट है।",
+      "promote_slug_taken_open": "“{{slug}}” खोलें",
+      "promote_slug_taken_open_older": "पुराना “{{taken}}” खोलें",
       "published": "प्रकाशित ({{visibility}})",
       "published_sync_issue": "प्रकाशित (सिंक समस्या)",
       "remove_artifact_confirm": "आर्टिफ़ैक्ट “{{slug}}” को अपनी लाइब्रेरी से हटाएँ?\n\nइससे आर्टिफ़ैक्ट की एंट्री और उसका वर्शन इतिहास मिट जाएगा। अगर यह आर्टिफ़ैक्ट डिस्क की किसी फ़ाइल या चैट विजेट से आया था, तो मूल को छुआ नहीं जाएगा — इसे बाद में फिर से जोड़ा जा सकता है।",
@@ -8682,7 +8710,8 @@
         "more_actions": "अधिक क्रियाएँ",
         "needs_active_chat": "यह चैट पूरी तरह खुल जाने पर उपलब्ध होगा",
         "needs_earlier_history_count_one": "पुराना इतिहास लोड करने के लिए चुनें — {{count}} पुराना संदेश शेष है",
-        "needs_earlier_history_count_other": "पुराना इतिहास लोड करने के लिए चुनें — {{count}} पुराने संदेश शेष हैं"
+        "needs_earlier_history_count_other": "पुराना इतिहास लोड करने के लिए चुनें — {{count}} पुराने संदेश शेष हैं",
+        "share_message": "छवि के रूप में साझा करें"
       },
       "chatFooter": {
         "compacting": "संक्षिप्त किया जा रहा है…",
@@ -9138,6 +9167,32 @@
       },
       "deepLink": {
         "message_unavailable": "यह संदेश अब इस बातचीत में नहीं है।"
+      },
+      "share": {
+        "title": "सोशल मीडिया पर साझा करें",
+        "description": "इस जवाब को एक शेयर कार्ड में बदलें जिसे कहीं भी पोस्ट किया जा सकता है।",
+        "preview_label": "कार्ड पूर्वावलोकन",
+        "edit_hint": "संपादित करने के लिए कार्ड के टेक्स्ट पर क्लिक करें",
+        "card_footer": "{{productName}} से बनाया गया",
+        "include_question": "मेरा प्रश्न शामिल करें",
+        "caption_label": "पोस्ट का टेक्स्ट",
+        "caption_template": "{{productName}} ने अभी मेरे लिए यह किया {{link}} #AIAgent",
+        "char_count": "{{count}} / {{limit}} · X सीमा",
+        "download_png": "PNG डाउनलोड करें",
+        "copy_image_text": "छवि और टेक्स्ट कॉपी करें",
+        "share_on_x": "X पर साझा करें",
+        "share_on_linkedin": "LinkedIn पर साझा करें",
+        "copied": "कॉपी हो गया — पोस्ट बॉक्स में छवि पेस्ट करें",
+        "copy_unavailable": "क्लिपबोर्ड उपलब्ध नहीं — छवि डाउनलोड कर दी गई",
+        "intent_hint": "पोस्ट बॉक्स टेक्स्ट भरा हुआ खुलेगा; कार्ड जोड़ने के लिए कॉपी की गई छवि पेस्ट करें।",
+        "kind_aws_key": "AWS एक्सेस कुंजी",
+        "kind_token": "API टोकन",
+        "kind_private_key": "निजी कुंजी",
+        "kind_local_path": "स्थानीय फ़ाइल पथ",
+        "kind_internal_url": "आंतरिक URL",
+        "card_wordmark": "{{productName}}",
+        "sensitive_in_card": "साझा करने से पहले — कार्ड में है: {{kinds}}",
+        "sensitive_in_caption": "साझा करने से पहले — पोस्ट के टेक्स्ट में है: {{kinds}}"
       }
     },
     "chatPage": {
@@ -9471,6 +9526,7 @@
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",
       "authorize": "प्राधिकृत करें",
+      "before_you_connect": "कनेक्ट करने से पहले",
       "cancel": "रद्द करें",
       "complete_connection": "पूरा करें",
       "connect": "कनेक्ट करें",
@@ -9508,6 +9564,10 @@
       "not_verified_help": "{{productName}} {{provider}} का प्राधिकरण नहीं देख सकता — टोकन Kiro CLI के पास रहता है। यदि कोई एजेंट इसे पहले से बुला सकता है तो यह काम कर रहा है; अन्यथा प्राधिकरण अभी भी आवश्यक है।",
       "official_mcp_server": "आधिकारिक MCP सर्वर",
       "open_managed_connection": "{{provider}} कनेक्शन कार्ड खोलें",
+      "prerequisite_atlassian": "Jira या Confluence साइट वाले Atlassian खाते की आवश्यकता है — इसके बिना सहमति पृष्ठ का Accept बटन निष्क्रिय रहता है।",
+      "prerequisite_gitlab": "GitLab Duo को बीटा और प्रयोगात्मक सुविधाओं के साथ सक्षम करें और अपने शीर्ष-स्तरीय समूह के लिए MCP सर्वर एक्सेस की अनुमति दें — इनके बिना कनेक्शन सफल होता है लेकिन कोई टूल उपलब्ध नहीं होता।",
+      "prerequisite_gitlab_steps": "GitLab Duo को बीटा और प्रयोगात्मक सुविधाओं के साथ सक्षम करें और अपने शीर्ष-स्तरीय समूह के लिए MCP सर्वर एक्सेस की अनुमति दें।",
+      "prerequisites_for_provider": "{{provider}} की पूर्व-आवश्यकताएँ",
       "reconnect": "फिर से कनेक्ट करें",
       "reconnecting": "फिर से कनेक्ट हो रहा है…",
       "relaying": "भेजा जा रहा है…",

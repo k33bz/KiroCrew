@@ -4818,6 +4818,8 @@
         "drive_upload": "Carica",
         "drive_uploading": "Caricamento…",
         "drive_bad_name": "Questo nome di file contiene caratteri che il drive non può archiviare. Rinominalo e riprova.",
+        "drive_bad_name_named": "Impossibile caricare “{{name}}”: il nome contiene caratteri che il drive non può archiviare. Rinominalo e riprova.",
+        "drive_upload_failed": "Impossibile caricare “{{name}}”. Riprova.",
         "section_files": "File",
         "section_library": "Libreria",
         "section_backup": "Backup",
@@ -4909,7 +4911,10 @@
         "library_actions": "Azioni sull'elemento della libreria",
         "library_remove_action": "Rimuovi la copia",
         "library_removing": "Rimozione in corso…",
-        "library_remove_failed": "Rimozione non riuscita: la copia cloud è invariata. Riprova."
+        "library_remove_failed": "Rimozione non riuscita: la copia cloud è invariata. Riprova.",
+        "move_conflict": "La cartella di destinazione contiene già un file con questo nome.",
+        "move_shared": "Questo file ha un link di condivisione attivo: spostarlo interromperebbe il link. Rimuovi la condivisione (o lascia che scada) e riprova.",
+        "move_failed": "Impossibile spostare il file. Riprova."
       },
       "page": {
         "totals_summary": "{{accounts}} account · {{keys}} chiavi · {{healthy}} integre",
@@ -5528,7 +5533,9 @@
       "auto_compact_threshold": "Soglia di compattazione automatica",
       "auto_compact_load_failed": "Impossibile caricare l'impostazione di compattazione automatica",
       "reset_to_global": "Ripristina il valore globale ({{pct}}%)",
-      "following_global": "Segue il valore globale ({{pct}}%)"
+      "following_global": "Segue il valore globale ({{pct}}%)",
+      "sketch": "Schizzo",
+      "sketch_desc": "Disegna uno schizzo; allega un’immagine e la sua origine modificabile"
     },
     "chatPane": {
       "agent_list": "Elenco degli agenti",
@@ -5556,7 +5563,9 @@
       "redaction_failed_retry": "Oscuramento non riuscito — riprova",
       "send_selection_to_chat": "Invia la selezione alla chat",
       "send_to_chat": "Invia alla chat",
-      "sending": "Invio in corso…"
+      "sending": "Invio in corso…",
+      "touch_select_anchor": "Primo punto impostato — tocca l'altra estremità",
+      "touch_select_done": "Intervallo selezionato — tocca Copia"
     },
     "codeBlock": {
       "copied": "Copiato!",
@@ -5869,8 +5878,10 @@
       "no_matches_enter_sends": "Nessun file corrispondente — Invio invia il messaggio",
       "open_in_viewer": "Apri nel visualizzatore",
       "remove_folder": "Rimuovi cartella",
-      "searching": "Ricerca in corso…",
-      "type_2_chars_to_search_files": "Digita almeno 2 caratteri per cercare file e cartelle…"
+      "searching_ctrl_enter_held": "Ricerca in corso… — Ctrl+Invio non invia ancora; premi Esc, poi Ctrl+Invio invia il messaggio",
+      "searching_enter_held": "Ricerca in corso… — Invio non invia ancora; premi Esc, poi Invio invia il messaggio",
+      "type_2_chars_to_search_files_ctrl_enter_held": "Digita almeno 2 caratteri per cercare file e cartelle… — Ctrl+Invio non invia ancora; premi Esc, poi Ctrl+Invio invia il messaggio",
+      "type_2_chars_to_search_files_enter_held": "Digita almeno 2 caratteri per cercare file e cartelle… — Invio non invia ancora; premi Esc, poi Invio invia il messaggio"
     },
     "fileRenderers": {
       "download": "Scarica",
@@ -7145,8 +7156,8 @@
       "title": "Cartelle di progetto attendibili"
     },
     "skillPickerMenu": {
-      "loading_skills_ctrl_enter_held": "Caricamento delle skill… — Ctrl+Invio non invia ancora; usa il pulsante Invia",
-      "loading_skills_enter_held": "Caricamento delle skill… — Invio non invia ancora; usa il pulsante Invia",
+      "loading_skills_ctrl_enter_held": "Caricamento delle skill… — Ctrl+Invio non invia ancora; premi Esc, poi Ctrl+Invio invia il messaggio",
+      "loading_skills_enter_held": "Caricamento delle skill… — Invio non invia ancora; premi Esc, poi Invio invia il messaggio",
       "no_matching_skills": "Nessuna skill corrispondente",
       "no_matching_skills_ctrl_enter_sends": "Nessuna skill corrispondente — Ctrl+Invio invia il messaggio",
       "no_matching_skills_enter_sends": "Nessuna skill corrispondente — Invio invia il messaggio",
@@ -7192,7 +7203,8 @@
       "desc_tools": "Mostra gli strumenti disponibili",
       "desc_usage": "Mostra informazioni su fatturazione e utilizzo",
       "desc_workflow": "Elenca o esegui un workflow salvato per nome",
-      "loading_commands": "Caricamento dei comandi…",
+      "loading_commands_ctrl_enter_held": "Caricamento dei comandi… — Ctrl+Invio non invia ancora; premi Esc, poi Ctrl+Invio invia il messaggio",
+      "loading_commands_enter_held": "Caricamento dei comandi… — Invio non invia ancora; premi Esc, poi Invio invia il messaggio",
       "no_matching_commands_ctrl_enter_sends": "Nessun comando corrispondente — Ctrl+Invio invia il messaggio",
       "no_matching_commands_enter_sends": "Nessun comando corrispondente — Invio invia il messaggio"
     },
@@ -7240,7 +7252,7 @@
       "copy": "Copia",
       "copy_failed": "Copia non riuscita",
       "copy_needs_https": "La copia richiede una connessione sicura (HTTPS)",
-      "copy_no_selection": "Tocca Seleziona, poi Copia",
+      "copy_no_selection": "Tieni premuta una riga o tocca Seleziona, poi Copia",
       "copy_done": "Copiato",
       "copy_permission_needed": "Consenti l'accesso agli appunti",
       "paste": "Incolla",
@@ -7772,6 +7784,18 @@
       "path_copied": "Percorso copiato",
       "reveal_blocked": "Questo percorso è protetto e non può essere aperto.",
       "reveal_failed": "Impossibile aprire questo percorso sul computer che esegue {{productName}}."
+    },
+    "sketchDialog": {
+      "title": "Blocco schizzi",
+      "draw_something_first": "Disegna prima qualcosa",
+      "loading": "Caricamento del blocco schizzi…",
+      "export_failed": "Impossibile esportare lo schizzo: riprova",
+      "insert_hint": "Allega l’immagine e un file sorgente modificabile che la tua crew può leggere come dati",
+      "attach_to_message": "Allega al messaggio",
+      "new_sketch": "Nuovo schizzo",
+      "confirm_discard": "Elimina disegno",
+      "already_attached": "Allegato — modifica la tela per disegnare di nuovo",
+      "load_failed": "Impossibile caricare il blocco schizzi: controlla la connessione e riapri"
     }
   },
   "hooks": {
@@ -8575,6 +8599,10 @@
       "pop_out_into_its_own_window": "Apri in una finestra separata",
       "pop_out_to_window": "Apri in una finestra",
       "preview": "Anteprima: {{slug}}",
+      "promote_slug_taken_title": "Salvato in un altro indirizzo",
+      "promote_slug_taken_body": "Quel nome era già in uso, quindi il documento è stato salvato come «{{slug}}». «{{taken}}» contiene ancora l’artefatto precedente.",
+      "promote_slug_taken_open": "Apri «{{slug}}»",
+      "promote_slug_taken_open_older": "Apri il precedente «{{taken}}»",
       "published": "Pubblicato ({{visibility}})",
       "published_sync_issue": "Pubblicato (problema di sincronizzazione)",
       "remove_artifact_confirm": "Rimuovere l’artefatto «{{slug}}» dalla tua libreria?\n\nQuesta operazione elimina la voce dell’artefatto e la sua cronologia delle versioni. Se questo artefatto proviene da un file su disco o da un widget della chat, l’originale NON viene modificato — puoi aggiungerlo di nuovo più tardi.",
@@ -8805,7 +8833,8 @@
         "needs_active_chat": "Disponibile quando questa conversazione ha finito di aprirsi",
         "needs_earlier_history_count_one": "Seleziona per caricare la cronologia precedente: resta {{count}} messaggio precedente",
         "needs_earlier_history_count_many": "Seleziona per caricare la cronologia precedente: restano {{count}} messaggi precedenti",
-        "needs_earlier_history_count_other": "Seleziona per caricare la cronologia precedente: restano {{count}} messaggi precedenti"
+        "needs_earlier_history_count_other": "Seleziona per caricare la cronologia precedente: restano {{count}} messaggi precedenti",
+        "share_message": "Condividi come immagine"
       },
       "chatFooter": {
         "compacting": "Compattazione in corso…",
@@ -9271,6 +9300,32 @@
       },
       "deepLink": {
         "message_unavailable": "Questo messaggio non è più in questa conversazione."
+      },
+      "share": {
+        "title": "Condividi sui social",
+        "description": "Trasforma questa risposta in una card da pubblicare ovunque.",
+        "preview_label": "Anteprima della card",
+        "edit_hint": "Fai clic sul testo della card per modificarlo",
+        "card_footer": "Creato con {{productName}}",
+        "include_question": "Includi la mia domanda",
+        "caption_label": "Testo del post",
+        "caption_template": "{{productName}} ha appena fatto questo per me {{link}} #AIAgent",
+        "char_count": "{{count}} / {{limit}} · limite X",
+        "download_png": "Scarica PNG",
+        "copy_image_text": "Copia immagine e testo",
+        "share_on_x": "Condividi su X",
+        "share_on_linkedin": "Condividi su LinkedIn",
+        "copied": "Copiato: incolla l'immagine nella finestra del post",
+        "copy_unavailable": "Appunti non disponibili: l'immagine è stata scaricata",
+        "intent_hint": "La finestra del post si apre con il testo precompilato; incolla l'immagine copiata per allegare la card.",
+        "kind_aws_key": "una chiave di accesso AWS",
+        "kind_token": "un token API",
+        "kind_private_key": "una chiave privata",
+        "kind_local_path": "un percorso di file locale",
+        "kind_internal_url": "un URL interno",
+        "card_wordmark": "{{productName}}",
+        "sensitive_in_card": "Prima di condividere — la card contiene: {{kinds}}",
+        "sensitive_in_caption": "Prima di condividere — il testo del post contiene: {{kinds}}"
       }
     },
     "chatPage": {
@@ -9616,6 +9671,7 @@
     "connectionsPage": {
       "action_failed": "Azione non riuscita: {{error}}",
       "authorize": "Autorizza",
+      "before_you_connect": "Prima della connessione",
       "cancel": "Annulla",
       "complete_connection": "Completa",
       "connect": "Connetti",
@@ -9653,6 +9709,10 @@
       "not_verified_help": "{{productName}} non può vedere l'autorizzazione di {{provider}}: il token è in mano a Kiro CLI. Se un agente riesce già a chiamarlo, funziona; altrimenti serve ancora un'autorizzazione.",
       "official_mcp_server": "Server MCP ufficiale",
       "open_managed_connection": "Apri la scheda di connessione di {{provider}}",
+      "prerequisite_atlassian": "Richiede un account Atlassian con un sito Jira o Confluence — senza di esso il pulsante Accept della pagina di consenso resta disabilitato.",
+      "prerequisite_gitlab": "Attiva GitLab Duo con le funzionalità beta e sperimentali e consenti l'accesso al server MCP per il tuo gruppo di primo livello — senza di essi la connessione riesce ma non espone alcuno strumento.",
+      "prerequisite_gitlab_steps": "Attiva GitLab Duo con le funzionalità beta e sperimentali e consenti l'accesso al server MCP per il tuo gruppo di primo livello.",
+      "prerequisites_for_provider": "Prerequisiti di {{provider}}",
       "reconnect": "Riconnetti",
       "reconnecting": "Riconnessione…",
       "relaying": "Invio…",

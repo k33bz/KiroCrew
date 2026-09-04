@@ -46,6 +46,8 @@ from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
+    _marker_bearing_text,
+    _repair_escaped_marker,
     build_permission_event,
     derive_edit_diff,
     extract_tool_purpose,
@@ -71,6 +73,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_STEER,
@@ -168,6 +171,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import content_free_digest
 from kiro_crew.skill_usage import get_global_skill_read_observer
 
 logger = logging.getLogger(__name__)
@@ -2726,7 +2730,47 @@ class AcpClient:
             work_dir=self._work_dir,
         )
         servers = params.get("mcpServers") or []
-        return list(servers) if isinstance(servers, list) else []
+        out = list(servers) if isinstance(servers, list) else []
+        return self._append_member_dispatch_server(out)
+
+    def _append_member_dispatch_server(self, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mount the dashboard session-control server into a member DM session.
+
+        Session-level and additive: the on-disk agent spec is untouched, so every
+        other session on the same agent keeps its ordinary tool set. The entry
+        carries ``KIROCREW_SESSION_KEY`` for strict identity — the same value this
+        client already exports to the child process env.
+
+        Honors the same permission-surface precondition the mirror translation
+        just applied: when Crew does not own the session's native permission
+        file, the whole array was withheld, and quietly appending a
+        session-control server there would hand a pre-approvable surface exactly
+        the tools the withhold exists to keep off it.
+        """
+        if self.backend not in ACP_BACKENDS_MEMBER_DISPATCH:
+            return servers
+        # circular import: members' module graph is heavy; resolved at call time.
+        from kiro_crew.members import is_member_session_key, member_dispatch_session_server
+
+        if not is_member_session_key(self._session_key):
+            return servers
+        session_key = self._session_key or ""
+        if not getattr(self, "_claude_settings_authored", False):
+            logger.warning(
+                "member session %s: permission surface not Crew-owned — session "
+                "control is not mounted; the DM thread runs as plain chat",
+                self._session_key,
+            )
+            return servers
+        entry = member_dispatch_session_server(session_key)
+        if entry is None:
+            logger.warning(
+                "member session %s: dashboard server unresolved — the DM thread "
+                "runs as plain chat this session",
+                self._session_key,
+            )
+            return servers
+        return [e for e in servers if e.get("name") != entry["name"]] + [entry]
 
     def _session_mcp_servers(self) -> list[dict[str, Any]]:
         """MCP server array passed to this session's ``session/new`` / ``session/load``.
@@ -5755,6 +5799,7 @@ class AcpClient:
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=STOP_REASON_END_TURN,
+                    synthetic_completion=True,
                     usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return
@@ -6684,12 +6729,45 @@ class AcpClient:
                             if "stdout" in j and j.get("stdout"):
                                 output_parts.append(str(j["stdout"])[:4000])
                             else:
-                                output_parts.append(json.dumps(j, default=str)[:4000])
+                                # An unrecognised structured envelope reaches the
+                                # consumer through json.dumps, which escapes every
+                                # quote in it. That is lossless for display but
+                                # fatal for a session-directive marker: the
+                                # sentinel survives while its payload becomes
+                                # \\"kind\\", so peek() can no longer name the
+                                # parked record and the directive is dropped. Emit
+                                # that one string verbatim instead.
+                                _marker = _marker_bearing_text(j)
+                                if _marker is not None:
+                                    logger.warning(
+                                        "tool-result rawOutput Json envelope carries a "
+                                        "session-directive marker; using that string "
+                                        "verbatim instead of json.dumps, which would "
+                                        "escape its payload. Envelope keys: %s",
+                                        sorted(j.keys()),
+                                    )
+                                    output_parts.append(_marker[:4000])
+                                else:
+                                    output_parts.append(json.dumps(j, default=str)[:4000])
 
         if not output_parts:
             return None
 
-        final_output = "\n".join(output_parts)[:8000]
+        final_output = "\n".join(output_parts)
+        # Repair a marker that arrived JSON-escaped, BEFORE redaction and the
+        # head cut: the consumer reads its selector out of this exact string.
+        _repaired = _repair_escaped_marker(final_output)
+        if _repaired is not None:
+            logger.warning(
+                "tool-result text carried a JSON-ESCAPED session-directive "
+                "marker; repaired it so the selector is readable. "
+                "Original: %dB sha=%s (content withheld -- this runs BEFORE "
+                "redaction, so the frame is unredacted here).",
+                len(final_output),
+                content_free_digest(final_output),
+            )
+            final_output = _repaired
+        final_output = final_output[:8000]
         final_output, _ = redact_exfiltration_urls(final_output)
         final_output, _ = redact_credentials(final_output)
         return AcpEvent(
@@ -6855,7 +6933,16 @@ class AcpClient:
                                     if out:
                                         output_parts.append(out[:4000])
                                 else:
-                                    output_parts.append(json.dumps(d, indent=2)[:4000])
+                                    # See the rawOutput Json branch above: a dump
+                                    # escapes an embedded directive marker beyond
+                                    # what peek() can read.
+                                    _marker = (
+                                        _marker_bearing_text(d) if isinstance(d, dict) else None
+                                    )
+                                    if _marker is not None:
+                                        output_parts.append(_marker[:4000])
+                                    else:
+                                        output_parts.append(json.dumps(d, indent=2)[:4000])
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:
@@ -6863,7 +6950,10 @@ class AcpClient:
                                 AcpEvent(
                                     kind=EVENT_TOOL_RESULT,
                                     tool_call_id=tool_use_id,
-                                    tool_output="\n".join(output_parts)[:8000],
+                                    tool_output=(
+                                        _repair_escaped_marker("\n".join(output_parts))
+                                        or "\n".join(output_parts)
+                                    )[:8000],
                                 )
                             )
         except Exception:
