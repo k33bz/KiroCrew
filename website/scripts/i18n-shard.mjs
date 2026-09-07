@@ -94,6 +94,28 @@ function sortDeep(o) {
   return out
 }
 
+/**
+ * A locale tag names the file `join` writes (`locales/<tag>.json`), so it must
+ * never carry a path separator or `..`: an unvalidated tag like
+ * `../../../.kiro/crew/security_policy` escapes the catalog directory and lets
+ * `join` clobber an arbitrary `.json` file (the keystone security policy, a
+ * config). A structural BCP-47 shape — letters, digits and hyphens only — is
+ * what forbids traversal. Membership in the shipped set is deliberately NOT
+ * required, so a maintainer can still materialise a not-yet-shipped locale;
+ * `i18n-translate.mjs` validates against the shipped whitelist for the same
+ * reason, and this is the lighter check that closes the same escape.
+ */
+const LOCALE_TAG = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$/
+function assertSafeLocale(locale) {
+  if (!LOCALE_TAG.test(locale)) {
+    throw new Error(
+      `Refusing to use '${locale}' as a locale: expected a BCP-47 tag `
+      + '(letters, digits and hyphens, e.g. zh-CN). A path separator or `..` '
+      + 'here would let join write outside src/i18n/locales.',
+    )
+  }
+}
+
 const [cmd, dir, arg] = process.argv.slice(2)
 
 // Flatten and merge every English source, so shards cover the full corpus a
@@ -150,9 +172,17 @@ if (cmd === 'split') {
 } else if (cmd === 'join') {
   const locale = arg
   if (!locale) throw new Error('join requires a locale, e.g. zh-CN')
+  assertSafeLocale(locale)
   const merged = {}
   for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.endsWith('.context.json')).sort()) {
-    Object.assign(merged, JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')))
+    const shardPath = path.join(dir, f)
+    // A symlinked shard would let a read follow out of the shard directory. The
+    // content is JSON-parsed and key-checked below, so this is defence in depth
+    // rather than a known escape, but a shard is always a real file in practice.
+    if (fs.lstatSync(shardPath).isSymbolicLink()) {
+      throw new Error(`Refusing to read shard '${f}': it is a symlink, not a real shard file.`)
+    }
+    Object.assign(merged, JSON.parse(fs.readFileSync(shardPath, 'utf-8')))
   }
 
   // Fail closed on an incomplete translation.
@@ -168,7 +198,22 @@ if (cmd === 'split') {
   }
 
   const out = path.join(ROOT, 'src/i18n/locales', `${locale}.json`)
-  fs.writeFileSync(out, JSON.stringify(sortDeep(nest(merged)), null, 2) + '\n')
+  // O_NOFOLLOW so a pre-planted symlink AT the target path cannot redirect the
+  // write elsewhere (e.g. locales/zh-CN.json -> ~/.bashrc). Together with the
+  // validated locale tag above, the write stays inside the catalog directory.
+  // O_NOFOLLOW is POSIX-only; it is absent (0) on Windows, where this dev tool
+  // is not the containment boundary and symlink semantics differ.
+  const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0
+  const fd = fs.openSync(
+    out,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | O_NOFOLLOW,
+    0o644,
+  )
+  try {
+    fs.writeSync(fd, JSON.stringify(sortDeep(nest(merged)), null, 2) + '\n')
+  } finally {
+    fs.closeSync(fd)
+  }
 
   const untranslated = Object.keys(flat).filter(k => merged[k] === flat[k])
   console.log(
