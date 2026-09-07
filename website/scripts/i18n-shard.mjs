@@ -102,7 +102,7 @@ function sortDeep(o) {
  * config). A structural BCP-47 shape — letters, digits and hyphens only — is
  * what forbids traversal. Membership in the shipped set is deliberately NOT
  * required, so a maintainer can still materialise a not-yet-shipped locale;
- * `i18n-translate.mjs` validates against the shipped whitelist for the same
+ * `i18n-translate.mjs` validates against the shipped allowlist for the same
  * reason, and this is the lighter check that closes the same escape.
  */
 const LOCALE_TAG = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$/
